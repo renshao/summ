@@ -110,15 +110,41 @@ filesystem driver exists, so the trait is shaped by measured requirements rather
 than guesses. distribution's driver interface is the cautionary tale — its
 Reader/Writer abstraction forces buffering that S3 does not need.
 
-### Phase 0 — baseline
-Run `distribution-spec/conformance` against local `distribution`. Capture a
-perf baseline with the existing harness in `../container-registry/bench`
-(Terraform + Ansible + Rust load tester, Azure and AWS). That harness is a major
-asset: point it at summ from day one for a continuous A/B.
+### Phase 0 — baseline — **done**, see `research/R1-spec-conformance.md`
+Conformance harness recipe verified end to end against `distribution` v3.1.1,
+with the exact commands in R1. Two gotchas worth not rediscovering: **on macOS
+port 5000 is AirPlay Receiver** (it answers 403 with `Server: AirTunes`), so use
+15000; and `storage.delete.enabled: true` must be set or the delete APIs skip.
+
+**Do not treat distribution as a passing baseline.** It scores 743/91/16 against
+the 1.1 certification profile, because it has no referrers route at all and no
+sha512. On its honest feature set it is 511 pass / 0 fail. Calibrate against that,
+not against the raw totals.
+
+**Read the result vocabulary, not the FAIL count.** `errRegUnsupported` silently
+downgrades FAIL to Skip (405 on delete, 202 on single-POST or mount), so a low
+FAIL count can conceal an entire unimplemented API.
+
+Perf baseline with `../container-registry/bench` is still to do.
 
 ### Phase 1 — skeleton
 axum, full route table, spec error model, config, single binary. Filesystem blob
 store, naive metadata. **Exit: conformance push + pull pass.**
+
+Two things R1 moved *into* this phase that looked like later work:
+
+- **Blob range serving is a Phase 1 correctness requirement, not a Phase 3
+  optimisation.** The suite exercises six range cases with exact expected
+  headers.
+- **Write `F <repo> <subject> <referrer>` edges from Phase 1**, even though
+  `/referrers/` stays 404 until Phase 6. Retrofitting them later costs a full
+  manifest rescan plus a spec-mandated ingest of the fallback tag schema.
+
+And one trap worth stating once: **there are two `Content-Range` grammars.**
+Chunked *upload* uses a bare `0-1023` (`^[0-9]+-[0-9]+$`, no `bytes ` prefix, no
+`/total`), and the `202` response echoes a bare `Range: 0-<end>`. Blob *download*
+uses ordinary RFC 9110 `bytes 500-1499/<len>`. Out-of-order chunks MUST get
+`416`.
 
 ### Phase 2 — metadata engine
 Wire `summ-meta` behind the HTTP layer. Catalog and tag pagination end-to-end.
@@ -126,8 +152,9 @@ Wire `summ-meta` behind the HTTP layer. Catalog and tag pagination end-to-end.
 Risks.
 
 ### Phase 3 — performance
-Zero-copy blob serving, Range requests. Benchmark against distribution on the
-existing rig. This is where "very fast" is won or lost.
+Zero-copy blob serving. Benchmark against distribution on the existing rig. This
+is where "very fast" is won or lost. (Range *correctness* lands in Phase 1; what
+belongs here is making it cheap.)
 
 ### Phase 4 — purge
 Offline sweep exploiting `R` and `G`.
@@ -392,10 +419,10 @@ Still outstanding, most blocking first:
 
 | # | Topic | Blocks | Why it is not obvious |
 |---|---|---|---|
-| R1 | **Read the spec properly and run the conformance suite.** Nobody has yet read `../distribution-spec`'s text or executed `conformance/`. | Phase 1 — everything | The endpoint list is the easy part. The sharp edges are the error-code taxonomy, `Docker-Content-Digest`, chunked-upload `Content-Range` validation and out-of-order rejection, cross-repo mount, pagination `Link` headers, content negotiation, and the referrers fallback tag schema. Guessing these means failing conformance late. |
+| ~~R1~~ | ~~Spec + conformance~~ — **done**, `research/R1-spec-conformance.md` | ~~Phase 1~~ | The endpoint list is the easy part. The sharp edges are the error-code taxonomy, `Docker-Content-Digest`, chunked-upload `Content-Range` validation and out-of-order rejection, cross-repo mount, pagination `Link` headers, content negotiation, and the referrers fallback tag schema. Guessing these means failing conformance late. |
 | R2 | **Zero-copy blob serving on stable Rust, 2026.** `sendfile` via `spawn_blocking` vs `io_uring`/`tokio-uring` maturity vs plain `tokio::fs` streaming; plus Range handling. | Phase 3 | This is where "very fast" is won. `../container-registry/notes/fs_limit.md` shows large pulls are network-saturated at ~1.56 GB/s, so the goal is near-zero CPU per byte, spending the headroom on concurrency. |
 | R3 | **RocksDB tuning: custom `SliceTransform` vs column families per key type.** | Phase 2 hardening | Prefix bloom filters are the biggest available win for `exists_prefix`, the purge hot path, but our prefixes come in four lengths (1, 5, 34, 66 bytes) and a fixed transform fits one. Column families would also let manifest bodies be tuned separately from small records. |
-| R4 | **Read `../zot/pkg/meta/boltdb` and `pkg/storage/{types,s3,local}`.** | Packages C, E | The closest prior art: a real registry with an embedded metadata store and a working S3 driver. Our schema is settled, so this is a cross-check for things we have missed — referrers handling, signature/attestation artifacts — and a second opinion on the driver trait. |
+| ~~R4~~ | ~~zot prior art~~ — **done**, `research/R4-zot-prior-art.md` | ~~Packages C, E~~ | The closest prior art: a real registry with an embedded metadata store and a working S3 driver. Our schema is settled, so this is a cross-check for things we have missed — referrers handling, signature/attestation artifacts — and a second opinion on the driver trait. |
 | R5 | **containerd's pull behaviour.** | Phase 3 | Determines what to optimise: request ordering, concurrency, whether it reuses connections, how it handles 206s. Optimising for a synthetic client is a way to win a benchmark and lose in production. |
 | R6 | **Survey existing Rust registry implementations.** | — | Cheap, and worth one pass before committing to an HTTP/storage shape. |
 
@@ -424,8 +451,18 @@ artificial ceiling not to reproduce.
 
 ## Beyond the spec
 
-Catalog/list pain is the reason this project exists, so summ should ship the OCI
-surface *plus* an extension API for the cross-cutting queries the spec cannot
-answer — per-repo stats, layer listings, reverse lookups. summdb prototyped these
-(`/v1/repos/:repo/stats`, `/v1/layers/:digest/manifests`). This is the real
-differentiator over distribution, more than raw speed.
+**`GET /v2/_catalog` is not in the spec.** It was removed before v1.0.0 and the
+path now sits in a reserved extension namespace; the conformance suite never
+exercises it. Verified: the string does not appear in `spec.md` at all.
+
+That is liberating rather than awkward. The single feature this project exists to
+fix is not a conformance obligation, so its pagination and ordering semantics are
+ours to choose — we are not bound to whatever `?n=`/`?last=` behaviour a
+reference implementation happens to have. It does mean the catalog needs its own
+tests, because nothing external will check it.
+
+So summ ships the OCI surface *plus* an extension API for the cross-cutting
+queries the spec cannot answer — catalog, per-repo stats, layer listings, reverse
+lookups. summdb prototyped several (`/v1/repos/:repo/stats`,
+`/v1/layers/:digest/manifests`). This is the real differentiator over
+distribution, more than raw speed.
