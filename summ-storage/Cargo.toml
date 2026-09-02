@@ -1,0 +1,19 @@
+[package]
+name = "summ-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+summ-core.workspace = true
+sha2.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+# `Stream` only - the trait definition, not the futures facade. R2's
+# recommendation is that the whole read path hides behind one function returning
+# a `Stream<Item = io::Result<Bytes>>`, so the trait has to be nameable here.
+futures-core = "0.3"
+
+[dev-dependencies]
+tempfile.workspace = true
+futures-util = { version = "0.3", default-features = false }

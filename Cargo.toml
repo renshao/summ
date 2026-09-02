@@ -1,5 +1,5 @@
 [workspace]
-members = ["summ-core", "summ-meta"]
+members = ["summ-core", "summ-meta", "summ-storage"]
 resolver = "2"
 
 [workspace.package]
@@ -9,8 +9,13 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 summ-core = { path = "summ-core" }
+summ-storage = { path = "summ-storage" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 postcard = { version = "1", features = ["alloc"] }
 redb = "2"
 rocksdb = "0.25"
+sha2 = "0.11"
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+tempfile = "3"
