@@ -817,8 +817,6 @@ Still outstanding, most blocking first:
 Not research, but open and worth closing:
 
 - **Aggregate manifest count** (Risk 2) — the per-axis bounds do not size the store.
-- **No `LICENSE` file.** `Cargo.toml` declares Apache-2.0 but nothing backs it, so
-  the repo is public with no effective licence grant.
 
 ## Reference material (sibling directories)
 
