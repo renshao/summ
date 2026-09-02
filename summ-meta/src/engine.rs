@@ -88,6 +88,13 @@ pub struct Page {
     pub next: Option<Vec<u8>>,
 }
 
+/// One page of a keys-only scan.
+#[derive(Debug, Clone, Default)]
+pub struct KeyPage {
+    pub keys: Vec<Vec<u8>>,
+    pub next: Option<Vec<u8>>,
+}
+
 pub trait MetaEngine: Send + Sync + 'static {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
 
@@ -97,6 +104,24 @@ pub trait MetaEngine: Send + Sync + 'static {
     /// Bounded by construction: there is no API that materialises a whole
     /// prefix. A ten-million-repo catalog is only ever read a page at a time.
     fn scan(&self, prefix: &[u8], start_after: Option<&[u8]>, limit: usize) -> Result<Page>;
+
+    /// Keys only, for ranges whose values are empty.
+    ///
+    /// Purge scans millions of valueless edge keys, and `scan` allocates an
+    /// empty `Vec` per row to do it. The default implementation is correct but
+    /// pays that cost; engines should override it.
+    fn scan_keys(
+        &self,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<KeyPage> {
+        let page = self.scan(prefix, start_after, limit)?;
+        Ok(KeyPage {
+            keys: page.entries.into_iter().map(|(k, _)| k).collect(),
+            next: page.next,
+        })
+    }
 
     /// Whether any key exists under `prefix`, without decoding a value.
     ///
