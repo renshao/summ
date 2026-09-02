@@ -1,0 +1,21 @@
+[package]
+name = "summ-registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+summ-core.workspace = true
+summ-meta.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+postcard.workspace = true
+zstd = "0.13"
+sha2.workspace = true
+# Manifest and descriptor types, rather than hand-rolling them. Only the
+# `image` feature: `runtime` and `distribution` pull in types this crate has no
+# use for, and the OCI runtime spec is a different specification entirely.
+oci-spec = { version = "0.10", default-features = false, features = ["image"] }
+
+[dev-dependencies]
+tempfile.workspace = true
