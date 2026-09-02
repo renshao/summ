@@ -152,9 +152,23 @@ Wire `summ-meta` behind the HTTP layer. Catalog and tag pagination end-to-end.
 Risks.
 
 ### Phase 3 — performance
-Zero-copy blob serving. Benchmark against distribution on the existing rig. This
-is where "very fast" is won or lost. (Range *correctness* lands in Phase 1; what
-belongs here is making it cheap.)
+Benchmark against distribution on the existing rig.
+
+**R2 settled the blob-serving question, and the answer is "do the simple thing
+well".** Measured on the bench host, cost of moving 1 GiB from page cache to
+socket: a naive 4 KiB `ReaderStream` burns 11–15 % of an 8-vCPU box at line rate;
+64 KiB chunks 5–11 %; **1 MiB chunks 2–5 %**; true `sendfile` 2–2.4 %. So the gap
+between a badly-tuned copy loop and a well-tuned one is **3–5×**, and the gap
+between a well-tuned loop and true zero-copy is **about 1 % of the machine** —
+bought at the price of fighting hyper for the socket, breaking under TLS, and
+blocking the reactor on page-cache misses. Bad trade.
+
+**Do:** `pread` in `spawn_blocking`, **1 MiB chunks**, `Bytes` into hyper's
+`writev`. **Do not:** `sendfile`, `mmap`, or an io_uring runtime. Tokio is
+bringing io_uring in-tree transparently; revisit then, for free.
+
+The real Phase 3 work is therefore metadata latency, not byte throughput — see
+the client findings below.
 
 ### Phase 4 — purge
 Offline sweep exploiting `R` and `G`.
@@ -367,6 +381,52 @@ plain copy, or shared object storage.
    upgrade path is upload-session pinning via `U` keys plus an mtime grace
    period — additive, not a redesign.
 
+## What the client actually does (from `research/R5`)
+
+Optimising for a synthetic benchmark is a way to win a benchmark and lose in
+production. The findings that change the design:
+
+- **Four of the five serial steps in a cold containerd pull are metadata**
+  (`HEAD manifests/<tag>`, `GET manifests/<index>`, `GET manifests/<manifest>`,
+  `GET blobs/<config>`), and they are strictly sequential, so their latencies
+  add. **This is where RocksDB beats distribution's filesystem link walk** — and
+  it means the `M`/`B`/`T` lookups deserve block cache, not just the `R` scans.
+  Combined with R2: the byte path is nearly free, so *metadata latency is the
+  product*.
+- **`HEAD /manifests/<ref>` must be a first-class single-lookup endpoint** —
+  `T` then `M`, two point lookups, no body read. Never implement it as "GET and
+  discard the body".
+- **containerd is HTTP/1.1 only**, pools 2 idle connections per host, and sizes
+  at roughly 3–8 concurrent connections per pulling node. Do not invest in h2/h3;
+  do keep TLS session resumption on and connection setup cheap.
+- **Never return `429`.** containerd retries it immediately, five times,
+  ignoring `Retry-After`. Since escaping provider rate limits is half the reason
+  summ exists, the answer is to not need throttling at all; if it is ever added
+  it must be a connection- or accept-level control, never a status code.
+- **Never compress or transform blob bodies** — no `CompressionLayer` near
+  `/blobs/`. The `B` key stores manifests zstd-compressed at rest, so decompress
+  and serve `identity`: the digest is over the plaintext.
+- **Design the blob path around aborted, open-ended range reads.** containerd
+  2.1+ chunked fetch requests `bytes=N-`, reads 8 MiB, then kills the connection.
+  Bottlerocket already ships this on by default. The test case is "client
+  cancels 8 MiB into a 900 MB response": minimal wasted read-ahead, prompt fd
+  release, no per-abort metric cardinality.
+- **Abort, do not apologise.** On a mid-stream blob failure, tear the connection
+  down. Appending anything converts a retryable short read into a digest
+  mismatch.
+- **The existing benchmark models the wrong shape.** `bench/loadtest` does
+  `GET manifest → GET all blobs concurrently`. To be honest it needs the leading
+  `HEAD`, the index→manifest→config→layers serialisation, and a warm-cache mode
+  that skips already-held layers — otherwise summ gets tuned for pure throughput
+  while real pulls are dominated by four serial metadata round trips.
+
+## Dependencies
+
+`oci-spec` 0.10.0 is the one clear win — take it rather than hand-rolling
+manifest and descriptor types. `oci-client` 0.17.0 is worth having in dev
+dependencies for tests and the bench harness, not in the server. Detail and the
+rejected alternatives are in `research/R5`.
+
 ## Pending schema changes (from `research/R4`)
 
 Found by reviewing zot and Harbor; agreed but **not yet applied**, deliberately
@@ -420,11 +480,11 @@ Still outstanding, most blocking first:
 | # | Topic | Blocks | Why it is not obvious |
 |---|---|---|---|
 | ~~R1~~ | ~~Spec + conformance~~ — **done**, `research/R1-spec-conformance.md` | ~~Phase 1~~ | The endpoint list is the easy part. The sharp edges are the error-code taxonomy, `Docker-Content-Digest`, chunked-upload `Content-Range` validation and out-of-order rejection, cross-repo mount, pagination `Link` headers, content negotiation, and the referrers fallback tag schema. Guessing these means failing conformance late. |
-| R2 | **Zero-copy blob serving on stable Rust, 2026.** `sendfile` via `spawn_blocking` vs `io_uring`/`tokio-uring` maturity vs plain `tokio::fs` streaming; plus Range handling. | Phase 3 | This is where "very fast" is won. `../container-registry/notes/fs_limit.md` shows large pulls are network-saturated at ~1.56 GB/s, so the goal is near-zero CPU per byte, spending the headroom on concurrency. |
+| ~~R2~~ | ~~Zero-copy blob serving~~ — **done**, `research/R2-zero-copy-serving.md`; answer: do not. `sendfile` via `spawn_blocking` vs `io_uring`/`tokio-uring` maturity vs plain `tokio::fs` streaming; plus Range handling. | Phase 3 | This is where "very fast" is won. `../container-registry/notes/fs_limit.md` shows large pulls are network-saturated at ~1.56 GB/s, so the goal is near-zero CPU per byte, spending the headroom on concurrency. |
 | R3 | **RocksDB tuning: custom `SliceTransform` vs column families per key type.** | Phase 2 hardening | Prefix bloom filters are the biggest available win for `exists_prefix`, the purge hot path, but our prefixes come in four lengths (1, 5, 34, 66 bytes) and a fixed transform fits one. Column families would also let manifest bodies be tuned separately from small records. |
 | ~~R4~~ | ~~zot prior art~~ — **done**, `research/R4-zot-prior-art.md` | ~~Packages C, E~~ | The closest prior art: a real registry with an embedded metadata store and a working S3 driver. Our schema is settled, so this is a cross-check for things we have missed — referrers handling, signature/attestation artifacts — and a second opinion on the driver trait. |
-| R5 | **containerd's pull behaviour.** | Phase 3 | Determines what to optimise: request ordering, concurrency, whether it reuses connections, how it handles 206s. Optimising for a synthetic client is a way to win a benchmark and lose in production. |
-| R6 | **Survey existing Rust registry implementations.** | — | Cheap, and worth one pass before committing to an HTTP/storage shape. |
+| ~~R5~~ | ~~Client behaviour + Rust ecosystem~~ — **done**, `research/R5-clients-and-ecosystem.md`. | Phase 3 | Determines what to optimise: request ordering, concurrency, whether it reuses connections, how it handles 206s. Optimising for a synthetic client is a way to win a benchmark and lose in production. |
+| ~~R6~~ | ~~Rust ecosystem survey~~ — **done**, folded into `research/R5` Part B. | — | — |
 
 Not research, but open and worth closing:
 
