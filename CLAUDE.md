@@ -13,8 +13,14 @@ An OCI Distribution Spec compliant container registry in Rust.
   schema is wrong.
 - **No unbounded list API.** Every scan takes a cursor and a limit. The target is
   10M repos and up to 10M manifests in one repo.
-- **Nothing depends on redb beyond the `MetaEngine` trait.** The engine choice is
-  not yet settled (see Risks in PLAN.md).
+- **RocksDB is the v1 engine**, statically linked. Nothing may depend on it
+  beyond the `MetaEngine` trait; redb is kept as a second implementation and the
+  integration suite runs against both, which is what keeps that boundary honest.
+- **Blob storage holds bytes, not relationships.** Content-addressed
+  `digest -> bytes` only. Do not reproduce distribution's link files — RocksDB
+  owns every relationship, and a second source of truth will diverge.
+- **Blobs land and fsync before the metadata batch commits.** An orphan blob is
+  garbage; metadata pointing at a missing blob is corruption.
 - **All mutations go through `WriteBatch`.** It is atomic, serialisable, and
   idempotent — it is the future WAL. Two rules follow: no side-channel writes
   (they would be invisible to the log and diverge replicas), and no
@@ -26,5 +32,5 @@ An OCI Distribution Spec compliant container registry in Rust.
 
 ```
 summ-core    digest, key encoding, value types, errors
-summ-meta    MetaEngine trait, WriteBatch, redb engine, repo interner
+summ-meta    MetaEngine trait, WriteBatch, RocksDB + redb engines, repo interner
 ```

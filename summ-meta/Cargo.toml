@@ -9,6 +9,7 @@ summ-core.workspace = true
 serde.workspace = true
 postcard.workspace = true
 redb.workspace = true
+rocksdb.workspace = true
 parking_lot = "0.12"
 lru = "0.12"
 

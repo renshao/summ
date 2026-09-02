@@ -24,6 +24,7 @@ summ targets both directly. Everything else is secondary.
 | Auth | None / static token for v1 | Auth is middleware, deferred to Phase 6. Not on the critical path. |
 | Topology | Single node, but keep HA viable | All mutations flow through a serialisable `WriteBatch`. No engine types leak past the trait. |
 | Workload | Full read-write, pull-optimised | Push must be correct and complete; perf work targets pull. |
+| Metadata engine | **RocksDB**, compiled from source and statically linked | Single binary, no RocksDB install. redb retained as a second implementation to keep the trait honest. |
 | Purge (GC) | Offline for v1 | Registry read-only during sweep. Schema already supports online later — see below. |
 | Digest algorithms | sha256 + sha512 | Tagged enum, algorithm byte in key encoding. |
 | Conformance bar | Core push/pull at Phase 1; referrers by Phase 6 | `distribution-spec/conformance` is the gate. |
@@ -86,11 +87,12 @@ Two traps worth stating explicitly:
 
 ## Status
 
-**Built** (`cargo test` — 22 passing):
+**Built** (`cargo test` — 36 passing):
 
 ```
 summ-core    digest (sha256/sha512), key encoding, value types, errors
-summ-meta    MetaEngine trait, WriteBatch op log, redb engine, LRU repo interner
+summ-meta    MetaEngine trait, WriteBatch op log, RocksDB engine (v1),
+             redb engine (kept to keep the trait honest), LRU repo interner
 ```
 
 Notable properties already covered by tests: cursor paging never exceeds its
@@ -144,7 +146,7 @@ concurrently; each owns its files.
 |---|---|---|---|
 | A | Conformance harness — script to run the suite against a local binary, wired into CI | `conformance/` | — |
 | B | HTTP skeleton — axum, routing, spec error codes, `Docker-Content-Digest` | `summ-server/` | — |
-| C | Filesystem blob store — content-addressed, multi-level fan-out | `summ-storage/` | — |
+| C | Filesystem blob store — content-addressed, 3-level fan-out, `commit_upload` not `move` | `summ-storage/` | — |
 | D | Upload session handling — chunked PUT/PATCH, resumable offsets | `summ-server/`, `U` keys | B, C |
 | E | Registry ops layer — manifest put/get/delete as `WriteBatch` builders | `summ-registry/` | — |
 | F | Purge | `summ-purge/` | E |
@@ -153,47 +155,118 @@ concurrently; each owns its files.
 Package E is the natural next step and the one most worth doing carefully: it is
 where spec semantics meet the key schema.
 
-## Engine choice (open)
+## Engine choice — RocksDB (decided)
 
-**redb is the current implementation, not a decision.** It was the fastest way to
-get a working store behind `MetaEngine`; the trait exists so swapping it is cheap.
+**Decided for v1: RocksDB**, compiled from source by `librocksdb-sys` and
+statically linked, so the registry ships as one binary with no RocksDB to
+install. Verified: the only dynamic dependencies are OS-provided (`libc++`,
+`libiconv`, `libSystem` on macOS; expect `libstdc++` + `libc` on Linux — a fully
+static musl build is a separate exercise if wanted).
 
-### Sizing first
+### Why an LSM
+
+- Reads are point lookups and short ordered prefix scans; prefix-*existence*
+  checks are the purge hot path.
+- Writes are rare relative to reads, but each push inserts tens of **randomly
+  distributed** keys (digest-prefixed, so effectively uniform).
+- Purge does bulk deletes.
+
+Random-key insert at volume is where a B-tree is weakest: page splits and write
+amplification across a multi-terabyte tree. An LSM absorbs those into sequential
+writes. Bulk deletes become cheap tombstones. And block compression matters more
+here than usual, because most of the keyspace is valueless edge keys sharing long
+digest prefixes.
+
+### Sizing
 
 The one-key-per-edge rule trades O(N) write amplification for O(E) space, where E
 is the number of reference edges. That is the right trade — space is cheap,
 rewriting a 360 MB value per push is not — but E is large. At ~10⁹ manifests
 referencing ~20 blobs each, the `R` range alone is ~2×10¹⁰ keys of ~70 bytes:
-**order 1 TB before compression**. Edge keys are valueless and share long digest
-prefixes, so they compress and prefix-compress well, but this has to be measured,
-not assumed. Confirming aggregate manifest count (Risk 2) directly sizes this.
+**order 1 TB before compression**. Compression is therefore load-bearing, not a
+nicety. Package G must measure post-compaction size on disk, not just throughput.
+Confirming aggregate manifest count (Risk 2) directly sizes this.
 
-### What the workload actually looks like
+### Still to tune
 
-- Reads: point lookups and short ordered prefix scans. Prefix-*existence* checks
-  are the purge hot path.
-- Writes: rare relative to reads, but each push inserts tens of **randomly
-  distributed** keys (digest-prefixed, so effectively uniform).
-- Deletes: bulk, during purge.
+`RocksEngine::open` sets Lz4 with Zstd at the bottom level and nothing else.
+Deliberately unturned until there are measurements:
 
-Random-key insert at volume is precisely where a B-tree is weakest and an LSM is
-strongest.
+- **Prefix bloom filters** would let `exists_prefix` skip SSTs entirely — the
+  single biggest available win for purge. Blocked on the fact that our prefixes
+  come in several lengths (1, 5, 34, 66 bytes) and a fixed-length prefix
+  transform fits only one of them. Options: a custom `SliceTransform` that reads
+  the type byte and returns the right length, or column families per key type.
+- **Column families** to separate hot small records from cold manifest bodies.
+- Block cache sizing, bloom bits/key, compaction style.
 
-### Leaning
+### redb
 
-| Engine | For | Against |
-|---|---|---|
-| **redb** (B-tree, pure Rust) | Zero friction, MVCC readers, good point-lookup latency, already wired | Random inserts into a multi-TB B-tree mean page splits and heavy write amplification; single writer serialises pushes |
-| **RocksDB** (LSM, C++) | Turns random inserts into sequential writes; prefix bloom filters make `exists_prefix` cheap; block compression on highly-compressible edge keys; tombstone deletes suit purge; proven at TB scale | C++ toolchain, build time, tuning burden, compaction stalls |
-| **fjall** (LSM, pure Rust) | LSM behaviour without the C++ dependency | Young; unproven at this scale |
+Kept as a second `MetaEngine` implementation, not as a fallback plan. The whole
+integration suite runs against both, which is what keeps the trait honest and the
+decision genuinely reversible. If it ever becomes a maintenance drag, delete it —
+the tests are the asset, not the engine.
 
-**Current leaning: an LSM, most likely RocksDB, for the production target — and
-redb retained as the zero-friction dev/test engine.** This is a leaning from the
-access pattern, not a measurement. Package G settles it: synthetic 10⁸–10⁹-key
-load, measuring insert throughput, space on disk after compaction, point-lookup
-and `exists_prefix` latency, and bulk-delete cost.
+## Blob storage — what to take from distribution
 
-Do not harden anything against redb specifics in the meantime.
+**Take the content-addressed blob store. Reject the link structure.**
+
+distribution's on-disk layout (`registry/storage/paths.go`) is two things fused
+together: a content-addressed blob store, and a set of *link files* — tiny files
+whose paths encode repo→blob membership, tag→manifest, and manifest revisions.
+
+The link files exist because **distribution has no metadata database**. It encodes
+relationships as filesystem paths so it can run against S3 alone. We have
+RocksDB, where those relationships already live as `P`, `R`, `T`, and `G` keys.
+Reproducing them on disk would mean two sources of truth that can silently
+diverge — and it is precisely what makes distribution's GC a full storage-tree
+walk and its catalog a recursive directory listing. On S3 those become LIST
+storms. Slow catalog and list operations are the reason this project exists;
+inheriting their cause would be self-defeating.
+
+So blob storage becomes a pure content-addressed object store with **no directory
+structure that carries meaning**: `digest → bytes`, nothing else. That keeps the
+driver trait small, which is what makes an S3 driver clean later.
+
+Four deliberate deviations:
+
+1. **Deeper fan-out, no per-blob directory.** distribution uses
+   `blobs/sha256/ab/<full-hex>/data` — 2 hex chars, so 256 first-level buckets,
+   which at 10⁸ blobs is ~400K subdirectories each; and the per-blob directory
+   doubles inode count to hold one file. Use `blobs/sha256/ab/cd/ef/<full-hex>`:
+   three levels of two hex chars is 16.7M buckets, ~6 blobs per directory at 10⁸,
+   and the file *is* the blob. On S3 the prefix depth is irrelevant, but keeping
+   one layout across drivers costs nothing.
+
+2. **Model `commit_upload`, not `move`.** distribution's driver trait exposes
+   `Move`, which on S3 is a lie — there is no rename, so it degrades to
+   copy-then-delete, and copying a multi-gigabyte layer to commit it is
+   pathological. Instead the driver should expose "commit this upload as this
+   digest" and implement it natively: the filesystem driver renames (atomic), the
+   S3 driver completes a multipart upload straight at the final key. This is the
+   single most important trait-design lesson to take from distribution, and it is
+   a lesson by counter-example.
+
+3. **Upload session state lives in RocksDB, not on disk.** distribution keeps
+   `_uploads/<id>/startedat` as a file to expire abandoned uploads. We have
+   `UploadSession` under `U` keys, which is cheaper to scan and already
+   transactional with everything else.
+
+4. **Resumable hashing is an open question.** distribution serialises hasher
+   state to `hashstates/<algo>/<offset>` so a resumed chunked upload need not
+   rehash from zero — Go's `hash.Hash` implements `encoding.BinaryMarshaler`.
+   **Rust's `sha2` exposes no equivalent stable API**, so this does not port
+   directly. For v1, keep the hasher in memory in the session: correct, simple,
+   and fine for a single node — but it pins an upload to one process, so it is a
+   constraint to revisit alongside HA. Do not design it away silently.
+
+### Crash consistency
+
+One ordering rule, and it is not negotiable: **blob bytes land and are fsynced
+first; the metadata batch is the commit point.** A blob with no metadata is
+harmless garbage that purge reclaims. Metadata referencing a missing blob is
+corruption that surfaces as a failed pull. Never the reverse.
+
 
 ## Replication and the WAL
 
@@ -223,15 +296,17 @@ plain copy, or shared object storage.
 
 ## Risks
 
-1. **The metadata engine is not chosen yet.** See "Engine choice" below. redb is
-   the current implementation, not the decision. *Highest-risk unknown in the
-   project.* Package G must settle it before Phase 2 hardens. Mitigation is
-   already in place: nothing depends on redb beyond `MetaEngine`.
+1. **RocksDB at 10¹⁰ keys is chosen but unmeasured.** The engine decision is
+   made; the *tuning* is not, and post-compaction size on disk is the number that
+   could still surprise us (see Sizing above). Package G measures it. Mitigation
+   remains in place: nothing depends on RocksDB beyond `MetaEngine`, and a second
+   implementation proves it.
 2. **Aggregate manifest count is still unspecified.** "10M repos, 10M manifests
    per repo" bounds each axis but not the total, and the total is what sizes the
    engine. Assumed ~10⁹ pending confirmation.
-3. **Filesystem fan-out.** distribution uses 2 hex chars = 256 dirs. At 10⁸+
-   blobs that is ~400K files per directory. Use 2–3 levels.
+3. **Resumable upload hashing has no direct Rust equivalent** to distribution's
+   serialised hash state. v1 keeps the hasher in memory, which pins an upload to
+   one process — a constraint on HA, not on v1. See Blob storage.
 4. **Offline purge is a scaling cliff.** Acceptable for v1 by decision. The
    upgrade path is upload-session pinning via `U` keys plus an mtime grace
    period — additive, not a redesign.
