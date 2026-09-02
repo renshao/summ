@@ -1,7 +1,8 @@
 //! Binary key encoding.
 //!
 //! Every key begins with a single-byte prefix; uppercase prefixes hold registry
-//! data, lowercase hold the repo-name interner. Repo names are interned to a
+//! data, lowercase hold internal bookkeeping - the repo-name interner and the
+//! schema version. Repo names are interned to a
 //! `u32` so a long name is not repeated in every key, and digests are stored raw
 //! rather than as hex, halving their size.
 //!
@@ -29,10 +30,29 @@ pub const PREFIX_REPO_BLOB: u8 = b'P';
 pub const PREFIX_CHILD_PARENT: u8 = b'S';
 pub const PREFIX_REFERRER: u8 = b'F';
 pub const PREFIX_UPLOAD: u8 = b'U';
+pub const PREFIX_TAG_HISTORY: u8 = b'H';
+pub const PREFIX_MANIFEST_TAG_HISTORY: u8 = b'J';
+pub const PREFIX_COUNTER: u8 = b'A';
 pub const PREFIX_REPO_BY_NAME: u8 = b'n';
 pub const PREFIX_REPO_BY_ID: u8 = b'i';
+pub const PREFIX_DB_VERSION: u8 = b'v';
+
+/// Counter scopes, the byte after `A`. Every granularity that will be queried
+/// has to be maintained on write: rolling repo totals up out of per-manifest
+/// buckets would be a scan across up to 10M manifests.
+pub const SCOPE_MANIFEST: u8 = b'm';
+pub const SCOPE_TAG: u8 = b't';
+pub const SCOPE_REPO: u8 = b'r';
 
 const REPO_LEN: usize = 4;
+
+/// Separates a variable-length tag from what follows it in a key.
+///
+/// Tag names match `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`, so NUL cannot occur in
+/// one, and it sorts below every legal tag byte. Without it a scan of tag `foo`
+/// would also sweep up `foobar`'s history. The `T` key needs no separator only
+/// because the tag is terminal there.
+const TAG_END: u8 = 0x00;
 
 fn start(prefix: u8, cap: usize) -> Vec<u8> {
     let mut k = Vec::with_capacity(1 + cap);
@@ -215,6 +235,153 @@ pub fn uploads() -> Vec<u8> {
     vec![PREFIX_UPLOAD]
 }
 
+// --- tag history -------------------------------------------------------
+
+/// Timestamps in history keys are stored complemented so that newest sorts
+/// first: [`crate::keys`] scans forward only, and adding a reverse iterator to
+/// both engines to serve one endpoint is not worth it.
+///
+/// The consequence for callers is that a `before`/`since` cursor is just a
+/// `start_after` seek to the complement of the boundary instant, so there is no
+/// pagination token to invent.
+fn push_desc_time(k: &mut Vec<u8>, unix_seconds: u64) {
+    k.extend_from_slice(&(!unix_seconds).to_be_bytes());
+}
+
+/// `H <repo> <tag> 0 <!ts> <digest>` -> `TagEvent`, newest first.
+///
+/// The digest is in the key rather than only in the value because it is the
+/// collision breaker: two events on one tag at the same instant with the same
+/// digest are the same event.
+pub fn tag_history(repo: RepoId, tag: &str, unix_seconds: u64, digest: &Digest) -> Vec<u8> {
+    let mut k = start_repo(
+        PREFIX_TAG_HISTORY,
+        repo,
+        tag.len() + 1 + 8 + digest.encoded_len(),
+    );
+    k.extend_from_slice(tag.as_bytes());
+    k.push(TAG_END);
+    push_desc_time(&mut k, unix_seconds);
+    digest.encode_into(&mut k);
+    k
+}
+
+/// Scan prefix over one tag's history.
+pub fn tag_history_of(repo: RepoId, tag: &str) -> Vec<u8> {
+    let mut k = start_repo(PREFIX_TAG_HISTORY, repo, tag.len() + 1);
+    k.extend_from_slice(tag.as_bytes());
+    k.push(TAG_END);
+    k
+}
+
+/// Seek key for "events strictly before this instant", given the descending
+/// order. Pass as `start_after`.
+pub fn tag_history_before(repo: RepoId, tag: &str, unix_seconds: u64) -> Vec<u8> {
+    let mut k = tag_history_of(repo, tag);
+    push_desc_time(&mut k, unix_seconds);
+    k
+}
+
+/// `J <repo> <digest> <!ts> <tag>` -> `TagEvent`. The digest-addressed form of
+/// the same history: what was this manifest ever tagged, and when.
+pub fn manifest_tag_history(
+    repo: RepoId,
+    digest: &Digest,
+    unix_seconds: u64,
+    tag: &str,
+) -> Vec<u8> {
+    let mut k = start_repo(
+        PREFIX_MANIFEST_TAG_HISTORY,
+        repo,
+        digest.encoded_len() + 8 + tag.len(),
+    );
+    digest.encode_into(&mut k);
+    push_desc_time(&mut k, unix_seconds);
+    k.extend_from_slice(tag.as_bytes());
+    k
+}
+
+pub fn manifest_tag_history_of(repo: RepoId, digest: &Digest) -> Vec<u8> {
+    let mut k = start_repo(PREFIX_MANIFEST_TAG_HISTORY, repo, digest.encoded_len());
+    digest.encode_into(&mut k);
+    k
+}
+
+// --- pull counters -----------------------------------------------------
+
+/// Days since the Unix epoch, UTC. The bucket boundary is fixed at write time;
+/// a UI may relabel to a local zone but must not re-bucket, or the same wall
+/// changes shape depending on who is looking at it. Good to 2149.
+pub fn day_bucket(unix_seconds: u64) -> u16 {
+    (unix_seconds / 86_400) as u16
+}
+
+/// `<shard>` is the writing node's id, `0` on a single node. Two nodes each
+/// writing an absolute value for one bucket would be last-write-wins, which is
+/// silent undercounting; reserving the component now is free, adding a key
+/// component to a populated store is a migration.
+fn push_bucket(k: &mut Vec<u8>, day: u16, shard: u16) {
+    k.extend_from_slice(&day.to_be_bytes());
+    k.extend_from_slice(&shard.to_be_bytes());
+}
+
+fn start_counter(scope: u8, repo: RepoId, cap: usize) -> Vec<u8> {
+    let mut k = start(PREFIX_COUNTER, 1 + REPO_LEN + cap);
+    k.push(scope);
+    k.extend_from_slice(&repo.to_be_bytes());
+    k
+}
+
+/// `A m <repo> <digest> <day> <shard>` -> `CounterBucket`. The per-manifest
+/// wall: 53 weeks is 371 buckets, so the whole visualisation is one bounded
+/// scan arriving in chronological order.
+pub fn counter_manifest(repo: RepoId, digest: &Digest, day: u16, shard: u16) -> Vec<u8> {
+    let mut k = start_counter(SCOPE_MANIFEST, repo, digest.encoded_len() + 4);
+    digest.encode_into(&mut k);
+    push_bucket(&mut k, day, shard);
+    k
+}
+
+pub fn counters_of_manifest(repo: RepoId, digest: &Digest) -> Vec<u8> {
+    let mut k = start_counter(SCOPE_MANIFEST, repo, digest.encoded_len());
+    digest.encode_into(&mut k);
+    k
+}
+
+/// `A t <repo> <tag> 0 <day> <shard>` -> `CounterBucket`.
+pub fn counter_tag(repo: RepoId, tag: &str, day: u16, shard: u16) -> Vec<u8> {
+    let mut k = start_counter(SCOPE_TAG, repo, tag.len() + 5);
+    k.extend_from_slice(tag.as_bytes());
+    k.push(TAG_END);
+    push_bucket(&mut k, day, shard);
+    k
+}
+
+pub fn counters_of_tag(repo: RepoId, tag: &str) -> Vec<u8> {
+    let mut k = start_counter(SCOPE_TAG, repo, tag.len() + 1);
+    k.extend_from_slice(tag.as_bytes());
+    k.push(TAG_END);
+    k
+}
+
+/// `A r <repo> <day> <shard>` -> `CounterBucket`. Repo totals, kept
+/// indefinitely because they are tiny.
+pub fn counter_repo(repo: RepoId, day: u16, shard: u16) -> Vec<u8> {
+    let mut k = start_counter(SCOPE_REPO, repo, 4);
+    push_bucket(&mut k, day, shard);
+    k
+}
+
+pub fn counters_of_repo(repo: RepoId) -> Vec<u8> {
+    start_counter(SCOPE_REPO, repo, 0)
+}
+
+/// Everything under one repo, for the prefix deletes purge does when a repo is
+/// dropped. Not a scan target: the three scopes have different key shapes.
+pub fn counters_in_repo_scope(scope: u8, repo: RepoId) -> Vec<u8> {
+    start_counter(scope, repo, 0)
+}
+
 // --- repo interner -----------------------------------------------------
 
 /// `n <name>` -> id. Ordered by name, so `GET /v2/_catalog` pages by scanning
@@ -248,6 +415,20 @@ pub fn parse_repo_id(value: &[u8]) -> Option<RepoId> {
     Some(RepoId::from_be_bytes(value.try_into().ok()?))
 }
 
+// --- store metadata ----------------------------------------------------
+
+/// `v` -> `SCHEMA_VERSION` (BE u32). Single key, written when the store is
+/// created.
+///
+/// A version marker is cheap now and unpleasant to retrofit onto a populated
+/// store, which is the whole reason it lands before there is anything to
+/// migrate. postcard is not self-describing, so without it a record written
+/// before a field was added simply fails to decode with no way to tell that
+/// from corruption.
+pub fn db_version() -> Vec<u8> {
+    vec![PREFIX_DB_VERSION]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,8 +450,12 @@ mod tests {
             PREFIX_CHILD_PARENT,
             PREFIX_REFERRER,
             PREFIX_UPLOAD,
+            PREFIX_TAG_HISTORY,
+            PREFIX_MANIFEST_TAG_HISTORY,
+            PREFIX_COUNTER,
             PREFIX_REPO_BY_NAME,
             PREFIX_REPO_BY_ID,
+            PREFIX_DB_VERSION,
         ];
         let mut seen = all.to_vec();
         seen.sort_unstable();
@@ -330,5 +515,76 @@ mod tests {
         let k = repo_by_id(9_000_000);
         assert_eq!(k.len(), 5);
         assert_eq!(parse_repo_id(&k[1..]), Some(9_000_000));
+    }
+
+    #[test]
+    fn tag_history_is_newest_first_and_cannot_reach_a_prefix_neighbour() {
+        // Later timestamp must sort earlier, since the endpoint returns
+        // descending order and the engines only scan forward.
+        let old = tag_history(1, "latest", 1_000, &d(1));
+        let new = tag_history(1, "latest", 2_000, &d(1));
+        assert!(new < old);
+
+        // `foo` must not sweep up `foobar`: that is what the NUL is for.
+        assert!(!tag_history(1, "foobar", 1_000, &d(1)).starts_with(&tag_history_of(1, "foo")));
+        assert!(tag_history(1, "foo", 1_000, &d(1)).starts_with(&tag_history_of(1, "foo")));
+    }
+
+    #[test]
+    fn a_history_before_cursor_seeks_past_newer_events() {
+        // `before = 2_000` should skip the 3_000 event and land on the 1_000 one.
+        let cursor = tag_history_before(1, "latest", 2_000);
+        let newer = tag_history(1, "latest", 3_000, &d(1));
+        let older = tag_history(1, "latest", 1_000, &d(1));
+        assert!(newer < cursor, "a newer event must sort before the cursor");
+        assert!(older > cursor, "an older event must sort after the cursor");
+    }
+
+    #[test]
+    fn manifest_tag_history_scans_within_one_manifest() {
+        assert!(
+            manifest_tag_history(1, &d(1), 5, "v1").starts_with(&manifest_tag_history_of(1, &d(1)))
+        );
+        assert!(!manifest_tag_history(1, &d(2), 5, "v1")
+            .starts_with(&manifest_tag_history_of(1, &d(1))));
+    }
+
+    #[test]
+    fn counter_scopes_do_not_collide_and_scan_cleanly() {
+        assert!(counter_manifest(1, &d(1), 20_000, 0).starts_with(&counters_of_manifest(1, &d(1))));
+        assert!(counter_tag(1, "latest", 20_000, 0).starts_with(&counters_of_tag(1, "latest")));
+        assert!(counter_repo(1, 20_000, 0).starts_with(&counters_of_repo(1)));
+
+        // A manifest bucket must not be reachable from the repo-scope scan,
+        // or repo totals would double-count every manifest.
+        assert!(!counter_manifest(1, &d(1), 20_000, 0).starts_with(&counters_of_repo(1)));
+        assert!(!counter_tag(1, "latest", 20_000, 0).starts_with(&counters_of_repo(1)));
+
+        // Tag counters need the same separator guarantee as tag history.
+        assert!(!counter_tag(1, "foobar", 20_000, 0).starts_with(&counters_of_tag(1, "foo")));
+    }
+
+    #[test]
+    fn counter_days_sort_chronologically_so_a_wall_is_one_scan() {
+        let mut keys = [
+            counter_manifest(1, &d(1), 20_100, 0),
+            counter_manifest(1, &d(1), 19_900, 0),
+            counter_manifest(1, &d(1), 20_000, 0),
+        ];
+        keys.sort();
+        assert_eq!(keys[0], counter_manifest(1, &d(1), 19_900, 0));
+        assert_eq!(keys[2], counter_manifest(1, &d(1), 20_100, 0));
+    }
+
+    #[test]
+    fn day_bucket_is_utc_days_since_the_epoch() {
+        assert_eq!(day_bucket(0), 0);
+        assert_eq!(day_bucket(86_399), 0);
+        assert_eq!(day_bucket(86_400), 1);
+    }
+
+    #[test]
+    fn the_version_key_is_one_byte_and_shares_no_prefix_with_data() {
+        assert_eq!(db_version(), vec![PREFIX_DB_VERSION]);
     }
 }
