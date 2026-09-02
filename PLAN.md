@@ -142,22 +142,24 @@ Digests encode as one algorithm byte followed by raw hash bytes.
 |---|---|---|
 | `M <repo> <digest>` | `ManifestRecord` | Manifest metadata |
 | `B <repo> <digest>` | zstd(manifest JSON) | Manifest body as pushed, byte-exact |
-| `T <repo> <tag>` | digest | Tag → manifest. Name-ordered: backs `tags/list` |
+| `T <repo> <tag>` | `TagRecord { digest, tagged_at }` | Tag → manifest. Name-ordered: backs `tags/list` |
 | `G <repo> <digest> <tag>` | — | Reverse of `T`. Empty scan ⇒ untagged ⇒ purgeable |
 | `L <digest>` | `BlobRecord { size }` | Global blob metadata |
 | `R <digest> <repo> <manifest>` | — | Blob → referencing manifests. **Purge hot path** |
-| `P <repo> <digest>` | — | Repo's blob set, incl. uploaded-but-unreferenced |
+| `P <repo> <digest>` | `RepoBlobRecord { size, added_at }` | Repo's blob set, incl. uploaded-but-unreferenced |
 | `S <repo> <child> <parent>` | — | Index → per-platform child edges |
-| `F <repo> <subject> <referrer>` | — | OCI 1.1 referrers |
+| `F <repo> <subject> <referrer>` | `ReferrerRecord` | OCI 1.1 referrers. Descriptor denormalised — the response cannot be built without it |
 | `U <uuid>` | `UploadSession` | In-progress chunked upload |
 | `n <name>` | repo id (BE u32) | Name-ordered. **`_catalog` pages over this** |
 | `i <id>` | name | Reverse. `i <u32::MAX>` reserved as the id counter |
-| `H <repo> <tag> 0 <!ts> <digest>` | `TagEvent` | *Planned.* Tag history, newest first |
-| `J <repo> <digest> <!ts> <tag>` | `TagEvent` | *Planned.* Same, addressed by digest |
-| `A <scope> <…> <day> <shard>` | `CounterBucket` | *Planned.* Daily pull counters |
+| `v` | schema version (BE u32) | Single key. Absent on a populated store ⇒ refuse to open |
+| `H <repo> <tag> 0 <!ts> <digest>` | `TagEvent` | Tag history, newest first. *Keys and values built; no writer yet* |
+| `J <repo> <digest> <!ts> <tag>` | `TagEvent` | Same, addressed by digest. *Ditto* |
+| `A <scope> <…> <day> <shard>` | `CounterBucket` | Daily pull counters. *Ditto* |
 
-The last three are not built and not yet applied — see **Analytics** below for
-what each component is doing and why.
+The last three now have key builders, value types and prefix-filter groups, so
+the schema will not have to move again when the feature is scheduled. Nothing
+writes to them yet — see **Analytics** below for what each component is doing.
 
 Two traps worth stating explicitly:
 
@@ -166,24 +168,49 @@ Two traps worth stating explicitly:
 - **A blob is servable under a repo** only if `R <digest> <repo>` is non-empty
   or `P <repo> <digest>` exists. Do not serve a blob just because `L` exists —
   that leaks content across repos.
+- **No `skip_serializing_if` on a stored record, ever.** postcard is not
+  self-describing, so a skipped field is not "absent" on the wire — it is
+  missing, and the decoder reads the *next* field's bytes. `Platform::variant`
+  carried it from the initial commit, which meant every ordinary multi-arch
+  index push wrote an `M` record that could not be read back. Fixed, and
+  `summ-core/tests/postcard_roundtrip.rs` now encodes and decodes every stored
+  record so it cannot come back.
 
 ## Status
 
-**Built** (`cargo test` — 36 passing):
+**Built** (`cargo test` — 261 passing):
 
 ```
-summ-core    digest (sha256/sha512), key encoding, value types, errors
-summ-meta    MetaEngine trait, WriteBatch op log, RocksDB engine (v1),
-             redb engine (kept to keep the trait honest), LRU repo interner
+summ-core     digest (sha256/sha512), key encoding, value types, errors
+summ-meta     MetaEngine trait, WriteBatch op log, RocksDB engine (v1),
+              redb engine (kept to keep the trait honest), LRU repo interner,
+              schema version marker + migration seam
+summ-storage  filesystem blob store: 3-level CAS, upload staging, resumable
+              hashing, 1 MiB pread range serving
+summ-registry ops layer: manifest push/pull/delete as WriteBatch builders,
+              tags, referrers, cursor-paged discovery
+summ-server   HTTP: full /v2/ route table, spec error model, upload state
+              machine, CLI. Runs on an in-memory store — see below
 ```
 
 Notable properties already covered by tests: cursor paging never exceeds its
 limit and never strays across a repo boundary; `exists_prefix` correctly gates
 purge; batches are atomic across every key a push touches; the interner stays
-correct with its cache fully evicted (the 10M-repo case).
+correct with its cache fully evicted (the 10M-repo case); prefix groups stay
+contiguous in key order across every in-domain range, which is the property
+`prefix_same_as_start` actually relies on; every stored record survives a
+postcard round trip; all four upload flows, all six blob range cases, and both
+`Content-Range` grammars.
 
-**Not built**: HTTP layer, blob storage, purge, conformance harness, everything
-in Phases 1–6.
+**The one thing not yet done in Phase 1 is the wiring.** The four packages were
+built concurrently against a fixed schema, so `summ-server` currently runs on
+`memory::MemoryRegistry` behind its `seam::Registry` trait rather than on
+`summ-registry` + `summ-storage` + `summ-meta`. The seam exists precisely to be
+replaced. Until then blob bodies are buffered rather than streamed, though
+`BlobRead.body` is already `axum::body::Body`, so the shape is right.
+
+**Not built**: purge, conformance harness, the extension API and UI, analytics
+writers, everything in Phases 2b–6.
 
 ## Phases
 
@@ -209,9 +236,22 @@ FAIL count can conceal an entire unimplemented API.
 
 Perf baseline with `../container-registry/bench` is still to do.
 
-### Phase 1 — skeleton
+### Phase 1 — skeleton — **substantially done, pending wiring**
 axum, full route table, spec error model, config, single binary. Filesystem blob
 store, naive metadata. **Exit: conformance push + pull pass.**
+
+Built: the route table, the error model, all four upload flows, all six range
+cases, both `Content-Range` grammars, the blob store, and the ops layer. What
+remains before the exit criterion can even be attempted is package K, the
+wiring, plus package A, the harness.
+
+**One thing to set before running the suite:** the ops layer validates that a
+manifest's referenced blobs exist, behind `RegistryOptions::validate_references`
+and defaulted on. R1 recommends *against* validating — it is optional per spec,
+costs N lookups, breaks a client pushing layers and manifest concurrently, and
+`OCI_DATA_SPARSE` pushes exactly that shape. **The harness will need it off for
+the sparse data sets.** Defaulting it on is the safer production posture; the
+flag is there so conformance does not have to argue with it.
 
 Two things R1 moved *into* this phase that looked like later work:
 
@@ -279,18 +319,27 @@ concurrently; each owns its files.
 | # | Package | Owns | Depends on |
 |---|---|---|---|
 | A | Conformance harness — script to run the suite against a local binary, wired into CI | `conformance/` | — |
-| B | HTTP skeleton — axum, routing, spec error codes, `Docker-Content-Digest` | `summ-server/` | — |
-| C | Filesystem blob store — content-addressed, 3-level fan-out, `commit_upload` not `move` | `summ-storage/` | — |
-| D | Upload session handling — chunked PUT/PATCH, resumable offsets | `summ-server/`, `U` keys | B, C |
-| E | Registry ops layer — manifest put/get/delete as `WriteBatch` builders | `summ-registry/` | — |
+| ~~B~~ | ~~HTTP skeleton~~ — **done**, on an in-memory seam | `summ-server/` | — |
+| ~~C~~ | ~~Filesystem blob store~~ — **done** | `summ-storage/` | — |
+| ~~D~~ | ~~Upload session handling~~ — **done** in the HTTP layer; still on the in-memory seam, so `U` keys are not yet written | `summ-server/`, `U` keys | B, C |
+| ~~E~~ | ~~Registry ops layer~~ — **done** | `summ-registry/` | — |
+| K | **Wiring** — replace `summ-server`'s `seam::Registry` in-memory impl with `summ-registry` + `summ-storage` + `summ-meta`, and stream blob bodies | `summ-server/` | B, C, E |
 | F | Purge | `summ-purge/` | E |
 | G | Scale benchmark — synthetic 10M-repo dataset, engine A/B | `benches/` | — |
 | H | Extension API — cursor-paged discovery endpoints | `summ-server/` | E |
 | I | Built-in web UI — embedded assets, served on the same port | `summ-ui/` | H |
 | J | Analytics — pull-count queue, aggregation worker, retention sweep | `summ-analytics/` | E |
 
-Package E is the natural next step and the one most worth doing carefully: it is
-where spec semantics meet the key schema.
+Packages B, C, E and D are done. **Package K, the wiring, is the next step** and
+is what turns four tested libraries into a registry: the four were built
+concurrently against a fixed schema, which is why the seam exists at all.
+
+One thing that fell out of building them concurrently and is worth keeping:
+`summ-server` reaches the layers below only through `seam::Registry`, whose
+failures are in spec vocabulary (`OpsError::{RepoUnknown, BlobUnknown,
+OffsetMismatch, …}`). The layer below never learns about HTTP. Keep that
+property when wiring — it is what makes the ops layer testable without a
+server, and the server testable without a store.
 
 ## Engine choice — RocksDB (decided)
 
@@ -399,6 +448,12 @@ driver trait small, which is what makes an S3 driver clean later.
 
 Four deliberate deviations:
 
+0. **The blob store is Unix-only.** `pread`/`pwrite` via
+   `std::os::unix::fs::FileExt`, which is what R2 argues for over
+   seek-then-read. Not a limitation worth removing — Linux is the deployment
+   target and macOS the development one — but it is a real constraint that was
+   not written down before.
+
 1. **Deeper fan-out, no per-blob directory.** distribution uses
    `blobs/sha256/ab/<full-hex>/data` — 2 hex chars, so 256 first-level buckets,
    which at 10⁸ blobs is ~400K subdirectories each; and the per-blob directory
@@ -426,8 +481,9 @@ Four deliberate deviations:
    zero, relying on Go's `encoding.BinaryMarshaler`. Rust has an equivalent:
    `crypto-common` 0.2 exposes `hazmat::SerializableState`, and `sha2` 0.11
    implements it for both `Sha256VarCore` and `Sha512VarCore` (verified by
-   experiment: state serialises to **104 bytes** for sha256, and a hasher
-   rehydrated from it produces a digest identical to the uninterrupted one).
+   experiment: state serialises to **104 bytes** for sha256 and **208 bytes**
+   for sha512, and a hasher rehydrated from it produces a digest identical to
+   the uninterrupted one).
 
    This is better than distribution's arrangement, because 104 bytes fits
    directly in the `UploadSession` record under the `U` key rather than needing
@@ -745,11 +801,51 @@ manifest and descriptor types. `oci-client` 0.17.0 is worth having in dev
 dependencies for tests and the bench harness, not in the server. Detail and the
 rejected alternatives are in `research/R5`.
 
-## Pending schema changes (from `research/R4`)
+## Schema changes from `research/R4` — **applied**
 
-Found by reviewing zot and Harbor; agreed but **not yet applied**, deliberately
-batched so the key schema changes once rather than three times. Apply together
-once R1 (spec) and R3 (RocksDB tuning) have landed.
+Found by reviewing zot and Harbor, and deliberately batched so the key schema
+moved once rather than three times. Applied together now that R1 (spec) and R3
+(RocksDB tuning) have landed; the prefix extractor moved to `summ.prefix.v2` in
+the same pass, exactly once. Kept here as the record of what changed and why.
+
+**Deferred, deliberately:**
+
+- **Manifest-digest interning to a `u32`** — measured by R3 as roughly halving
+  the `R` keyspace, a bigger space win than every tuning knob combined. Still
+  not adopted: it is a schema change with its own costs and it wants its own
+  measurement first.
+- **S3 multipart identifiers on `UploadSession`** — a value change, not a key
+  change, and there is no S3 driver until Phase 5. The version marker that
+  landed in this batch is exactly what makes adding them later safe.
+
+**Found during implementation, still open:**
+
+- **`ManifestRecord.artifact_type` cannot answer a referrers query on its own.**
+  The value the response must carry is the *effective* artifact type: an image
+  manifest with no `artifactType` reports its **config descriptor's
+  mediaType**, which the record does not store. Free on the push path, where the
+  parsed body is in hand — but synthesising an edge for a cosign tag set after
+  the fact forces a re-read and re-parse of `B`. A `config_media_type` field, or
+  redefining `artifact_type` as the effective value, removes that read.
+- **`keys::tag_history_before(ts)` is inclusive of events at exactly `ts`.** The
+  cursor seeks to `H <repo> <tag> 0x00 !ts` as specified, but the digest follows
+  in the key, so an event at exactly `ts` sorts after the cursor and is
+  returned. #606's `before` most likely means strictly-before; closing the gap
+  means seeking to `!(ts - 1)` instead. Harmless until the endpoint exists.
+- **`summ_core::keys` has encoders but no decoders** for the digest-bearing
+  suffixes (`M`, `P`, `F`, `S`, `R`). Every paged query needs them to turn an
+  engine cursor into a URL-safe token. They currently live in
+  `summ-registry/src/suffix.rs` and belong next to the encoders.
+- **`SummError` has no `Io` variant and no `OffsetMismatch { expected, got }`.**
+  An out-of-order upload append — which the HTTP layer must turn into a 416 —
+  currently rides on `InvalidData`. Matchable without parsing messages, but a
+  dedicated variant is the honest end state.
+- **`DigestAlgorithm` lives in `summ-storage`, not `summ-core`.** An upload
+  picks an algorithm at POST time from `?digest-algorithm=`, before any hash
+  exists, and `Digest` can only name one after the fact. It belongs beside
+  `Digest`.
+
+The original list follows.
 
 - **`F` must carry a value.** The referrers response is an image index whose
   entries require `artifactType` and `annotations`, and `?artifactType=`

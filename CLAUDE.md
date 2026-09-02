@@ -23,6 +23,10 @@ operation rather than an afterthought.
   owns every relationship, and a second source of truth will diverge.
 - **Blobs land and fsync before the metadata batch commits.** An orphan blob is
   garbage; metadata pointing at a missing blob is corruption.
+- **No `skip_serializing_if` on a stored record.** postcard is not
+  self-describing, so a skipped field is not "absent" on the wire — it is
+  missing, and the decoder reads the next field's bytes. `PLAN.md` records the
+  bug this caused; `summ-core/tests/postcard_roundtrip.rs` is the guard.
 - **All mutations go through `WriteBatch`.** It is atomic, serialisable, and
   idempotent — it is the future WAL. Two rules follow: no side-channel writes
   (they would be invisible to the log and diverge replicas), and no
@@ -39,6 +43,10 @@ operation rather than an afterthought.
 ## Layout
 
 ```
-summ-core    digest, key encoding, value types, errors
-summ-meta    MetaEngine trait, WriteBatch, RocksDB + redb engines, repo interner
+summ-core     digest, key encoding, value types, errors
+summ-meta     MetaEngine trait, WriteBatch, RocksDB + redb engines, repo
+              interner, schema version + migration seam
+summ-storage  filesystem blob store (Unix only: pread/pwrite)
+summ-registry ops layer — spec operations as WriteBatch builders
+summ-server   axum HTTP layer, /v2/ route table, the `summ` binary
 ```
