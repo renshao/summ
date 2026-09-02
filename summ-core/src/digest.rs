@@ -24,6 +24,19 @@ pub enum Digest {
     Sha512([u8; 64]),
 }
 
+/// Encoded key length for an algorithm byte, without needing a whole `Digest`.
+///
+/// The RocksDB prefix extractor classifies keys by reading the algorithm byte
+/// out of a raw key, so it needs this without decoding. Exported as a function
+/// rather than as the constants so it cannot drift from `encode_into`.
+pub fn encoded_len_of(algo: u8) -> Option<usize> {
+    match algo {
+        ALGO_SHA256 => Some(33),
+        ALGO_SHA512 => Some(65),
+        _ => None,
+    }
+}
+
 impl Digest {
     pub fn algorithm(&self) -> &'static str {
         match self {
@@ -174,6 +187,17 @@ mod tests {
         let s = "sha512:".to_string() + &"3f".repeat(64);
         let d: Digest = s.parse().unwrap();
         assert_eq!(d.to_string(), s);
+    }
+
+    #[test]
+    fn encoded_len_of_agrees_with_the_encoder() {
+        for d in [Digest::Sha256([0; 32]), Digest::Sha512([0; 64])] {
+            let mut buf = Vec::new();
+            d.encode_into(&mut buf);
+            assert_eq!(encoded_len_of(buf[0]), Some(d.encoded_len()));
+        }
+        assert_eq!(encoded_len_of(0), None);
+        assert_eq!(encoded_len_of(99), None);
     }
 
     #[test]

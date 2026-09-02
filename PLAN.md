@@ -305,28 +305,60 @@ writes. Bulk deletes become cheap tombstones. And block compression matters more
 here than usual, because most of the keyspace is valueless edge keys sharing long
 digest prefixes.
 
-### Sizing
+### Sizing — measured
 
 The one-key-per-edge rule trades O(N) write amplification for O(E) space, where E
 is the number of reference edges. That is the right trade — space is cheap,
-rewriting a 360 MB value per push is not — but E is large. At ~10⁹ manifests
-referencing ~20 blobs each, the `R` range alone is ~2×10¹⁰ keys of ~70 bytes:
-**order 1 TB before compression**. Compression is therefore load-bearing, not a
-nicety. Package G must measure post-compaction size on disk, not just throughput.
-Confirming aggregate manifest count (Risk 2) directly sizes this.
+rewriting a 360 MB value per push is not — but E is large.
 
-### Still to tune
+Measured on 20 M synthetic edge keys (`research/R3` §6): 79 B/key raw →
+**53.12 B/key with no compression at all**, purely from RocksDB's block key
+delta encoding, → **42.00 B/key** with zstd and 16 KiB blocks. Delta encoding
+does more work here than compression does, which is what you would hope given
+that edge keys share long digest prefixes.
 
-`RocksEngine::open` sets Lz4 with Zstd at the bottom level and nothing else.
-Deliberately unturned until there are measurements:
+**The dominant unknown is not a knob — it is the blob fan-out distribution.**
+At the same 20 M keys, varying references per blob: 1 → 78.24 B/key (a 1 %
+saving; delta encoding has nothing to bite on), 2 → 55.55, 10 → 42.00,
+100 → 39.41. So aggregate `R` size is governed by how widely blobs are shared in
+the real corpus, giving a planning range of roughly **800 GB to 1.6 TB**. That
+spread is wider than every tuning option combined. See Risk 2.
 
-- **Prefix bloom filters** would let `exists_prefix` skip SSTs entirely — the
-  single biggest available win for purge. Blocked on the fact that our prefixes
-  come in several lengths (1, 5, 34, 66 bytes) and a fixed-length prefix
-  transform fits only one of them. Options: a custom `SliceTransform` that reads
-  the type byte and returns the right length, or column families per key type.
-- **Column families** to separate hot small records from cold manifest bodies.
-- Block cache sizing, bloom bits/key, compaction style.
+One idea from R3 worth more than all the tuning: **interning manifest digests to
+a `u32`, as repo names already are, would roughly halve the `R` range.** Not yet
+adopted — it is a schema change with its own costs — but it is the largest single
+lever available.
+
+### Tuning — settled, see `research/R3`
+
+Applied in `RocksEngine::open`. The headline: **RocksDB's default
+`filter_policy` is `nullptr`** (`table.h:590`), so before this the engine had no
+bloom filters at all.
+
+- **Custom `SliceTransform` (`"summ.prefix.v1"`).** The prefix-consistency
+  property RocksDB demands *is* satisfied by a variable-length transform,
+  because the bytes deciding the length — the type byte, and for digest-bearing
+  keys the algorithm byte — are themselves inside the prefix. Proved and verified
+  experimentally. There are **six** prefix lengths, not the four first assumed:
+  1, 5, 34, 38, 66, 70.
+- **Measured: 118 829 → 735 796 negative `exists_prefix`/s, a 6.2× win** on the
+  purge hot path, and the prefix filter costs **10× less space** than a
+  whole-key filter (0.125 vs 1.25 B/key) because it holds one entry per group.
+- **Whole-key blooms do nothing for `exists_prefix`** — it is a seek, not a
+  point lookup. Kept anyway for `get`.
+- **16 KiB blocks** shrink the index ~4× (a projected 11.2 GB → 2.9 GB) for the
+  same data size. That, not compression, is the reason to raise it.
+- **Explicit 512 MiB LRU block cache** — RocksDB's default is 32 MiB.
+- **Rejected:** `optimize_for_point_lookup` (silently replaces the table factory
+  and cache), `optimize_filters_for_hits` (drops exactly the filters purge
+  needs), universal compaction, zstd dictionaries (measured *worse*), and
+  column families. Cross-CF `WriteBatch` **is** atomic — verified by 12 rounds of
+  SIGKILL during ~7000 three-CF batches, zero torn — so CFs were viable, but
+  there is no merged cross-CF iterator and they leak a RocksDB concept into
+  `MetaOp` and the replication log for nothing the transform does not already
+  give.
+- `auto_prefix_mode` is unusable: not exposed by the binding, and carries a
+  documented `BUG:` in 11.8.1.
 
 ### redb
 
@@ -459,9 +491,13 @@ plain copy, or shared object storage.
    could still surprise us (see Sizing above). Package G measures it. Mitigation
    remains in place: nothing depends on RocksDB beyond `MetaEngine`, and a second
    implementation proves it.
-2. **Aggregate manifest count is still unspecified.** "10M repos, 10M manifests
-   per repo" bounds each axis but not the total, and the total is what sizes the
-   engine. Assumed ~10⁹ pending confirmation.
+2. **Aggregate manifest count and blob fan-out are both unspecified**, and R3
+   showed fan-out matters as much as count: per-key cost ranges from 78 B at one
+   reference per blob to 39 B at a hundred, giving an ~800 GB to ~1.6 TB planning
+   range for the `R` keyspace alone. "10M repos, 10M manifests per repo" bounds
+   each axis but not the total. Assumed ~10⁹ manifests pending confirmation; a
+   sample of the real corpus's sharing distribution would narrow this more than
+   any further tuning.
 3. **Filesystem fan-out.** distribution's 2 hex chars gives 256 directories; at
    10⁸ blobs that is ~400K entries each. Use three levels. See Blob storage.
 4. **Offline purge is a scaling cliff.** Acceptable for v1 by decision. The
@@ -542,6 +578,12 @@ once R1 (spec) and R3 (RocksDB tuning) have landed.
   storage) **and S3 multipart identifiers.**
 - **Purge must treat any `RepoId` referenced by a live `U` session as live**,
   or it can retire an interner entry an in-flight upload still holds.
+- **`DeletePrefix` is the wrong primitive for a single blob's edge range** (it
+  is ~10 keys) — point-delete them instead, which also strengthens the case for
+  `scan_keys`.
+- **Consider interning manifest digests to a `u32`.** R3 measures this as
+  roughly halving the `R` keyspace — a bigger space win than every tuning knob
+  combined.
 - **`MetaEngine` gains `scan_keys`** (or `Page` becomes value-optional) — purge
   scans millions of valueless edge keys and currently allocates an empty `Vec`
   per row.
@@ -568,7 +610,7 @@ Still outstanding, most blocking first:
 |---|---|---|---|
 | ~~R1~~ | ~~Spec + conformance~~ — **done**, `research/R1-spec-conformance.md` | ~~Phase 1~~ | The endpoint list is the easy part. The sharp edges are the error-code taxonomy, `Docker-Content-Digest`, chunked-upload `Content-Range` validation and out-of-order rejection, cross-repo mount, pagination `Link` headers, content negotiation, and the referrers fallback tag schema. Guessing these means failing conformance late. |
 | ~~R2~~ | ~~Zero-copy blob serving~~ — **done**, `research/R2-zero-copy-serving.md`; answer: do not. `sendfile` via `spawn_blocking` vs `io_uring`/`tokio-uring` maturity vs plain `tokio::fs` streaming; plus Range handling. | Phase 3 | This is where "very fast" is won. `../container-registry/notes/fs_limit.md` shows large pulls are network-saturated at ~1.56 GB/s, so the goal is near-zero CPU per byte, spending the headroom on concurrency. |
-| R3 | **RocksDB tuning: custom `SliceTransform` vs column families per key type.** | Phase 2 hardening | Prefix bloom filters are the biggest available win for `exists_prefix`, the purge hot path, but our prefixes come in four lengths (1, 5, 34, 66 bytes) and a fixed transform fits one. Column families would also let manifest bodies be tuned separately from small records. |
+| ~~R3~~ | ~~RocksDB tuning~~ — **done and applied**, `research/R3-rocksdb-tuning.md` | ~~Phase 2~~ | Prefix bloom filters are the biggest available win for `exists_prefix`, the purge hot path, but our prefixes come in four lengths (1, 5, 34, 66 bytes) and a fixed transform fits one. Column families would also let manifest bodies be tuned separately from small records. |
 | ~~R4~~ | ~~zot prior art~~ — **done**, `research/R4-zot-prior-art.md` | ~~Packages C, E~~ | The closest prior art: a real registry with an embedded metadata store and a working S3 driver. Our schema is settled, so this is a cross-check for things we have missed — referrers handling, signature/attestation artifacts — and a second opinion on the driver trait. |
 | ~~R5~~ | ~~Client behaviour + Rust ecosystem~~ — **done**, `research/R5-clients-and-ecosystem.md`. | Phase 3 | Determines what to optimise: request ordering, concurrency, whether it reuses connections, how it handles 206s. Optimising for a synthetic client is a way to win a benchmark and lose in production. |
 | ~~R6~~ | ~~Rust ecosystem survey~~ — **done**, folded into `research/R5` Part B. | — | — |
