@@ -286,10 +286,19 @@ alongside applying it — no change to callers.
 
 The property that makes this work is that batches contain only `Put`, `Delete`,
 and `DeletePrefix`. There is no read-modify-write anywhere, because the schema
-has no fan-in vectors that would need one. **That makes every batch idempotent**,
-so replay is safe, retries are safe, and a replica that reapplies an overlapping
-suffix of the log converges. Had we kept the prototype's `merge` primitive,
-replay would have required exactly-once delivery — a far harder problem.
+has no fan-in vectors that would need one. Had we kept the prototype's `merge`
+primitive, replay would have required exactly-once delivery — a far harder
+problem.
+
+**One correction to an earlier, too-strong claim here.** `Put` and `Delete` are
+self-contained: their effect is fully determined by the batch's own content.
+`DeletePrefix` is not — its blast radius depends on what happens to be in the
+store when it is applied. So a log of these batches is safe to replay **in
+order, from a consistent point**, and replaying an overlapping suffix in order
+converges. It is *not* safe under arbitrary reordering, nor against a store that
+a second writer is mutating outside the log. Do not describe the batches as
+simply "idempotent" without that qualifier; the WAL design must guarantee
+ordered replay.
 
 Two constraints to preserve, both already in CLAUDE.md:
 
@@ -304,6 +313,19 @@ plain copy, or shared object storage.
 
 ## Risks
 
+0. **A lost or corrupt RocksDB is a dead registry.** This is the largest
+   durability gap and it was previously unlisted. Manifest bytes live only under
+   `B` and tags only under `T`, so the metadata store is authoritative with no
+   way to reconstruct it. A full disk of blobs would be unidentifiable. zot does
+   not have this problem — its metadata is a derived cache rebuilt by walking
+   storage — which is also why its migration patch lists are empty: it can always
+   rebuild. Two mitigations to decide on before v1 ships, in `research/R4`:
+   write manifest bytes to the blob store as well as `B` (one small object per
+   manifest, makes the corpus self-describing), and add a `DBVersion` key plus a
+   migration hook now, because retrofitting a version marker onto a populated
+   store is unpleasant. Neither recovers tags; the planned WAL is what covers
+   those.
+
 1. **RocksDB at 10¹⁰ keys is chosen but unmeasured.** The engine decision is
    made; the *tuning* is not, and post-compaction size on disk is the number that
    could still surprise us (see Sizing above). Package G measures it. Mitigation
@@ -317,6 +339,49 @@ plain copy, or shared object storage.
 4. **Offline purge is a scaling cliff.** Acceptable for v1 by decision. The
    upgrade path is upload-session pinning via `U` keys plus an mtime grace
    period — additive, not a redesign.
+
+## Pending schema changes (from `research/R4`)
+
+Found by reviewing zot and Harbor; agreed but **not yet applied**, deliberately
+batched so the key schema changes once rather than three times. Apply together
+once R1 (spec) and R3 (RocksDB tuning) have landed.
+
+- **`F` must carry a value.** The referrers response is an image index whose
+  entries require `artifactType` and `annotations`, and `?artifactType=`
+  filters on them. `F` is valueless and `ManifestRecord` has neither field, so
+  **a spec-compliant referrers response cannot be built from the current schema
+  at all.** Give `F` a `ReferrerRecord { media_type, artifact_type, size,
+  annotations }`. That is bounded fan-out — one referrer's own descriptor — so it
+  does not violate the no-growing-values rule, and it turns the endpoint into a
+  single ordered prefix scan with the filter applied during it. Harbor
+  denormalises identically onto `artifact_accessory`; two independent systems
+  landing on the same shape is a strong signal.
+- **Synthesise `F` edges for legacy cosign tags** (`^sha256-<hex>\.(sig|sbom|att)$`).
+  Otherwise deleting a subject manifest leaves the signature tag dangling
+  forever with its layers pinned by `R`, and purge — which keys entirely off "is
+  it tagged?" — never reclaims it. A leak, not a correctness bug, but silent.
+- **`P` gains `{size, added_at}`** — the grace clock for expiring
+  uploaded-but-unreferenced blobs has nowhere to live today.
+- **`ManifestRecord` gains `pushed_at`, `artifact_type`, `annotations`; `T`
+  gains `tagged_at`.** No timestamps anywhere means no retention story.
+- **`UploadSession` gains the serialised hasher state** (104 bytes, see Blob
+  storage) **and S3 multipart identifiers.**
+- **Purge must treat any `RepoId` referenced by a live `U` session as live**,
+  or it can retire an interner entry an in-flight upload still holds.
+- **`MetaEngine` gains `scan_keys`** (or `Page` becomes value-optional) — purge
+  scans millions of valueless edge keys and currently allocates an empty `Vec`
+  per row.
+
+Two rules to write down while they are fresh:
+
+- **Never hold a repo-scoped lock across a request-body read.** zot's
+  `imagestore.go:1039` is the bug report: an unread body under a write lock
+  stalls everything until `ReadTimeout`. summ has no such lock today; the risk is
+  introducing one for purge or upload-offset validation.
+- **Never re-read a blob to verify it.** zot's S3 path costs three full passes
+  over every layer — complete multipart, re-read the whole object to hash it,
+  then `Move` (copy+delete). Hash on the way in; the resumable-hasher design
+  already makes this free.
 
 ## Research status
 
