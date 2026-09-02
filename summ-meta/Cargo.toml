@@ -1,0 +1,16 @@
+[package]
+name = "summ-meta"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+summ-core.workspace = true
+serde.workspace = true
+postcard.workspace = true
+redb.workspace = true
+parking_lot = "0.12"
+lru = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
