@@ -252,13 +252,21 @@ Four deliberate deviations:
    `UploadSession` under `U` keys, which is cheaper to scan and already
    transactional with everything else.
 
-4. **Resumable hashing is an open question.** distribution serialises hasher
-   state to `hashstates/<algo>/<offset>` so a resumed chunked upload need not
-   rehash from zero — Go's `hash.Hash` implements `encoding.BinaryMarshaler`.
-   **Rust's `sha2` exposes no equivalent stable API**, so this does not port
-   directly. For v1, keep the hasher in memory in the session: correct, simple,
-   and fine for a single node — but it pins an upload to one process, so it is a
-   constraint to revisit alongside HA. Do not design it away silently.
+4. **Resumable hashing does port.** distribution serialises hasher state to
+   `hashstates/<algo>/<offset>` so a resumed chunked upload need not rehash from
+   zero, relying on Go's `encoding.BinaryMarshaler`. Rust has an equivalent:
+   `crypto-common` 0.2 exposes `hazmat::SerializableState`, and `sha2` 0.11
+   implements it for both `Sha256VarCore` and `Sha512VarCore` (verified by
+   experiment: state serialises to **104 bytes** for sha256, and a hasher
+   rehydrated from it produces a digest identical to the uninterrupted one).
+
+   This is better than distribution's arrangement, because 104 bytes fits
+   directly in the `UploadSession` record under the `U` key rather than needing
+   its own files on the storage driver. An interrupted chunked upload can then
+   resume on any process, which removes what would otherwise have been an HA
+   constraint. Note it requires `sha2` 0.11+; the trait does not exist in the
+   0.10 line. The trait is in a `hazmat` module and the serialised state is
+   sensitive - it must not be exposed outside the metadata store.
 
 ### Crash consistency
 
@@ -304,12 +312,33 @@ plain copy, or shared object storage.
 2. **Aggregate manifest count is still unspecified.** "10M repos, 10M manifests
    per repo" bounds each axis but not the total, and the total is what sizes the
    engine. Assumed ~10⁹ pending confirmation.
-3. **Resumable upload hashing has no direct Rust equivalent** to distribution's
-   serialised hash state. v1 keeps the hasher in memory, which pins an upload to
-   one process — a constraint on HA, not on v1. See Blob storage.
+3. **Filesystem fan-out.** distribution's 2 hex chars gives 256 directories; at
+   10⁸ blobs that is ~400K entries each. Use three levels. See Blob storage.
 4. **Offline purge is a scaling cliff.** Acceptable for v1 by decision. The
    upgrade path is upload-session pinning via `U` keys plus an mtime grace
    period — additive, not a redesign.
+
+## Research status
+
+Settled, with the finding recorded above: metadata engine (RocksDB), blob
+storage layout, resumable upload hashing, online-vs-offline purge.
+
+Still outstanding, most blocking first:
+
+| # | Topic | Blocks | Why it is not obvious |
+|---|---|---|---|
+| R1 | **Read the spec properly and run the conformance suite.** Nobody has yet read `../distribution-spec`'s text or executed `conformance/`. | Phase 1 — everything | The endpoint list is the easy part. The sharp edges are the error-code taxonomy, `Docker-Content-Digest`, chunked-upload `Content-Range` validation and out-of-order rejection, cross-repo mount, pagination `Link` headers, content negotiation, and the referrers fallback tag schema. Guessing these means failing conformance late. |
+| R2 | **Zero-copy blob serving on stable Rust, 2026.** `sendfile` via `spawn_blocking` vs `io_uring`/`tokio-uring` maturity vs plain `tokio::fs` streaming; plus Range handling. | Phase 3 | This is where "very fast" is won. `../container-registry/notes/fs_limit.md` shows large pulls are network-saturated at ~1.56 GB/s, so the goal is near-zero CPU per byte, spending the headroom on concurrency. |
+| R3 | **RocksDB tuning: custom `SliceTransform` vs column families per key type.** | Phase 2 hardening | Prefix bloom filters are the biggest available win for `exists_prefix`, the purge hot path, but our prefixes come in four lengths (1, 5, 34, 66 bytes) and a fixed transform fits one. Column families would also let manifest bodies be tuned separately from small records. |
+| R4 | **Read `../zot/pkg/meta/boltdb` and `pkg/storage/{types,s3,local}`.** | Packages C, E | The closest prior art: a real registry with an embedded metadata store and a working S3 driver. Our schema is settled, so this is a cross-check for things we have missed — referrers handling, signature/attestation artifacts — and a second opinion on the driver trait. |
+| R5 | **containerd's pull behaviour.** | Phase 3 | Determines what to optimise: request ordering, concurrency, whether it reuses connections, how it handles 206s. Optimising for a synthetic client is a way to win a benchmark and lose in production. |
+| R6 | **Survey existing Rust registry implementations.** | — | Cheap, and worth one pass before committing to an HTTP/storage shape. |
+
+Not research, but open and worth closing:
+
+- **Aggregate manifest count** (Risk 2) — the per-axis bounds do not size the store.
+- **No `LICENSE` file.** `Cargo.toml` declares Apache-2.0 but nothing backs it, so
+  the repo is public with no effective licence grant.
 
 ## Reference material (sibling directories)
 
