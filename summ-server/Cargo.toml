@@ -1,0 +1,32 @@
+[package]
+name = "summ-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "summ"
+path = "src/main.rs"
+
+# summ-meta, summ-storage and summ-registry are deliberately absent. The HTTP
+# layer talks to them only through the `seam::Registry` trait defined here, so
+# adding them as dependencies before that wiring exists would buy nothing and
+# would couple this crate's build to theirs.
+[dependencies]
+summ-core.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+sha2.workspace = true
+async-trait = "0.1"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "set-header"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile.workspace = true

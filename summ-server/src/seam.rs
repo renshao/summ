@@ -1,0 +1,269 @@
+//! The seam between the HTTP layer and everything below it.
+//!
+//! `summ-registry` (manifest and tag operations over `WriteBatch`) and
+//! `summ-storage` (the content-addressed blob store) are separate crates built
+//! separately. This trait is what the handlers actually call, so the HTTP layer
+//! is complete and testable before either exists, and so wiring them up later
+//! is an implementation of one trait rather than a rewrite of the handlers.
+//!
+//! Three rules shaped it, and they are worth keeping if it grows:
+//!
+//! - **Every method is a single registry operation**, not a step in one. There
+//!   is no `begin`/`commit` pair, because a push must land as one `WriteBatch`
+//!   and a seam that let the HTTP layer sequence writes would make that
+//!   impossible to guarantee.
+//! - **Failures are expressed in spec terms** ([`OpsError`]), not storage
+//!   terms. The layer below knows that an offset did not match; only the layer
+//!   above knows that means `416 BLOB_UPLOAD_INVALID`.
+//! - **Identifiers are minted above and passed down.** `create_upload` takes
+//!   the id rather than returning one, because a `WriteBatch` must contain no
+//!   engine-minted values if it is to mean the same thing when replayed on a
+//!   replica.
+//!
+//! Pagination is a page plus a `more` flag rather than an opaque cursor. The
+//! flag is the whole reason `Link` can be emitted only when a further page
+//! genuinely exists - the reference implementation cannot tell, so it emits
+//! `Link` on the final page too and every client pays for one wasted request.
+
+use std::collections::BTreeMap;
+
+use async_trait::async_trait;
+use axum::body::{Body, Bytes};
+use summ_core::Digest;
+
+use crate::range::ByteRange;
+use crate::reference::Reference;
+
+/// One page of an ordered scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    /// Whether a key exists beyond this page. Determined by peeking one past
+    /// the limit, never by "the page was full".
+    pub more: bool,
+}
+
+impl<T> Page<T> {
+    pub fn empty() -> Self {
+        Page {
+            items: Vec::new(),
+            more: false,
+        }
+    }
+}
+
+/// Everything a `HEAD` on a manifest needs, which is also everything a `GET`
+/// needs besides the bytes.
+///
+/// `media_type` is the `Content-Type` the client pushed, stored verbatim. The
+/// spec requires the response `Content-Type` to match the manifest's own
+/// `mediaType` field, and the suite asserts it exactly, so it is never
+/// synthesised or normalised here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestStat {
+    pub digest: Digest,
+    pub media_type: String,
+    pub size: u64,
+}
+
+/// What a manifest `PUT` reports back to the HTTP layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestPut {
+    /// Digest of the bytes as received. `Docker-Content-Digest` is this value,
+    /// under the algorithm the client used - summ never rehashes under a
+    /// different algorithm, so the spec's differing-algorithm escape hatch
+    /// never applies.
+    pub digest: Digest,
+    /// The manifest's `subject`, if it had one. Drives `OCI-Subject`.
+    pub subject: Option<Digest>,
+    /// Tags applied from `?tag=` parameters. Drives `OCI-Tag`.
+    pub tags: Vec<String>,
+}
+
+/// A blob body ready to be written to the socket.
+///
+/// `body` is an `axum::body::Body` rather than `Bytes` precisely so the real
+/// implementation can stream: containerd 2.1+ chunked fetch opens `bytes=N-`,
+/// reads 8 MiB and kills the connection, so buffering a whole blob to answer a
+/// range is pathological.
+pub struct BlobRead {
+    /// Full size of the blob, for `Content-Range`'s `/<total>`.
+    pub total_size: u64,
+    /// The window actually being served. `None` means the whole blob.
+    pub window: Option<ByteRange>,
+    pub body: Body,
+}
+
+/// One entry of a referrers image index.
+///
+/// `artifact_type` is resolved at push time, not here: for an image manifest it
+/// falls back to the config descriptor's `mediaType`, and for an index it is
+/// omitted entirely when absent. Resolving it on write is what keeps the
+/// referrers endpoint a pure ordered scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Descriptor {
+    pub media_type: String,
+    pub digest: Digest,
+    pub size: u64,
+    pub artifact_type: Option<String>,
+    pub annotations: BTreeMap<String, String>,
+}
+
+/// A referrers response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Referrers {
+    pub manifests: Vec<Descriptor>,
+    /// Whether the `?artifactType=` filter was actually applied. Drives
+    /// `OCI-Filters-Applied`, which must be sent only when the filter is exact
+    /// - the suite then verifies no descriptor of another type is present.
+    pub filter_applied: bool,
+}
+
+/// Failures the layers below can report, in the vocabulary of the spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpsError {
+    RepoUnknown,
+    ManifestUnknown,
+    BlobUnknown,
+    UploadUnknown,
+    /// A chunk did not begin at the committed offset. `current` is the offset
+    /// the session is actually at, which the `416` path leaves untouched.
+    OffsetMismatch {
+        current: u64,
+    },
+    /// The bytes did not hash to the digest the client named.
+    DigestMismatch,
+    /// The manifest could not be parsed well enough to index it. Note this is
+    /// *not* schema validation: manifests carrying fields outside the OCI
+    /// schema must round-trip, and referenced blobs are deliberately not
+    /// required to exist.
+    ManifestInvalid(String),
+    Internal(String),
+}
+
+pub type OpsResult<T> = Result<T, OpsError>;
+
+/// The one trait the handlers depend on.
+#[async_trait]
+pub trait Registry: Send + Sync + 'static {
+    // ---- discovery -------------------------------------------------------
+
+    /// Repository names in byte order, starting strictly after `last`.
+    async fn repositories(&self, last: Option<&str>, limit: usize) -> OpsResult<Page<String>>;
+
+    /// Tags in byte order, starting strictly after `last`.
+    /// `Err(OpsError::RepoUnknown)` when the repository does not exist.
+    async fn tags(&self, name: &str, last: Option<&str>, limit: usize) -> OpsResult<Page<String>>;
+
+    // ---- manifests -------------------------------------------------------
+
+    /// Metadata only. `HEAD` is a first-class path, never a `GET` with the body
+    /// thrown away: four of the five serial steps in a cold containerd pull are
+    /// metadata lookups, and this is the first of them.
+    async fn stat_manifest(&self, name: &str, reference: &Reference) -> OpsResult<ManifestStat>;
+
+    /// The manifest exactly as pushed. The bytes are never re-serialised - the
+    /// digest is over them and the suite byte-compares.
+    async fn get_manifest(
+        &self,
+        name: &str,
+        reference: &Reference,
+    ) -> OpsResult<(ManifestStat, Bytes)>;
+
+    /// `tags` carries any `?tag=` parameters, already validated against the tag
+    /// grammar.
+    async fn put_manifest(
+        &self,
+        name: &str,
+        reference: &Reference,
+        content_type: &str,
+        tags: &[String],
+        body: Bytes,
+    ) -> OpsResult<ManifestPut>;
+
+    /// Deleting by digest MUST cascade to every tag pointing at it; deleting by
+    /// tag MUST leave the manifest reachable by digest.
+    async fn delete_manifest(&self, name: &str, reference: &Reference) -> OpsResult<()>;
+
+    // ---- blobs -----------------------------------------------------------
+
+    /// Size of a blob servable under `name`. Membership is per repository: a
+    /// blob present elsewhere in the registry is not servable here.
+    async fn stat_blob(&self, name: &str, digest: &Digest) -> OpsResult<u64>;
+
+    async fn get_blob(
+        &self,
+        name: &str,
+        digest: &Digest,
+        window: Option<ByteRange>,
+    ) -> OpsResult<BlobRead>;
+
+    /// Removes the blob's membership of `name` only. Deleting from one
+    /// repository must not affect another that has the same blob mounted.
+    async fn delete_blob(&self, name: &str, digest: &Digest) -> OpsResult<()>;
+
+    /// Cross-repository mount. `Ok(true)` mounted, `Ok(false)` refused - a
+    /// refusal is not an error, it means "answer `202` and take a normal
+    /// upload". `from` is optional: the spec allows anonymous mount, and with a
+    /// registry-wide blob record "is this blob present anywhere" is one lookup.
+    async fn mount_blob(&self, name: &str, digest: &Digest, from: Option<&str>) -> OpsResult<bool>;
+
+    // ---- uploads ---------------------------------------------------------
+
+    /// `algorithm` comes from `?digest-algorithm=` and selects which hasher the
+    /// session carries; it defaults to `sha256`.
+    async fn create_upload(&self, name: &str, id: &str, algorithm: &str) -> OpsResult<()>;
+
+    /// Committed byte count. Backs both the `416` check and the end-13 status
+    /// `GET`, and must not have any side effect - the spec requires a rejected
+    /// chunk to leave the session byte-identical.
+    async fn upload_offset(&self, name: &str, id: &str) -> OpsResult<u64>;
+
+    /// Append at `expected_offset`, returning the new committed offset.
+    ///
+    /// The offset is re-checked here as well as in the handler. The handler
+    /// checks it because that is where the `Content-Range` grammar lives; the
+    /// implementation checks it because only it can do so atomically with the
+    /// write.
+    async fn append_upload(
+        &self,
+        name: &str,
+        id: &str,
+        expected_offset: u64,
+        chunk: Bytes,
+    ) -> OpsResult<u64>;
+
+    /// Append an optional final chunk, verify the whole-blob digest, and commit.
+    ///
+    /// Verification happens only here: a `PATCH` cannot verify a whole-blob
+    /// digest because it has not seen the end. On mismatch nothing is
+    /// committed.
+    async fn finish_upload(
+        &self,
+        name: &str,
+        id: &str,
+        expected_offset: u64,
+        chunk: Bytes,
+        digest: &Digest,
+    ) -> OpsResult<()>;
+
+    async fn cancel_upload(&self, name: &str, id: &str) -> OpsResult<()>;
+
+    /// Push a whole blob in one request (end-4b, the single-POST flow).
+    async fn put_blob(&self, name: &str, digest: &Digest, body: Bytes) -> OpsResult<()>;
+
+    // ---- referrers -------------------------------------------------------
+
+    /// Manifests in `name` whose `subject` is `subject`.
+    ///
+    /// An unknown subject is **not** an error: once the referrers API is on it
+    /// MUST NOT return `404`, so this returns an empty list. A subject that
+    /// does not resolve to a stored manifest is normal - the spec requires a
+    /// manifest with a dangling `subject` to be accepted and listed.
+    async fn referrers(
+        &self,
+        name: &str,
+        subject: &Digest,
+        artifact_type: Option<&str>,
+    ) -> OpsResult<Referrers>;
+}
