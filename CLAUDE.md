@@ -1,6 +1,8 @@
 # summ
 
-An OCI Distribution Spec compliant container registry in Rust.
+An OCI Distribution Spec compliant container registry in Rust. One binary, no
+dependencies, a built-in web UI, and metadata discovery as a first-class
+operation rather than an afterthought.
 
 @PLAN.md
 
@@ -26,6 +28,12 @@ An OCI Distribution Spec compliant container registry in Rust.
   (they would be invisible to the log and diverge replicas), and no
   non-deterministic content in a batch (no apply-time timestamps or engine-minted
   ids — the caller supplies them).
+- **Discovery is a headline feature, not an extra.** The extension API and the
+  embedded UI are core product surface. They are unstandardised, so they carry
+  their own tests — the conformance suite will not cover them.
+- **The binary stays self-contained.** No external database, object store or
+  sidecar required to run. A feature needing one must justify itself against
+  that, and the usual answer is to build it in.
 - `cargo test` before declaring anything done. `cargo clippy` and `cargo fmt`.
 
 ## Layout

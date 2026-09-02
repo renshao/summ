@@ -1,20 +1,94 @@
 # summ — build plan
 
-An OCI Distribution Spec compliant container registry in Rust. Single binary,
-fast, with a purpose-built metadata store so catalog and tag listing stay cheap
-at ten million repositories.
+An OCI Distribution Spec compliant container registry in Rust. One binary, no
+dependencies, a built-in web UI, and a purpose-built metadata store that makes
+discovery — what is in here, how much of it, and what references what — a
+first-class operation rather than an afterthought.
 
 This document is the entry point for a fresh session. It records what is decided,
 what is built, and what is open. Update it as work lands.
 
 ## Why this exists
 
-Cloud registries (ECR, ACR) fall over on two axes at scale:
+Four goals. They are not independent: the metadata store that makes discovery
+fast is the same one that makes pulls fast, and the UI is what proves both are
+real.
 
-1. **Catalog and list operations** — slow or unusable at high repo counts.
-2. **Rate limiting / throttling** — pull concurrency capped by the provider.
+### 1. Extremely fast
 
-summ targets both directly. Everything else is secondary.
+Fast is the point, not a feature. Two things follow from the research, and they
+are not what we assumed going in:
+
+- **The byte path is nearly free.** Serving blob bytes well costs 2–5 % of an
+  8-vCPU box at line rate, and the best possible implementation would save about
+  1 % (`research/R2`). Throughput is not where the race is won.
+- **Metadata latency is the product.** Four of the five serial steps in a cold
+  containerd pull are metadata lookups, and being sequential their latencies add
+  (`research/R5`). A registry that answers those in microseconds instead of
+  milliseconds is a *visibly* faster registry, on exactly the path every pull
+  takes.
+
+So the speed goal and the discovery goal below are the same engineering problem,
+approached from two directions.
+
+### 2. First-class metadata discovery
+
+The Distribution Spec is a transfer protocol. It can tell you the bytes of a
+manifest you already know the name of; it cannot tell you what is in your
+registry, how big it is, what a layer is shared by, or which manifests are
+untagged and reclaimable. `GET /v2/_catalog` is not even in the spec — it was
+removed before v1.0.0 and now sits in a reserved extension namespace, so
+*nothing* standard answers the most basic question an operator has.
+
+Every registry therefore bolts discovery on afterwards, over a store that was
+designed for transfer, and it is slow: distribution walks the filesystem, zot
+does a whole-repo read-modify-write, and the managed registries throttle or
+time out. This is the concrete failure that started the project — **catalog and
+list operations degrading at high repo counts, and provider rate limiting** on
+ECR and ACR.
+
+summ inverts the order. The metadata store is designed for discovery first, and
+transfer is served from it. Listing repositories, listing tags, counting
+manifests, summing a repo's size, and asking which manifests reference a layer
+are all ordered prefix scans over an index built for exactly that — at ten
+million repositories, with cursor pagination throughout and no operation that
+materialises an unbounded set.
+
+### 3. Simple to run — batteries included
+
+One binary. No database to provision, no object store to configure before first
+use, no sidecar, no migration step. `summ serve` on a laptop and on a
+ten-million-repo host should be the same command. RocksDB is compiled in and
+statically linked precisely so that "install the registry" is "copy one file".
+
+This is a design constraint, not a convenience: every feature that would require
+an external service has to justify itself against it, and the answer is usually
+to build the capability in rather than depend out.
+
+### 4. A built-in web UI
+
+Shipped in the binary, served on the same port, no separate build or deploy.
+Browse repositories, tags, manifests and their counts and sizes; drill into a
+manifest; see what a layer is shared by.
+
+The UI is not a side project — it is the reason goal 2 has a visible payoff, and
+it is the honesty check on the extension API. If the UI can render a
+ten-million-repo catalog responsively, the API underneath is genuinely
+cursor-paged and genuinely fast. If it cannot, no amount of benchmark numbers
+will cover for it. summdb already prototyped both the UI and the queries behind
+it, so this is proven ground rather than speculation.
+
+### Consequences
+
+- The **extension API is core product surface**, not a nice-to-have. It is what
+  the UI runs on and what makes summ worth choosing. It is also unstandardised,
+  so it needs its own tests — nothing external will check it.
+- **Everything is cursor-paged**, including the UI's own queries. A view that
+  sorts or counts across the whole registry is a bug, however convenient.
+- **Embedding the UI** means asset bundling in the binary and a UI that can be
+  developed without a separate toolchain in the release path.
+- Conformance remains the floor, not the ceiling: summ must pass the OCI suite,
+  but passing it is not the goal.
 
 ## Decisions locked
 
@@ -28,7 +102,9 @@ summ targets both directly. Everything else is secondary.
 | Purge (GC) | Offline for v1 | Registry read-only during sweep. Schema already supports online later — see below. |
 | Digest algorithms | sha256 + sha512 | Tagged enum, algorithm byte in key encoding. |
 | Conformance bar | Core push/pull at Phase 1; referrers by Phase 6 | `distribution-spec/conformance` is the gate. |
-| summdb | Prototype, not a dependency | Code copied in and reworked. summdb is not maintained once summ takes off. |
+| Web UI | Built in, served on the same port, assets embedded in the binary | No separate build or deploy. Constrains the extension API to be genuinely cursor-paged. |
+| Extension API | Core product surface, versioned separately from `/v2/` | Unstandardised, so it carries its own test suite. |
+| summdb | Prototype, not a dependency | Code copied in and reworked. summdb is not maintained once summ takes off. Its UI and stats queries are the starting point for Phase 2b. |
 
 "GC" throughout means *registry* garbage collection — purging unreferenced blobs
 and untagged manifests. Rust has no runtime GC; the terms are unrelated.
@@ -151,6 +227,15 @@ Wire `summ-meta` behind the HTTP layer. Catalog and tag pagination end-to-end.
 **Must include a synthetic load at target scale before committing to redb** — see
 Risks.
 
+### Phase 2b — discovery API and web UI
+The payoff for goals 2 and 4, and the honesty check on both. Cursor-paged
+extension endpoints (see "Beyond the spec"), then the embedded UI on top of them.
+
+Deliberately placed before the performance phase, not after. The UI is the thing
+that will expose an unbounded scan or an accidental full-table sort, and it is
+much cheaper to find those before tuning than after. If the UI can browse a
+ten-million-repo catalog responsively, the API underneath is honest.
+
 ### Phase 3 — performance
 Benchmark against distribution on the existing rig.
 
@@ -192,6 +277,8 @@ concurrently; each owns its files.
 | E | Registry ops layer — manifest put/get/delete as `WriteBatch` builders | `summ-registry/` | — |
 | F | Purge | `summ-purge/` | E |
 | G | Scale benchmark — synthetic 10M-repo dataset, engine A/B | `benches/` | — |
+| H | Extension API — cursor-paged discovery endpoints | `summ-server/` | E |
+| I | Built-in web UI — embedded assets, served on the same port | `summ-ui/` | H |
 
 Package E is the natural next step and the one most worth doing carefully: it is
 where spec semantics meet the key schema.
@@ -509,20 +596,30 @@ the goal is to burn near-zero CPU per byte and spend the headroom on
 concurrency. Note distribution's `maxthreads: 100` — precisely the kind of
 artificial ceiling not to reproduce.
 
-## Beyond the spec
+## Beyond the spec — the extension API
 
-**`GET /v2/_catalog` is not in the spec.** It was removed before v1.0.0 and the
-path now sits in a reserved extension namespace; the conformance suite never
-exercises it. Verified: the string does not appear in `spec.md` at all.
+`GET /v2/_catalog` is not in the Distribution Spec: removed before v1.0.0, the
+path now sits in a reserved extension namespace, and the conformance suite never
+exercises it. Verified — the string does not appear in `spec.md` at all.
 
-That is liberating rather than awkward. The single feature this project exists to
-fix is not a conformance obligation, so its pagination and ordering semantics are
-ours to choose — we are not bound to whatever `?n=`/`?last=` behaviour a
-reference implementation happens to have. It does mean the catalog needs its own
-tests, because nothing external will check it.
+That is liberating rather than awkward. The operation this project exists to make
+fast carries no conformance obligation, so its pagination and ordering semantics
+are ours to choose. The cost is that nothing external validates it, so the
+extension API needs its own test suite.
 
-So summ ships the OCI surface *plus* an extension API for the cross-cutting
-queries the spec cannot answer — catalog, per-repo stats, layer listings, reverse
-lookups. summdb prototyped several (`/v1/repos/:repo/stats`,
-`/v1/layers/:digest/manifests`). This is the real differentiator over
-distribution, more than raw speed.
+Surface to build, all cursor-paged, all backed by prefix scans over the key
+schema:
+
+| Query | Backed by |
+|---|---|
+| List repositories | `n` (name-ordered) |
+| List tags in a repo | `T <repo>` |
+| List manifests in a repo, with counts | `M <repo>` |
+| Repo size and manifest count | `P <repo>` |
+| Which manifests reference this layer | `R <digest>` |
+| Which tags point at this manifest | `G <repo> <digest>` |
+| Untagged / reclaimable manifests | `M` minus `G` |
+
+summdb prototyped several of these (`/v1/repos/:repo/stats`,
+`/v1/layers/:digest/manifests`) along with the UI that consumes them; that code
+is the starting point.
