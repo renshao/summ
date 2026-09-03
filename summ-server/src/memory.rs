@@ -56,7 +56,6 @@ struct Repo {
 #[derive(Debug)]
 struct Upload {
     repo: String,
-    algorithm: String,
     buffer: Vec<u8>,
 }
 
@@ -162,9 +161,10 @@ fn sha512(bytes: &[u8]) -> Digest {
     Digest::Sha512(raw)
 }
 
-/// Hash under the same algorithm the client named. summ never rehashes content
-/// under a different algorithm, which is what lets `Docker-Content-Digest`
-/// always echo the client's digest exactly.
+/// Hash under the algorithm the client's `?digest=` named, whatever the session
+/// was opened with. That is what lets `Docker-Content-Digest` echo the client's
+/// digest exactly, and it is the cheap equivalent of the real backend rehashing
+/// its staged bytes when the closing digest disagrees with the opening hint.
 fn hash_like(bytes: &[u8], like: &Digest) -> Digest {
     match like {
         Digest::Sha256(_) => sha256(bytes),
@@ -225,8 +225,18 @@ fn describe(repo: &Repo, digest: &Digest, stored: &StoredManifest) -> ManifestIn
         )
         .collect();
     let blobs = referenced.len() as u64;
+    // Foreign layers - the ones carrying `urls` - are counted but not sized.
+    // The real backend does the same: the manifest genuinely references them,
+    // so they belong in the count, but their bytes live on somebody else's CDN
+    // and adding them would inflate every repository size that mentions a
+    // Windows base layer.
     let blob_size = referenced
         .iter()
+        .filter(|e| {
+            e.get("urls")
+                .and_then(serde_json::Value::as_array)
+                .is_none_or(|u| u.is_empty())
+        })
         .filter_map(|e| e.get("size").and_then(serde_json::Value::as_u64))
         .sum();
 
@@ -526,14 +536,18 @@ impl Registry for MemoryRegistry {
         Ok(true)
     }
 
-    async fn create_upload(&self, name: &str, id: &str, algorithm: &str) -> OpsResult<()> {
+    /// `algorithm` is not kept. The session it names is only ever closed by a
+    /// `?digest=`, and that digest names the algorithm the content is verified
+    /// under - here by hashing the buffer, in the real backend by rehashing the
+    /// staged bytes when the two differ. Storing the opening hint would give
+    /// this implementation a decision the real one does not make.
+    async fn create_upload(&self, name: &str, id: &str, _algorithm: &str) -> OpsResult<()> {
         let mut state = self.lock();
         state.repos.entry(name.to_owned()).or_default();
         state.uploads.insert(
             id.to_owned(),
             Upload {
                 repo: name.to_owned(),
-                algorithm: algorithm.to_owned(),
                 buffer: Vec::new(),
             },
         );
@@ -600,13 +614,6 @@ impl Registry for MemoryRegistry {
         if hash_like(&bytes, digest) != *digest {
             return Err(OpsError::DigestMismatch);
         }
-        // `algorithm` is what the session was opened with; a `?digest=` naming
-        // a different one is a client error rather than a silent rehash.
-        let expected_algorithm = digest.algorithm();
-        if upload.algorithm != expected_algorithm {
-            return Err(OpsError::DigestMismatch);
-        }
-
         state.uploads.remove(id);
         state
             .repos

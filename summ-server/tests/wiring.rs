@@ -16,7 +16,7 @@ use std::sync::Arc;
 use axum::body::{Body, Bytes};
 use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use axum::Router;
-use sha2::{Digest as _, Sha256};
+use sha2::{Digest as _, Sha256, Sha512};
 use summ_registry::RegistryOptions;
 use summ_server::backend::{Backend, Engine};
 use summ_server::config::ServerConfig;
@@ -202,6 +202,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .map(|b| format!("{b:02x}"))
         .collect();
     format!("sha256:{hex}")
+}
+
+fn sha512_hex(bytes: &[u8]) -> String {
+    let hex: String = Sha512::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("sha512:{hex}")
 }
 
 const IMAGE_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -1246,4 +1254,228 @@ async fn a_referrers_filter_is_exact_and_the_link_carries_it() {
         seen, sboms,
         "every match, across pages that were mostly empty"
     );
+}
+
+// ------------------------------------------------------- digest algorithms --
+
+/// A sha512 blob pushed the way every real client pushes one: no
+/// `?digest-algorithm=` on the `POST`, because the spec makes it a SHOULD and
+/// no client in the conformance suite sends it. The session therefore stages
+/// bytes under sha256 and only learns the truth from the closing `?digest=`,
+/// which is the case that used to fail with `400 DIGEST_INVALID` on content
+/// that was perfectly good.
+#[tokio::test]
+async fn a_sha512_blob_pushes_chunked_without_the_algorithm_hint() {
+    let dir = TempDir::new().expect("tempdir");
+    let h = Harness::rocks(dir.path());
+
+    let bytes: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let digest = sha512_hex(&bytes);
+
+    let opened = h
+        .request(
+            Method::POST,
+            "/v2/demo/app/blobs/uploads/",
+            Vec::new(),
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(opened.status, StatusCode::ACCEPTED);
+    let location = opened
+        .header(header::LOCATION)
+        .expect("Location")
+        .to_owned();
+
+    // Three chunks, all hashed under sha256 before the algorithm is named.
+    let mut offset = 0u64;
+    for chunk in bytes.chunks(1500).take(2) {
+        let reply = h.patch_chunk(&location, offset, chunk).await;
+        assert_eq!(reply.status, StatusCode::ACCEPTED);
+        offset += chunk.len() as u64;
+    }
+    let closed = h
+        .close_upload(&location, &digest, offset, &bytes[offset as usize..])
+        .await;
+    assert_eq!(
+        closed.status,
+        StatusCode::CREATED,
+        "a sha512 close on a hint-less session is a rehash, not a client error"
+    );
+    assert_eq!(
+        closed.header("docker-content-digest"),
+        Some(digest.as_str())
+    );
+
+    let get = h.get(&format!("/v2/demo/app/blobs/{digest}")).await;
+    assert_eq!(get.status, StatusCode::OK);
+    assert_eq!(&get.body[..], &bytes[..], "the blob reads back byte-exact");
+
+    // Addressed under sha512 only. A rehash that quietly stored the content
+    // under the algorithm the session started with would still pass everything
+    // above if the response echoed the client's digest.
+    let head = h
+        .head(&format!("/v2/demo/app/blobs/{}", sha256_hex(&bytes)))
+        .await;
+    assert_eq!(head.status, StatusCode::NOT_FOUND);
+}
+
+/// The rehash survives the same interruption the ordinary resume path does: the
+/// staged bytes and the sha256 hasher state come back from the `U` record in a
+/// second process, and the switch to sha512 happens there.
+#[tokio::test]
+async fn a_sha512_close_works_on_an_upload_resumed_by_another_process() {
+    let dir = TempDir::new().expect("tempdir");
+    let bytes: Vec<u8> = (0..3000u32).map(|i| (i % 199) as u8).collect();
+    let digest = sha512_hex(&bytes);
+    let split = 1024usize;
+
+    let location = {
+        let h = Harness::rocks(dir.path());
+        let opened = h
+            .request(
+                Method::POST,
+                "/v2/demo/app/blobs/uploads/",
+                Vec::new(),
+                Body::empty(),
+            )
+            .await;
+        let location = opened
+            .header(header::LOCATION)
+            .expect("Location")
+            .to_owned();
+        let reply = h.patch_chunk(&location, 0, &bytes[..split]).await;
+        assert_eq!(reply.status, StatusCode::ACCEPTED);
+        location
+    };
+
+    let h = Harness::rocks(dir.path());
+    let closed = h
+        .close_upload(&location, &digest, split as u64, &bytes[split..])
+        .await;
+    assert_eq!(closed.status, StatusCode::CREATED);
+
+    let get = h.get(&format!("/v2/demo/app/blobs/{digest}")).await;
+    assert_eq!(&get.body[..], &bytes[..]);
+}
+
+/// A manifest is content the client addresses by digest too, so the same
+/// hint-less sha512 push has to work all the way through to a pullable image.
+#[tokio::test]
+async fn a_sha512_manifest_and_its_blobs_round_trip() {
+    let dir = TempDir::new().expect("tempdir");
+    let h = Harness::rocks(dir.path());
+
+    for blob in [CONFIG, LAYER] {
+        let digest = sha512_hex(blob);
+        let opened = h
+            .request(
+                Method::POST,
+                "/v2/demo/app/blobs/uploads/",
+                Vec::new(),
+                Body::empty(),
+            )
+            .await;
+        let location = opened
+            .header(header::LOCATION)
+            .expect("Location")
+            .to_owned();
+        let closed = h.close_upload(&location, &digest, 0, blob).await;
+        assert_eq!(closed.status, StatusCode::CREATED, "pushing {digest}");
+    }
+
+    let body = format!(
+        r#"{{"schemaVersion":2,"mediaType":"{IMAGE_MANIFEST}","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{}","size":{}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{}","size":{}}}]}}"#,
+        sha512_hex(CONFIG),
+        CONFIG.len(),
+        sha512_hex(LAYER),
+        LAYER.len(),
+    )
+    .into_bytes();
+    let digest = sha512_hex(&body);
+
+    let pushed = h.push_manifest("demo/app", &digest, &body).await;
+    assert_eq!(pushed.status, StatusCode::CREATED);
+
+    let pulled = h.get(&format!("/v2/demo/app/manifests/{digest}")).await;
+    assert_eq!(pulled.status, StatusCode::OK);
+    assert_eq!(
+        &pulled.body[..],
+        &body[..],
+        "manifests come back byte-exact"
+    );
+}
+
+// ---------------------------------------------------- non-distributable ----
+
+/// A manifest whose layers carry `urls` pushes with reference validation on.
+///
+/// Windows base images are the case in the wild: the descriptor names where the
+/// content actually lives and the registry is not expected to hold it, so
+/// demanding the blob rejects an image that is entirely valid. This is the
+/// conformance suite's *Non-distributable Layers* row, and failing it cascades
+/// into every manifest and tag check that uses the data.
+#[tokio::test]
+async fn a_manifest_with_foreign_layers_pushes_without_its_blobs() {
+    let dir = TempDir::new().expect("tempdir");
+    let h = Harness::rocks(dir.path());
+
+    // Only the config and the ordinary layer are pushed. The two foreign
+    // layers are never uploaded and never will be.
+    let config_digest = h.push_blob("demo/win", CONFIG).await;
+    let layer_digest = h.push_blob("demo/win", LAYER).await;
+    let foreign = "sha256:6b10979a4ee507b5c28f3c5687f6675e8683c34a27754e15e323a5171b033aca";
+
+    let body = format!(
+        r#"{{"schemaVersion":2,"mediaType":"{IMAGE_MANIFEST}","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest}","size":{}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.nondistributable.v1.tar+gzip","digest":"{foreign}","size":123456,"urls":["https://store.example.com/blobs/sha256/6b1097"]}},{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{layer_digest}","size":{}}}]}}"#,
+        CONFIG.len(),
+        LAYER.len(),
+    )
+    .into_bytes();
+
+    let pushed = h.push_manifest("demo/win", "latest", &body).await;
+    assert_eq!(
+        pushed.status,
+        StatusCode::CREATED,
+        "a foreign layer must not be demanded: {}",
+        String::from_utf8_lossy(&pushed.body)
+    );
+
+    let pulled = h.get("/v2/demo/win/manifests/latest").await;
+    assert_eq!(pulled.status, StatusCode::OK);
+    assert_eq!(&pulled.body[..], &body[..], "byte-exact, `urls` and all");
+
+    // The foreign layer got no `L`, `P` or `R`, so nothing claims summ has it.
+    // An edge here would advertise a blob that is not on disk, which turns a
+    // pull into a failed read rather than an honest 404.
+    let head = h.get(&format!("/v2/demo/win/blobs/{foreign}")).await;
+    assert_eq!(
+        head.status,
+        StatusCode::NOT_FOUND,
+        "a foreign layer must never look servable"
+    );
+}
+
+/// The same manifest when the foreign blob *has* been pushed: `urls` stops
+/// being an exemption and the layer is an ordinary blob.
+#[tokio::test]
+async fn a_foreign_layer_that_was_pushed_anyway_is_an_ordinary_blob() {
+    let dir = TempDir::new().expect("tempdir");
+    let h = Harness::rocks(dir.path());
+
+    let config_digest = h.push_blob("demo/win", CONFIG).await;
+    let layer_digest = h.push_blob("demo/win", LAYER).await;
+
+    let body = format!(
+        r#"{{"schemaVersion":2,"mediaType":"{IMAGE_MANIFEST}","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest}","size":{}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.nondistributable.v1.tar+gzip","digest":"{layer_digest}","size":{},"urls":["https://store.example.com/blobs/whatever"]}}]}}"#,
+        CONFIG.len(),
+        LAYER.len(),
+    )
+    .into_bytes();
+
+    let pushed = h.push_manifest("demo/win", "present", &body).await;
+    assert_eq!(pushed.status, StatusCode::CREATED);
+
+    let get = h.get(&format!("/v2/demo/win/blobs/{layer_digest}")).await;
+    assert_eq!(get.status, StatusCode::OK);
+    assert_eq!(&get.body[..], LAYER);
 }

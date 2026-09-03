@@ -726,16 +726,21 @@ impl Registry for Backend {
                 current: session.offset,
             });
         }
-        // The session was opened under one algorithm and the client has now
-        // named a digest in another. summ never rehashes content under a
-        // second algorithm - that is what lets `Docker-Content-Digest` echo the
-        // client's digest exactly - so this is the client's error, not a
-        // silent re-run.
-        if session.algorithm != digest.algorithm() {
-            return Err(OpsError::DigestMismatch);
-        }
-
         let mut upload = self.resume(id, &session).await?;
+
+        // The session was opened under one algorithm and the client has now
+        // closed it with a digest in another. `?digest-algorithm=` is a SHOULD
+        // (end-4c) and no client in the conformance suite sends it, so a
+        // sha512 push arrives on a session hashing sha256 - and rejecting it
+        // would be blaming the client for content that is perfectly good.
+        // Rehash the staged bytes instead; this is a no-op on every push whose
+        // algorithm already matches, and it happens before the closing chunk
+        // so the hasher simply carries on from `offset`.
+        self.blobs
+            .rehash_upload(&mut upload, DigestAlgorithm::of(digest))
+            .await
+            .map_err(storage_error)?;
+
         drain_into(&mut upload, body).await?;
 
         // Commit fsyncs the bytes *and* the containing directory before it

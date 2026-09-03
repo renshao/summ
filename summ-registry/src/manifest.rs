@@ -32,6 +32,16 @@ pub struct BlobDesc {
     /// present `L` record is authoritative, because it was written from the
     /// bytes that actually arrived.
     pub size: u64,
+    /// The descriptor carries `urls`, so the content lives somewhere else and
+    /// this registry is not expected to hold it - a non-distributable, or
+    /// "foreign", layer. Windows base layers are the case in the wild.
+    ///
+    /// Detected by the presence of `urls` rather than by media type: the
+    /// `nondistributable` media types are the conventional carriers, but it is
+    /// `urls` that says where the bytes actually are, and a registry that keyed
+    /// off the media type would still reject a foreign layer wearing an
+    /// ordinary one.
+    pub foreign: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,11 +72,18 @@ pub struct ParsedManifest {
 impl ParsedManifest {
     /// Sum of the sizes of the blobs this manifest directly references.
     ///
-    /// Includes the config, so it agrees exactly with the set of `R` edges the
-    /// push writes. Not recursive: an index totals zero here, and its real size
-    /// comes from walking its children and deduplicating shared layers.
+    /// Includes the config and excludes foreign layers, so it agrees with the
+    /// set of `R` edges the push writes and, more to the point, describes bytes
+    /// this registry actually stores. Counting a Windows base layer hosted on
+    /// someone else's CDN would inflate every repository size that mentions it.
+    /// Not recursive: an index totals zero here, and its real size comes from
+    /// walking its children and deduplicating shared layers.
     pub fn total_layer_size(&self) -> u64 {
-        self.blobs.iter().map(|b| b.size).sum()
+        self.blobs
+            .iter()
+            .filter(|b| !b.foreign)
+            .map(|b| b.size)
+            .sum()
     }
 }
 
@@ -204,6 +221,7 @@ fn blob_desc(d: &Descriptor) -> Result<BlobDesc> {
     Ok(BlobDesc {
         digest: descriptor_digest(d)?,
         size: d.size(),
+        foreign: d.urls().as_ref().is_some_and(|u| !u.is_empty()),
     })
 }
 
@@ -243,6 +261,55 @@ mod tests {
             "annotations": { "org.opencontainers.image.title": "demo" }
         }))
         .expect("json")
+    }
+
+    #[test]
+    fn a_layer_with_urls_is_foreign_and_does_not_count_towards_stored_size() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST,
+            "config": { "mediaType": "application/vnd.oci.image.config.v1+json",
+                        "digest": hexd(1), "size": 7 },
+            "layers": [
+                { "mediaType": "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip",
+                  "digest": hexd(2), "size": 123456,
+                  "urls": ["https://store.example.com/blobs/sha256/aa"] },
+                { "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                  "digest": hexd(3), "size": 100 }
+            ]
+        }))
+        .expect("json");
+
+        let p = parse(&body, None).expect("parses");
+        assert_eq!(p.blobs.len(), 3, "a foreign layer is still referenced");
+        assert!(!p.blobs[0].foreign, "the config is not foreign");
+        assert!(p.blobs[1].foreign, "`urls` is what makes a layer foreign");
+        assert!(!p.blobs[2].foreign);
+        assert_eq!(
+            p.total_layer_size(),
+            107,
+            "the 123456 bytes hosted elsewhere are not this registry's storage"
+        );
+    }
+
+    #[test]
+    fn an_empty_urls_array_is_not_a_foreign_layer() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST,
+            "config": { "mediaType": "application/vnd.oci.image.config.v1+json",
+                        "digest": hexd(1), "size": 7 },
+            "layers": [ { "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                          "digest": hexd(2), "size": 100, "urls": [] } ]
+        }))
+        .expect("json");
+
+        let p = parse(&body, None).expect("parses");
+        assert!(
+            !p.blobs[1].foreign,
+            "an empty `urls` names nowhere to fetch from, so the blob is ours"
+        );
+        assert_eq!(p.total_layer_size(), 107);
     }
 
     #[test]

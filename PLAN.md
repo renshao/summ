@@ -47,7 +47,7 @@ Conformance is the floor, not the ceiling.
 | Metadata engine | **RocksDB**, compiled from source and statically linked | Single binary, no RocksDB install. redb retained as a second implementation to keep the trait honest. |
 | Purge (GC) | Offline for v1 | Registry read-only during sweep. Schema already supports online later — see below. |
 | Digest algorithms | sha256 + sha512 | Tagged enum, algorithm byte in key encoding. |
-| Conformance bar | Core push/pull at Phase 1; referrers by Phase 6 | `distribution-spec/conformance` is the gate. Referrers landed early and passes; the suite's remaining failures are one sha512 upload bug. |
+| Conformance bar | Core push/pull at Phase 1; referrers by Phase 6 | `distribution-spec/conformance` is the gate. **Passing: 862 checks, zero failures, at `OCI_VERSION=1.1`.** Referrers landed early and passes with the rest. |
 | Web UI | Built in, served on the same port, assets embedded in the binary | No separate build or deploy. Constrains the extension API to be genuinely cursor-paged. |
 | Extension API | Core product surface, versioned separately from `/v2/` | Unstandardised, so it carries its own test suite. |
 | summdb | Prototype, not a dependency | Code copied in and reworked. summdb is not maintained once summ takes off. Its UI and stats queries are the starting point for Phase 2b. |
@@ -119,7 +119,7 @@ Two traps worth stating explicitly:
 
 ## Status
 
-`cargo test` — **310 passing**. Every crate in CLAUDE.md's Layout is built, and
+`cargo test` — **324 passing**. Every crate in CLAUDE.md's Layout is built, and
 **the wiring has landed** (package K, `summ-server/src/backend.rs`): `summ
 serve` runs on `summ-registry` over `summ-meta` with `summ-storage` holding the
 bytes. `tests/wiring.rs` drives the same router as `tests/api.rs` against a real
@@ -161,16 +161,35 @@ through `OCI-Filters-Applied`, and `--no-referrers` to turn the endpoint off
 again. Two rules are load-bearing and easy to regress — see **The referrers
 API** below.
 
-**The conformance suite has been run against summ for the first time**, at
-`OCI_VERSION=1.1` per R1's recipe. Every referrers and subject check passes:
-*Referrers*, *Manifest put with subject*, *Artifacts with Subject*, *Index with
-Subject*, *Missing Subject*, *Artifact Index*. Eight failures remain and they
-are all one bug, in the blob upload path and unrelated to this work — see
-**A sha512 blob cannot be pushed without the algorithm hint** below.
+**summ passes the conformance suite**: 862 checks, **zero failures**, exit 0, at
+`OCI_VERSION=1.1` per R1's recipe. Only five rows are `Disabled`, all by the
+suite's own default config (*Blob upload cancel*, *Manifest put with tag
+params*, *Sparse Manifests*, *Tag Param*, *Tag Param sha512*) — nothing is
+`Skip`, so no row is hiding an unimplemented API behind `errRegUnsupported`.
 
-**Not built**: purge, conformance harness, analytics writers, Phases 3–6, and
-the rest of the discovery surface (blob fan-in, untagged set, tag history, pull
-counts — all listed under **Beyond the spec**).
+**Both engines pass.** The same run against `--engine redb` is also 862/0, which
+is the cheapest available proof that nothing has leaked past `MetaEngine`.
+
+Two bugs stood between the first run and this one, both found by the suite and
+both fixed:
+
+- **sha512 could not be pushed without the algorithm hint.** An upload session
+  chose its hasher at `POST` time and never revisited it, so a client that
+  opened a plain session and closed it with `?digest=sha512:…` got `400
+  DIGEST_INVALID` on content that had hashed perfectly well — under the other
+  algorithm. `?digest-algorithm=` is a SHOULD (end-4c) and *no* client in the
+  suite sends it: every blob flow carries a literal `// TODO: add digest
+  algorithm if not sha256`. Fixed by rehashing — see **Digest algorithms**.
+- **A manifest with non-distributable layers was rejected.** Reference
+  validation demanded a blob for every descriptor, including the ones carrying
+  `urls`, which name content hosted elsewhere that a registry is not expected to
+  hold. One data row failing cascaded into six: *Non-distributable Layers* plus
+  the *Manifest put/get/head by digest and by tag* rows and *Tag listing*, all of
+  which use that data. See **Foreign layers**.
+
+**Not built**: purge, the conformance run in CI, analytics writers, Phases 3–6,
+and the rest of the discovery surface (blob fan-in, untagged set, tag history,
+pull counts — all listed under **Beyond the spec**).
 
 ## Phases
 
@@ -194,10 +213,11 @@ Three things not to rediscover:
 
 Perf baseline with `../container-registry/bench` still to do.
 
-### Phase 1 — skeleton — **built, pending the conformance run**
+### Phase 1 — skeleton — **done**
 
-Everything is built. **Package A, the harness, is all that remains** before the
-exit criterion (conformance push + pull pass) can be attempted. It will need:
+The exit criterion is met: the suite passes clean at `OCI_VERSION=1.1`. Package
+A remains as *automation* — the run above was driven by hand, and it belongs in
+CI before it can be called a gate rather than an observation. It will need:
 
 - `--allow-missing-references`. Reference validation defaults on; R1 recommends
   against it because it is optional, costs N lookups, and breaks a client
@@ -332,11 +352,53 @@ wild, and they are handled: `sha256-<hex>.sig|.sbom|.att` synthesises its `F`
 edge at tag time and retracts it when the tag moves (`summ-registry/src/cosign.rs`).
 That is a purge fix as much as a discovery one — see the module docs.
 
+## Digest algorithms
+
+- **The closing `?digest=` decides the algorithm, not the opening hint.**
+  `?digest-algorithm=` (end-4c) is a SHOULD and no real client sends it — every
+  blob flow in the conformance suite carries a `// TODO: add digest algorithm if
+  not sha256` — so a sha512 push arrives on a session that has been hashing
+  sha256. Rejecting it blames the client for content that is fine. The session
+  rehashes its staged bytes instead (`Upload::rehash_as`), before the closing
+  chunk, so the hasher simply carries on from the recorded offset.
+- **The rehash is the one place staged bytes are re-read, and it must stay
+  exceptional.** A session whose algorithm already matches returns without
+  touching the file, which is every ordinary push. The rejected alternative was
+  hashing both algorithms on the way in: correct, streaming, and it would make
+  sha512 the bottleneck on *every* byte of *every* push — around 700 MB/s
+  against sha256's ~2 GB/s with SHA-NI — to serve a case almost nobody takes.
+  One sequential pass over a file written moments ago, only when the algorithms
+  disagree, is the cheaper trade. This is emphatically not zot's re-read of
+  every layer out of S3; do not let it grow into one.
+- **A rehash must never rescue a wrong digest.** It changes which hash is
+  computed, never what the commit compares against.
+
+## Foreign layers
+
+- **`urls` on a descriptor exempts it from reference validation, and from every
+  edge.** A non-distributable layer names where its content actually lives and
+  the registry is not expected to hold it. Demanding the blob rejects every
+  Windows base image. Writing `L`, `P` or `R` for it would be worse: those keys
+  are exactly what make a blob servable, so the edges would advertise bytes that
+  are not on disk and turn a pull into a failed read rather than an honest 404.
+  Absent and foreign means no validation and no edges; present anyway — a client
+  may push one — and it is an ordinary blob from there on.
+- **Foreignness is decided by `urls`, not by media type.** The
+  `nondistributable` media types are the conventional carriers, but `urls` is
+  what says where the bytes are, and keying off the media type would still
+  reject a foreign layer wearing an ordinary one. An empty `urls` names nowhere,
+  so it is not foreign.
+- **A foreign layer is counted but not sized.** It stays in
+  `ManifestRecord.layers`, because the manifest genuinely references it, and it
+  is excluded from `total_layer_size`, because a repository's size means bytes
+  this registry stores. Counting a base layer hosted on someone else's CDN would
+  inflate every repository that mentions it.
+
 ## Work packages (parallelisable)
 
 | # | Package | Owns | Depends on |
 |---|---|---|---|
-| A | **Conformance harness — the next step** | `conformance/` | — |
+| A | **Conformance harness** — the suite passes by hand; this is putting it in CI so it is a gate | `conformance/` | — |
 | F | Purge | `summ-purge/` | E |
 | G | Scale benchmark — synthetic 10M-repo dataset, engine A/B | `benches/` | — |
 | H | Extension API — *first cut done*; blob fan-in, untagged set, history remain | `summ-server/` | E |
@@ -344,8 +406,8 @@ That is a purge fix as much as a discovery one — see the module docs.
 | J | Analytics — pull-count queue, aggregation worker, retention | `summ-analytics/` | E |
 
 Done: **B** HTTP skeleton, **C** blob store, **D** upload sessions, **E** ops
-layer, **K** wiring, and the first cut of **H** and **I**. Package A is all that
-stands between here and the Phase 1 exit criterion.
+layer, **K** wiring, and the first cut of **H** and **I**. The Phase 1 exit
+criterion is met; package A is what stops it from silently regressing.
 
 ## Engine choice — RocksDB (decided)
 
@@ -604,17 +666,6 @@ implementation has since turned up, is below.
   `spawn_blocking` round trip (~5 µs, measured in R2) would cost more than the
   lookup it protects. That bet is unmeasured, and a cold read on a
   ten-million-repo store is exactly where it would be wrong. Phase 3.
-- **A sha512 blob cannot be pushed without the algorithm hint.** An upload
-  session picks its algorithm at `POST` time from `?digest-algorithm=` and
-  defaults to sha256, so a client that opens a plain session and closes it with
-  `?digest=sha512:…` gets `400 DIGEST_INVALID` — the content hashed fine, under
-  the other algorithm. This is all eight remaining conformance failures (*Blobs
-  sha512*, and the *Blob chunked* / *mount* / *post put* / *streaming* API rows
-  that push through it); `?digest-algorithm=sha512` works, which is why *Digest
-  Algorithm sha512* passes and the failure hid. The fix is to defer the choice:
-  hash under both, or rehash on commit when the closing digest names an
-  algorithm the session is not using. Found by the first conformance run, not
-  yet fixed.
 - **Anonymous cross-repo mount is served from `L` alone.** `?mount=<digest>`
   with no `from=` grants membership on the strength of "the content exists
   somewhere", which is what the spec's anonymous mount means and what makes it

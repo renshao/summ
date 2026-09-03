@@ -712,3 +712,150 @@ async fn dropping_a_stream_mid_blob_leaves_the_blob_readable() {
 
     assert_eq!(read_all(&store, &digest).await, body);
 }
+
+// ------------------------------------------------------------------ rehashing
+
+#[tokio::test]
+async fn rehashing_mid_upload_matches_an_upload_that_never_changed_algorithm() {
+    // `?digest-algorithm=` is a SHOULD, so a session opened without it hashes
+    // sha256 and can still be closed with a sha512 `?digest=`. The rehash has
+    // to cover the bytes already staged and leave the hasher able to carry on.
+    let (_dir, store) = store();
+    let head: &[u8] = b"staged under sha256, committed under sha512; ";
+    let tail: &[u8] = b"and a final chunk on the closing PUT";
+    let whole: Vec<u8> = [head, tail].concat();
+
+    let id = upload_id("switched");
+    let mut upload = store
+        .create_upload(&id, DigestAlgorithm::Sha256)
+        .await
+        .expect("create");
+    let offset = upload
+        .append(0, Bytes::copy_from_slice(head))
+        .await
+        .expect("append head");
+
+    store
+        .rehash_upload(&mut upload, DigestAlgorithm::Sha512)
+        .await
+        .expect("rehash");
+    assert_eq!(
+        upload.algorithm(),
+        DigestAlgorithm::Sha512,
+        "the upload now hashes under the algorithm the client named"
+    );
+    assert_eq!(
+        upload.offset(),
+        offset,
+        "rehashing reads the staged bytes; it must not move the offset"
+    );
+
+    upload
+        .append(offset, Bytes::copy_from_slice(tail))
+        .await
+        .expect("append tail");
+
+    let expected = sha512_of(&whole);
+    store
+        .commit_upload(upload, &expected)
+        .await
+        .expect("the rehashed digest must equal a straight sha512 of the whole blob");
+    assert_eq!(read_all(&store, &expected).await, whole);
+}
+
+#[tokio::test]
+async fn rehashing_to_the_algorithm_already_in_use_is_a_no_op() {
+    // The common case by an enormous margin: every push whose closing digest
+    // agrees with the session. It must not read the staging file at all, and
+    // it certainly must not disturb the running hash.
+    let (_dir, store) = store();
+    let body: &[u8] = b"unchanged";
+    let id = upload_id("same-algorithm");
+    let mut upload = store
+        .create_upload(&id, DigestAlgorithm::Sha256)
+        .await
+        .expect("create");
+    upload
+        .append(0, Bytes::copy_from_slice(body))
+        .await
+        .expect("append");
+    let before = upload.hasher_state().expect("state");
+
+    store
+        .rehash_upload(&mut upload, DigestAlgorithm::Sha256)
+        .await
+        .expect("rehash");
+    assert_eq!(
+        upload.hasher_state().expect("state"),
+        before,
+        "a no-op rehash must leave the hasher byte-identical"
+    );
+
+    let digest = sha256_of(body);
+    store.commit_upload(upload, &digest).await.expect("commit");
+}
+
+#[tokio::test]
+async fn rehashing_an_empty_upload_costs_nothing_and_still_switches() {
+    // Flow A: `POST` with no hint, then a single `PUT ?digest=sha512:...`
+    // carrying the whole body. There is nothing staged to re-read, so this is
+    // the cheap path even though the algorithm changes.
+    let (_dir, store) = store();
+    let body: &[u8] = b"the whole blob arrives on the closing PUT";
+    let id = upload_id("empty-switch");
+    let mut upload = store
+        .create_upload(&id, DigestAlgorithm::Sha256)
+        .await
+        .expect("create");
+
+    store
+        .rehash_upload(&mut upload, DigestAlgorithm::Sha512)
+        .await
+        .expect("rehash");
+    upload
+        .append(0, Bytes::copy_from_slice(body))
+        .await
+        .expect("append");
+
+    let expected = sha512_of(body);
+    store
+        .commit_upload(upload, &expected)
+        .await
+        .expect("commit");
+    assert_eq!(read_all(&store, &expected).await, body);
+}
+
+#[tokio::test]
+async fn rehashing_reads_back_more_than_one_chunk() {
+    // The rehash loop is the one place staged bytes are read back, so it gets
+    // a body several read-chunks long rather than a single short buffer.
+    let dir = TempDir::new().expect("tempdir");
+    let store = BlobStore::open(dir.path())
+        .expect("open")
+        .with_read_chunk_size(MIN_READ_CHUNK_SIZE);
+    let body: Vec<u8> = (0..MIN_READ_CHUNK_SIZE * 3 + 7)
+        .map(|i| (i % 251) as u8)
+        .collect();
+
+    let id = upload_id("multi-chunk-rehash");
+    let mut upload = store
+        .create_upload(&id, DigestAlgorithm::Sha256)
+        .await
+        .expect("create");
+    upload
+        .append(0, Bytes::copy_from_slice(&body))
+        .await
+        .expect("append");
+
+    store
+        .rehash_upload(&mut upload, DigestAlgorithm::Sha512)
+        .await
+        .expect("rehash");
+
+    let expected = sha512_of(&body);
+    store
+        .commit_upload(upload, &expected)
+        .await
+        .expect("commit");
+    assert_eq!(read_all(&store, &expected).await, body);
+}

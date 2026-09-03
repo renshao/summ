@@ -203,6 +203,19 @@ impl BlobStore {
         .map_err(|e| SummError::Storage(format!("upload resume task failed: {e}")))?
     }
 
+    /// Re-derive an upload's running hash under `algorithm`.
+    ///
+    /// A no-op when the upload is already hashing under it, which is every
+    /// ordinary push. See [`Upload::rehash_as`] for why this exists and why it
+    /// is cheaper than hashing every upload twice.
+    pub async fn rehash_upload(
+        &self,
+        upload: &mut Upload,
+        algorithm: DigestAlgorithm,
+    ) -> Result<()> {
+        upload.rehash_as(algorithm, self.read_chunk_size).await
+    }
+
     /// Commit an upload as `expected`, returning the blob's size.
     ///
     /// **Not `move`.** distribution's driver trait exposes `Move`, which on S3

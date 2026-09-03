@@ -189,6 +189,59 @@ impl Upload {
         Ok(self.offset)
     }
 
+    /// Re-derive the running hash under a different algorithm.
+    ///
+    /// `?digest-algorithm=` (end-4c) is a SHOULD, so a client is entitled to
+    /// open a session without it and close the upload with a `?digest=` naming
+    /// sha512. The session is hashing under sha256 by then, and the content is
+    /// perfectly good - only the running hash is the wrong one. This reads the
+    /// staged bytes back and rebuilds the hasher over them, so the commit
+    /// verifies against the digest the client actually named.
+    ///
+    /// **This is the one place summ re-reads staged bytes, and it stays
+    /// exceptional by construction.** A session whose algorithm already matches
+    /// returns without touching the file, which is every ordinary push; the
+    /// pass costs one sequential read of a file written moments ago, so it is
+    /// nothing like zot's re-read of every layer out of S3. Hashing both
+    /// algorithms on the way in would avoid it, at the price of paying for
+    /// sha512 on every byte of every push to serve a case almost nobody takes.
+    ///
+    /// Call it **before** appending the closing chunk: the rehash covers
+    /// `[0, offset)` and the hasher carries on from there.
+    pub(crate) async fn rehash_as(
+        &mut self,
+        algorithm: DigestAlgorithm,
+        chunk_size: usize,
+    ) -> Result<()> {
+        if algorithm == self.algorithm {
+            return Ok(());
+        }
+
+        let mut staged = self.staged.take().ok_or_else(Self::poisoned)?;
+        let offset = self.offset;
+        let path = self.path.clone();
+        let (staged, result) = tokio::task::spawn_blocking(move || {
+            // The hasher is replaced only on success, so a failed read leaves
+            // the upload hashing under the algorithm it already had rather
+            // than under a half-fed one.
+            match rehash(&staged.file, offset, algorithm, chunk_size) {
+                Ok(hasher) => {
+                    staged.hasher = hasher;
+                    (staged, Ok(()))
+                }
+                Err(e) => (staged, Err(e)),
+            }
+        })
+        .await
+        .map_err(|e| SummError::Storage(format!("upload rehash task failed: {e}")))?;
+        self.staged = Some(staged);
+
+        result
+            .map_err(|e| SummError::Storage(format!("rehashing upload {}: {e}", path.display())))?;
+        self.algorithm = algorithm;
+        Ok(())
+    }
+
     /// Flush and fsync the staged bytes, then finalise the hash.
     ///
     /// Used by [`crate::BlobStore::commit_upload`], which is where the fsync
@@ -205,6 +258,29 @@ impl Upload {
         .map_err(|e| SummError::Storage(format!("fsyncing upload {}: {e}", path.display())))?;
         Ok((path, digest, offset))
     }
+}
+
+/// Feed the first `len` staged bytes to a fresh hasher.
+///
+/// `pread` in a loop, same as the read path: the file is being appended to by
+/// this process alone, but reading positionally keeps the descriptor's offset
+/// out of it, which is what lets the write path go on using the same handle.
+fn rehash(
+    file: &File,
+    len: u64,
+    algorithm: DigestAlgorithm,
+    chunk_size: usize,
+) -> std::io::Result<Hasher> {
+    let mut hasher = Hasher::new(algorithm);
+    let mut buf = vec![0u8; chunk_size.max(1)];
+    let mut at = 0u64;
+    while at < len {
+        let want = buf.len().min((len - at) as usize);
+        file.read_exact_at(&mut buf[..want], at)?;
+        hasher.update(&buf[..want]);
+        at += want as u64;
+    }
+    Ok(hasher)
 }
 
 /// `pwrite` until the chunk is fully written.

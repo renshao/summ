@@ -1221,6 +1221,118 @@ async fn sha512_works_end_to_end() {
     assert_eq!(&get.body[..], &bytes[..]);
 }
 
+/// The conformance suite never sends `?digest-algorithm=` - every one of its
+/// blob flows carries a literal `// TODO: add digest algorithm if not sha256` -
+/// and the spec makes the parameter a SHOULD, so this is the shape a real
+/// sha512 push arrives in. Getting a `400 DIGEST_INVALID` here means being told
+/// the content is bad when the content was fine and only the registry's choice
+/// of hasher was wrong.
+#[tokio::test]
+async fn sha512_needs_no_algorithm_hint_in_any_upload_flow() {
+    for (flow, chunked) in [("monolithic", false), ("chunked", true)] {
+        let h = Harness::new();
+        let bytes = blob_2048();
+        let digest = sha512_hex(&bytes);
+        let repo = format!("demo/{flow}");
+        let location = open_upload(&h, &format!("/v2/{repo}/blobs/uploads/")).await;
+
+        let tail = if chunked {
+            // Bytes go in under the session's default sha256 before the client
+            // ever names sha512, which is the case that has to work.
+            let head = bytes[..1024].to_vec();
+            let patch = h
+                .request(
+                    Method::PATCH,
+                    &location,
+                    vec![
+                        (header::CONTENT_RANGE.as_str(), "0-1023".to_owned()),
+                        (header::CONTENT_LENGTH.as_str(), head.len().to_string()),
+                    ],
+                    Body::from(head),
+                )
+                .await;
+            assert_eq!(patch.status, StatusCode::ACCEPTED);
+            bytes[1024..].to_vec()
+        } else {
+            bytes.clone()
+        };
+
+        let start = bytes.len() - tail.len();
+        let mut headers = vec![(header::CONTENT_LENGTH.as_str(), tail.len().to_string())];
+        if chunked {
+            headers.push((
+                header::CONTENT_RANGE.as_str(),
+                format!("{start}-{}", bytes.len() - 1),
+            ));
+        }
+        let put = h
+            .request(
+                Method::PUT,
+                &format!("{location}?digest={digest}"),
+                headers,
+                Body::from(tail),
+            )
+            .await;
+        assert_eq!(
+            put.status,
+            StatusCode::CREATED,
+            "{flow} sha512 push without the hint"
+        );
+        assert_eq!(
+            put.header("docker-content-digest"),
+            Some(digest.as_str()),
+            "the client's digest is echoed, not one of the registry's choosing"
+        );
+
+        let get = h.get(&format!("/v2/{repo}/blobs/{digest}")).await;
+        assert_eq!(get.status, StatusCode::OK);
+        assert_eq!(&get.body[..], &bytes[..], "{flow} blob reads back");
+    }
+}
+
+/// The hint and the closing digest disagreeing is not an error either: the
+/// digest is the client's actual claim about the content, and the hint is only
+/// ever an optimisation.
+#[tokio::test]
+async fn a_closing_digest_overrides_the_algorithm_the_session_was_opened_with() {
+    let h = Harness::new();
+    let bytes = b"opened as sha512, closed as sha256".to_vec();
+    let digest = sha256_hex(&bytes);
+
+    let location = open_upload(&h, "/v2/demo/app/blobs/uploads/?digest-algorithm=sha512").await;
+    let put = h
+        .request(
+            Method::PUT,
+            &format!("{location}?digest={digest}"),
+            vec![(header::CONTENT_LENGTH.as_str(), bytes.len().to_string())],
+            Body::from(bytes.clone()),
+        )
+        .await;
+    assert_eq!(put.status, StatusCode::CREATED);
+    assert_eq!(put.header("docker-content-digest"), Some(digest.as_str()));
+
+    let get = h.get(&format!("/v2/demo/app/blobs/{digest}")).await;
+    assert_eq!(&get.body[..], &bytes[..]);
+}
+
+/// Switching algorithm must not turn a genuinely wrong digest into a right one.
+#[tokio::test]
+async fn a_wrong_sha512_digest_is_still_rejected_without_the_hint() {
+    let h = Harness::new();
+    let bytes = blob_2048();
+    let wrong = sha512_hex(b"different content entirely");
+    let location = open_upload(&h, "/v2/demo/app/blobs/uploads/").await;
+
+    h.request(
+        Method::PUT,
+        &format!("{location}?digest={wrong}"),
+        vec![(header::CONTENT_LENGTH.as_str(), bytes.len().to_string())],
+        Body::from(bytes),
+    )
+    .await
+    .assert_error(StatusCode::BAD_REQUEST, ErrorCode::DigestInvalid);
+}
+
 #[tokio::test]
 async fn an_unsupported_digest_algorithm_is_rejected_at_the_post() {
     let h = Harness::new();

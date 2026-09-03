@@ -517,6 +517,18 @@ impl Registry {
             let known = self.blob_record(&desc.digest)?;
             let in_repo = self.blob_is_servable_id(repo, &desc.digest)?;
 
+            // A foreign layer names its content's real home in `urls`, and the
+            // spec does not expect a registry to hold it. Requiring the blob
+            // would reject every Windows base image; recording `L`, `P` or `R`
+            // for it would be worse - those keys are what make a blob servable,
+            // so the edges would advertise bytes that are not on disk and turn
+            // a pull into a 500. Absent and foreign means no validation and no
+            // edges. Present anyway - a client is free to push one - and it is
+            // an ordinary blob from here on.
+            if desc.foreign && !(known.is_some() && in_repo) {
+                continue;
+            }
+
             if self.options.validate_references && !(known.is_some() && in_repo) {
                 return Err(RegistryError::ManifestBlobUnknown {
                     repo: repo_name.to_string(),
