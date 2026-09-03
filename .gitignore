@@ -1,2 +1,6 @@
 target/
 *.db
+
+# `--data-dir` defaults to ./data, so a `summ serve` in the repo root leaves a
+# registry here. Anchored: only the root one, not a `data/` fixture in a crate.
+/data/
