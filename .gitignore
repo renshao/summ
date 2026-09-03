@@ -4,3 +4,9 @@ target/
 # `--data-dir` defaults to ./data, so a `summ serve` in the repo root leaves a
 # registry here. Anchored: only the root one, not a `data/` fixture in a crate.
 /data/
+
+# Harness configuration is the contributor's own business, not the repo's.
+# CLAUDE.md is kept locally but untracked, so nothing here dictates how anyone
+# drives an AI tool.
+CLAUDE.md
+.claude/
