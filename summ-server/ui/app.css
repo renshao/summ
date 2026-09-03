@@ -131,7 +131,12 @@ a:hover { text-decoration: underline; }
 
 /* ---- page furniture --------------------------------------------------- */
 
-main { flex: 1; padding-top: 28px; padding-bottom: 48px; }
+/* `main.shell`, not `main`: the element carries `.shell`, whose `padding`
+   shorthand resets all four sides, and a bare type selector loses to it on
+   specificity regardless of source order. So the vertical padding here read as
+   0 and the page title sat hard against the top bar's border. Any rule adding
+   vertical padding to a `.shell` element has to out-specify the shorthand. */
+main.shell { flex: 1; padding-top: 40px; padding-bottom: 56px; }
 
 .crumbs {
   font-size: 13px;
