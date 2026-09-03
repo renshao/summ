@@ -34,6 +34,7 @@ pub mod error;
 pub mod manifest;
 pub mod reference;
 pub mod registry;
+pub mod uploads;
 
 mod delete;
 mod discovery;
@@ -55,3 +56,4 @@ pub use discovery::{
 };
 pub use referrers::{ReferrerEntry, ReferrerList};
 pub use tags::{TagList, TagSet};
+pub use uploads::UploadKey;

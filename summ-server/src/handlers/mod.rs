@@ -134,16 +134,27 @@ pub fn ops_error(err: OpsError) -> ApiError {
         OpsError::ManifestInvalid(detail) => {
             ApiError::new(ErrorCode::ManifestInvalid).with_detail(detail)
         }
+        OpsError::ManifestBlobUnknown { digest } => ApiError::new(ErrorCode::ManifestBlobUnknown)
+            .with_detail(format!("{digest} is not present in this repository")),
+        OpsError::SizeMismatch { declared, actual } => ApiError::new(ErrorCode::SizeInvalid)
+            .with_detail(format!("expected {declared} bytes, got {actual}")),
+        OpsError::BodyTooLarge { limit } => ApiError::new(ErrorCode::SizeInvalid)
+            .with_status(StatusCode::PAYLOAD_TOO_LARGE)
+            .with_message("request body exceeds the maximum accepted size")
+            .with_detail(format!("limit is {limit} bytes")),
+        OpsError::BodyIncomplete(detail) => ApiError::new(ErrorCode::BlobUploadInvalid)
+            .with_message("the request body did not arrive complete")
+            .with_detail(detail),
         OpsError::Internal(detail) => ApiError::internal(detail),
     }
 }
 
 /// Buffer a request body.
 ///
-/// A placeholder for streaming, and marked as one: `summ-storage` will take a
-/// body and write it through, at which point uploads stop being bounded by
-/// memory. Manifests will keep buffering because they must be hashed and stored
-/// whole anyway.
+/// Blob bodies do **not** come through here any more - they travel as an
+/// [`UploadBody`](crate::seam::UploadBody) and are written through frame by
+/// frame. What is left is manifests, which must be hashed and stored whole
+/// anyway and are capped at a few megabytes.
 pub async fn read_body(body: Body, limit: usize, on_overflow: ApiError) -> Result<Bytes, ApiError> {
     axum::body::to_bytes(body, limit)
         .await

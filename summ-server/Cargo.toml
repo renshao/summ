@@ -8,12 +8,15 @@ license.workspace = true
 name = "summ"
 path = "src/main.rs"
 
-# summ-meta, summ-storage and summ-registry are deliberately absent. The HTTP
-# layer talks to them only through the `seam::Registry` trait defined here, so
-# adding them as dependencies before that wiring exists would buy nothing and
-# would couple this crate's build to theirs.
+# The HTTP layer still talks to storage only through the `seam::Registry` trait
+# defined here; `backend` is the one module that names the crates below, and
+# `memory` remains a complete second implementation of the same trait. Nothing
+# under `handlers/` may import any of these three directly.
 [dependencies]
 summ-core.workspace = true
+summ-meta.workspace = true
+summ-storage.workspace = true
+summ-registry.workspace = true
 axum.workspace = true
 tokio.workspace = true
 serde.workspace = true
@@ -21,6 +24,9 @@ serde_json.workspace = true
 bytes.workspace = true
 sha2.workspace = true
 async-trait = "0.1"
+# `StreamExt::next` over an axum body, to write an upload through frame by
+# frame instead of buffering a layer to append it.
+futures-util = { version = "0.3", default-features = false }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace", "set-header"] }
 tracing = "0.1"

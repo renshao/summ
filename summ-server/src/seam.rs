@@ -119,6 +119,49 @@ pub struct Referrers {
     pub filter_applied: bool,
 }
 
+/// A blob body arriving on a push.
+///
+/// Carried as a stream rather than as `Bytes` because the alternative is a
+/// buffer the size of a layer: the default per-request ceiling is 1 GiB, and a
+/// handful of concurrent pushes at that size is an out-of-memory kill rather
+/// than a slow registry. The implementation writes frames through as they
+/// arrive, so a push costs one frame of memory regardless of the blob.
+///
+/// The two limits travel with the body because only the consumer can enforce
+/// them: `declared` is not known to be wrong until the last frame has arrived,
+/// and `limit` is not known to be exceeded until it is.
+pub struct UploadBody {
+    pub body: Body,
+    /// The client's `Content-Length`, when it sent one. `None` is a streamed
+    /// upload with no declared length, which the spec permits.
+    pub declared: Option<u64>,
+    /// Hard ceiling on the bytes this one request may carry.
+    pub limit: u64,
+}
+
+impl UploadBody {
+    /// Collect the whole body, enforcing both limits.
+    ///
+    /// For an implementation that has nowhere to stream *to*. The streaming
+    /// implementation must not use this - the point of the type is that it need
+    /// not.
+    pub async fn collect(self) -> OpsResult<Bytes> {
+        let limit = usize::try_from(self.limit).unwrap_or(usize::MAX);
+        let bytes = axum::body::to_bytes(self.body, limit)
+            .await
+            .map_err(|_| OpsError::BodyTooLarge { limit: self.limit })?;
+        if let Some(declared) = self.declared {
+            if declared != bytes.len() as u64 {
+                return Err(OpsError::SizeMismatch {
+                    declared,
+                    actual: bytes.len() as u64,
+                });
+            }
+        }
+        Ok(bytes)
+    }
+}
+
 /// Failures the layers below can report, in the vocabulary of the spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpsError {
@@ -133,11 +176,40 @@ pub enum OpsError {
     },
     /// The bytes did not hash to the digest the client named.
     DigestMismatch,
+    /// The body did not carry the number of bytes the client declared.
+    ///
+    /// Detected while consuming the body rather than before it, which is the
+    /// price of not buffering. The session's *recorded* offset is still
+    /// untouched - a rejected request never commits one - so the client's
+    /// recovery is unchanged: ask for the offset, resume from it.
+    SizeMismatch {
+        declared: u64,
+        actual: u64,
+    },
+    /// The body exceeded the per-request ceiling.
+    BodyTooLarge {
+        limit: u64,
+    },
+    /// The body ended early or the connection failed part-way through. A
+    /// client's problem rather than the registry's, so not an `Internal`.
+    BodyIncomplete(String),
     /// The manifest could not be parsed well enough to index it. Note this is
     /// *not* schema validation: manifests carrying fields outside the OCI
     /// schema must round-trip, and referenced blobs are deliberately not
     /// required to exist.
     ManifestInvalid(String),
+    /// The manifest named a layer or a child manifest this repository does not
+    /// have. Distinct from [`OpsError::ManifestInvalid`] because the spec gives
+    /// it its own code, `MANIFEST_BLOB_UNKNOWN`, and a client can act on the
+    /// difference: the document is well-formed and the fix is to push the blob,
+    /// not to rewrite the manifest.
+    ///
+    /// Only an implementation that validates references can raise it. The check
+    /// is optional per spec - see `RegistryOptions::validate_references` - so an
+    /// implementation that skips it simply never returns this.
+    ManifestBlobUnknown {
+        digest: Digest,
+    },
     Internal(String),
 }
 
@@ -230,7 +302,7 @@ pub trait Registry: Send + Sync + 'static {
         name: &str,
         id: &str,
         expected_offset: u64,
-        chunk: Bytes,
+        body: UploadBody,
     ) -> OpsResult<u64>;
 
     /// Append an optional final chunk, verify the whole-blob digest, and commit.
@@ -243,14 +315,14 @@ pub trait Registry: Send + Sync + 'static {
         name: &str,
         id: &str,
         expected_offset: u64,
-        chunk: Bytes,
+        body: UploadBody,
         digest: &Digest,
     ) -> OpsResult<()>;
 
     async fn cancel_upload(&self, name: &str, id: &str) -> OpsResult<()>;
 
     /// Push a whole blob in one request (end-4b, the single-POST flow).
-    async fn put_blob(&self, name: &str, digest: &Digest, body: Bytes) -> OpsResult<()>;
+    async fn put_blob(&self, name: &str, digest: &Digest, body: UploadBody) -> OpsResult<()>;
 
     // ---- referrers -------------------------------------------------------
 

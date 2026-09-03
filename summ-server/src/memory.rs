@@ -33,7 +33,8 @@ use summ_core::Digest;
 use crate::range::ByteRange;
 use crate::reference::Reference;
 use crate::seam::{
-    BlobRead, Descriptor, ManifestPut, ManifestStat, OpsError, OpsResult, Page, Referrers, Registry,
+    BlobRead, Descriptor, ManifestPut, ManifestStat, OpsError, OpsResult, Page, Referrers,
+    Registry, UploadBody,
 };
 
 #[derive(Debug, Clone)]
@@ -454,8 +455,13 @@ impl Registry for MemoryRegistry {
         name: &str,
         id: &str,
         expected_offset: u64,
-        chunk: Bytes,
+        body: UploadBody,
     ) -> OpsResult<u64> {
+        // Collected, because there is nowhere to stream to: this
+        // implementation's whole storage is a `Vec<u8>`. The real one must not
+        // do this, which is why the collecting is here rather than in the
+        // handler.
+        let chunk = body.collect().await?;
         let mut state = self.lock();
         let upload = state.uploads.get_mut(id).ok_or(OpsError::UploadUnknown)?;
         if upload.repo != name {
@@ -474,9 +480,10 @@ impl Registry for MemoryRegistry {
         name: &str,
         id: &str,
         expected_offset: u64,
-        chunk: Bytes,
+        body: UploadBody,
         digest: &Digest,
     ) -> OpsResult<()> {
+        let chunk = body.collect().await?;
         let mut state = self.lock();
         let upload = state.uploads.get(id).ok_or(OpsError::UploadUnknown)?;
         if upload.repo != name {
@@ -522,7 +529,8 @@ impl Registry for MemoryRegistry {
         }
     }
 
-    async fn put_blob(&self, name: &str, digest: &Digest, body: Bytes) -> OpsResult<()> {
+    async fn put_blob(&self, name: &str, digest: &Digest, body: UploadBody) -> OpsResult<()> {
+        let body = body.collect().await?;
         if hash_like(&body, digest) != *digest {
             return Err(OpsError::DigestMismatch);
         }

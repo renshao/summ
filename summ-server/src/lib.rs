@@ -5,8 +5,10 @@
 //! narrow trait. That is deliberate: the spec's sharp edges - the two
 //! `Content-Range` grammars, `Docker-Content-Digest`, out-of-order chunk
 //! rejection, pagination `Link` headers, the name grammar - are all decided
-//! here, above storage, so they can be tested without one. [`memory`] provides
-//! an implementation of that trait good enough to exercise the whole surface.
+//! here, above storage, so they can be tested without one. [`backend`] is the
+//! real implementation of that trait - `summ-registry` over `summ-meta`, with
+//! `summ-storage` holding the bytes - and [`memory`] is a second one, kept
+//! because a trait with one implementation is not a seam.
 //!
 //! Two things the middleware stack deliberately does *not* have, both from
 //! `research/R5`:
@@ -20,6 +22,7 @@
 //!   or accept level.
 
 pub mod app;
+pub mod backend;
 pub mod config;
 pub mod error;
 pub mod handlers;

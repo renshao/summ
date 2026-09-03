@@ -248,6 +248,22 @@ impl Registry {
         Ok(Planned { outcome: (), batch })
     }
 
+    /// The global `L` record, ignoring repository membership entirely.
+    ///
+    /// **Never gate serving on this.** Blob content is deduplicated
+    /// registry-wide, so `L` says only that the bytes exist somewhere; using it
+    /// to answer a `GET` would let any repository name pull any layer in the
+    /// store by digest. [`Registry::servable_blob`] is the predicate for that,
+    /// and it is not this one.
+    ///
+    /// It exists for the two callers that legitimately ask a registry-wide
+    /// question: anonymous cross-repository mount, where the spec's whole point
+    /// is that the client need not know where the blob already lives, and
+    /// purge, which reasons about content rather than about names.
+    pub fn blob_metadata(&self, digest: &Digest) -> Result<Option<BlobRecord>> {
+        self.blob_record(digest)
+    }
+
     pub(crate) fn blob_record(&self, digest: &Digest) -> Result<Option<BlobRecord>> {
         match self.engine.get(&keys::blob(digest))? {
             Some(raw) => Ok(Some(decode(&raw, "BlobRecord")?)),
@@ -363,6 +379,24 @@ impl Registry {
     /// batch. It has to be: no key for the repo can be encoded until its id
     /// exists. It is idempotent and independently atomic.
     pub fn plan_manifest_put(&self, req: &ManifestPut<'_>) -> Result<Planned<PushOutcome>> {
+        self.plan_manifest_put_tagged(req, &[])
+    }
+
+    /// A push that also applies the `?tag=` parameters of end-7b.
+    ///
+    /// The extra tags cannot be a second call to
+    /// [`Registry::plan_set_tag`]: that one requires the manifest to be stored
+    /// already, and here it exists only inside the batch being built. Staging
+    /// them from the parsed body instead is what keeps the whole push - the
+    /// manifest, its edges, and every tag it lands under - a single atomic
+    /// batch. Applying the manifest first and the tags afterwards would leave a
+    /// crash window in which the digest resolves but the tag the client was
+    /// told about does not.
+    pub fn plan_manifest_put_tagged(
+        &self,
+        req: &ManifestPut<'_>,
+        extra_tags: &[String],
+    ) -> Result<Planned<PushOutcome>> {
         if req.body.len() > self.options.max_manifest_bytes {
             return Err(RegistryError::invalid(format!(
                 "manifest is {} bytes, limit is {}",
@@ -428,14 +462,32 @@ impl Registry {
         }
 
         let mut displaced = None;
-        if let Some(tag) = req.reference.as_tag() {
+        if req.reference.as_tag().is_some() || !extra_tags.is_empty() {
             let target = TagTarget {
                 digest,
                 media_type: parsed.media_type.clone(),
                 size: record.size,
                 referrer,
             };
-            displaced = self.stage_set_tag(&mut batch, repo_id, tag, &target, req.now)?;
+            // The reference's own tag first, so it is the one whose displaced
+            // digest is reported; a `?tag=` repeating it stages identical keys
+            // and is skipped rather than written twice.
+            let mut applied: Vec<&str> = Vec::with_capacity(extra_tags.len() + 1);
+            for tag in req
+                .reference
+                .as_tag()
+                .into_iter()
+                .chain(extra_tags.iter().map(String::as_str))
+            {
+                if applied.contains(&tag) {
+                    continue;
+                }
+                let previous = self.stage_set_tag(&mut batch, repo_id, tag, &target, req.now)?;
+                if applied.is_empty() {
+                    displaced = previous;
+                }
+                applied.push(tag);
+            }
         }
 
         Ok(Planned {

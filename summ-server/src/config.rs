@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use crate::backend::Engine;
+
 /// Limits and switches the handlers consult. Separate from [`Cli`] so tests can
 /// construct one directly and so a future config file has somewhere to land.
 #[derive(Debug, Clone)]
@@ -85,11 +87,32 @@ pub struct ServeArgs {
 
     /// Directory for blobs and metadata.
     ///
-    /// Unused while the storage layers are being built: `serve` currently backs
-    /// the API with the in-memory registry, which is enough to exercise the
-    /// whole HTTP surface by hand.
+    /// `meta/` holds the metadata engine and `blobs/` the content-addressed
+    /// store. They share a directory because they must share a filesystem: an
+    /// upload is committed by renaming its staging file into the blob tree, and
+    /// a rename across devices is not a rename.
     #[arg(long, default_value = "./data", env = "SUMM_DATA_DIR")]
     pub data_dir: PathBuf,
+
+    /// Metadata engine.
+    ///
+    /// RocksDB is the v1 decision. redb is the second implementation that keeps
+    /// `MetaEngine` honest, and running the whole binary on it is a stronger
+    /// check of that boundary than running the trait's tests against it.
+    #[arg(long, value_enum, default_value = "rocks", env = "SUMM_ENGINE")]
+    pub engine: Engine,
+
+    /// Accept a manifest whose layers or child manifests are not present yet.
+    ///
+    /// Validation defaults on: a registry that accepts a manifest it cannot
+    /// serve has traded a push-time 400 for a pull-time 404, and the pull-time
+    /// failure is the one nobody can diagnose. It is optional per spec and
+    /// R1 recommends against it for exactly one caller - the conformance
+    /// suite's `OCI_DATA_SPARSE` sets push a manifest and its layers
+    /// concurrently, which is the shape validation rejects. This flag is how
+    /// the harness turns it off without the server arguing with it.
+    #[arg(long, env = "SUMM_ALLOW_MISSING_REFERENCES")]
+    pub allow_missing_references: bool,
 
     /// Maximum manifest size in bytes.
     #[arg(long, default_value_t = 8 * 1024 * 1024, env = "SUMM_MAX_MANIFEST_BYTES")]
@@ -109,6 +132,19 @@ pub struct ServeArgs {
 }
 
 impl ServeArgs {
+    /// The ops layer's own limits, which are not the HTTP layer's.
+    ///
+    /// `max_manifest_bytes` appears in both on purpose and is deliberately the
+    /// same number: the handler's copy decides a `413` before the body is read,
+    /// and the ops layer's is the backstop for any caller that did not come
+    /// through HTTP.
+    pub fn registry_options(&self) -> summ_registry::RegistryOptions {
+        summ_registry::RegistryOptions {
+            validate_references: !self.allow_missing_references,
+            max_manifest_bytes: self.max_manifest_bytes,
+        }
+    }
+
     pub fn server_config(&self) -> ServerConfig {
         ServerConfig {
             max_manifest_bytes: self.max_manifest_bytes,

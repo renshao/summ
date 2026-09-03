@@ -48,5 +48,12 @@ summ-meta     MetaEngine trait, WriteBatch, RocksDB + redb engines, repo
               interner, schema version + migration seam
 summ-storage  filesystem blob store (Unix only: pread/pwrite)
 summ-registry ops layer — spec operations as WriteBatch builders
-summ-server   axum HTTP layer, /v2/ route table, the `summ` binary
+summ-server   axum HTTP layer, /v2/ route table, the `summ` binary, and
+              `backend.rs` — the one module that wires the three above together
 ```
+
+`summ-server` reaches everything below it through `seam::Registry`, whose
+failures are in spec vocabulary. **Nothing under `handlers/` may import
+`summ-registry`, `summ-meta` or `summ-storage`** — `backend.rs` is the only
+module that names them, and `memory.rs` is a second implementation of the same
+trait, kept so the seam stays one.

@@ -314,7 +314,12 @@ async fn resuming_an_unknown_upload_is_not_found() {
         state
     };
     let err = store
-        .resume_upload(&upload_id("ghost"), DigestAlgorithm::Sha256, 0, &state)
+        .resume_upload(
+            &upload_id("ghost"),
+            DigestAlgorithm::Sha256,
+            0,
+            Some(&state),
+        )
         .await
         .expect_err("must fail");
     assert!(matches!(err, SummError::NotFound), "got {err:?}");
@@ -349,7 +354,7 @@ async fn hasher_state_survives_a_process_restart() {
         // Process two: rehydrate from exactly what the metadata store holds.
         let store = BlobStore::open(dir.path()).expect("reopen");
         let mut upload = store
-            .resume_upload(&id, algorithm, offset, &state)
+            .resume_upload(&id, algorithm, offset, Some(&state))
             .await
             .expect("resume");
         assert_eq!(upload.offset(), offset);
@@ -398,7 +403,7 @@ async fn resuming_truncates_bytes_written_past_the_recorded_offset() {
     };
 
     let mut upload = store
-        .resume_upload(&id, DigestAlgorithm::Sha256, offset, &state)
+        .resume_upload(&id, DigestAlgorithm::Sha256, offset, Some(&state))
         .await
         .expect("resume");
     upload
@@ -433,7 +438,7 @@ async fn resuming_a_short_staging_file_is_an_error_not_a_hole() {
     drop(upload);
 
     let err = store
-        .resume_upload(&id, DigestAlgorithm::Sha256, 9_999, &state)
+        .resume_upload(&id, DigestAlgorithm::Sha256, 9_999, Some(&state))
         .await
         .expect_err("must fail");
     assert!(matches!(err, SummError::Storage(_)), "got {err:?}");

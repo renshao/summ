@@ -29,12 +29,13 @@ use summ_core::Digest;
 use uuid::Uuid;
 
 use super::{
-    digest_header, empty_with_length, method_not_allowed, ops_error, read_body, Ctx, Handled,
+    digest_header, empty_with_length, method_not_allowed, ops_error, Ctx, Handled,
     DOCKER_CONTENT_DIGEST, OCI_CHUNK_MIN_LENGTH,
 };
 use crate::error::{ApiError, ErrorCode};
 use crate::range::{parse_chunk_range, upload_range_header, ChunkRangeError};
 use crate::reference::{parse_digest, valid_name};
+use crate::seam::UploadBody;
 
 /// `POST /v2/<name>/blobs/uploads/`.
 pub async fn create(ctx: &Ctx, name: &str, body: Body) -> Handled {
@@ -122,11 +123,8 @@ async fn mount(
 async fn single_post(ctx: &Ctx, name: &str, raw: &str, body: Body) -> Handled {
     let digest =
         parse_digest(raw).map_err(|e| ApiError::new(ErrorCode::DigestInvalid).with_detail(e.0))?;
-    let limit = ctx.config().max_upload_chunk_bytes;
-    let bytes = read_body(body, limit, body_too_large(limit)).await?;
-
     ctx.registry()
-        .put_blob(name, &digest, bytes)
+        .put_blob(name, &digest, upload_body(ctx, body, None))
         .await
         .map_err(ops_error)?;
 
@@ -159,19 +157,13 @@ async fn patch(ctx: &Ctx, name: &str, id: &str, body: Body) -> Handled {
         .await
         .map_err(ops_error)?;
 
+    // Everything the `416` depends on is decided here, before a byte of the
+    // body is touched: a rejected chunk must leave the session byte-identical.
     let declared = validate_chunk(ctx, offset)?;
-
-    let limit = ctx.config().max_upload_chunk_bytes;
-    let chunk = read_body(body, limit, body_too_large(limit)).await?;
-    if let Some(declared) = declared {
-        if declared != chunk.len() as u64 {
-            return Err(size_mismatch(declared, chunk.len() as u64));
-        }
-    }
 
     let new_offset = ctx
         .registry()
-        .append_upload(name, id, offset, chunk)
+        .append_upload(name, id, offset, upload_body(ctx, body, declared))
         .await
         .map_err(ops_error)?;
 
@@ -205,16 +197,8 @@ async fn finish(ctx: &Ctx, name: &str, id: &str, body: Body) -> Handled {
     // out-of-order final chunk is a `416` just like any other.
     let declared = validate_chunk(ctx, offset)?;
 
-    let limit = ctx.config().max_upload_chunk_bytes;
-    let chunk = read_body(body, limit, body_too_large(limit)).await?;
-    if let Some(declared) = declared {
-        if declared != chunk.len() as u64 {
-            return Err(size_mismatch(declared, chunk.len() as u64));
-        }
-    }
-
     ctx.registry()
-        .finish_upload(name, id, offset, chunk, &digest)
+        .finish_upload(name, id, offset, upload_body(ctx, body, declared), &digest)
         .await
         .map_err(ops_error)?;
 
@@ -323,11 +307,17 @@ fn size_mismatch(expected: u64, actual: u64) -> ApiError {
         .with_detail(format!("expected {expected} bytes, got {actual}"))
 }
 
-fn body_too_large(limit: usize) -> ApiError {
-    ApiError::new(ErrorCode::SizeInvalid)
-        .with_status(StatusCode::PAYLOAD_TOO_LARGE)
-        .with_message("request body exceeds the maximum accepted size")
-        .with_detail(format!("limit is {limit} bytes"))
+/// Hand the body down without reading it.
+///
+/// The declared length and the per-request ceiling travel with it rather than
+/// being checked here, because neither can be checked before the bytes arrive
+/// and the whole point is that they are never all here at once.
+fn upload_body(ctx: &Ctx, body: Body, declared: Option<u64>) -> UploadBody {
+    UploadBody {
+        body,
+        declared,
+        limit: ctx.config().max_upload_chunk_bytes as u64,
+    }
 }
 
 /// The `<blob-push-location>`.

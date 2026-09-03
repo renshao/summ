@@ -146,8 +146,14 @@ impl BlobStore {
     /// Reopen an upload from its persisted `UploadSession`.
     ///
     /// `offset` and `hasher_state` are the pair stored under the `U` key; they
-    /// must come from the same batch. Because they were committed *after* the
-    /// bytes were written, the staging file can legitimately be longer than
+    /// must come from the same batch. `hasher_state` is `None` only for a
+    /// session that has never been appended to, where a fresh hasher is the
+    /// correct state and there is none worth storing; passing `None` with a
+    /// non-zero offset would resume onto a hash that has not seen the bytes
+    /// already on disk, so it is refused rather than started from scratch.
+    ///
+    /// Because the pair is committed *after*
+    /// the bytes were written, the staging file can legitimately be longer than
     /// `offset` - a crash between the write and the metadata commit - so it is
     /// truncated back to the recorded offset. It can never legitimately be
     /// shorter, and a short file is reported rather than papered over: resuming
@@ -161,11 +167,19 @@ impl BlobStore {
         id: &UploadId,
         algorithm: DigestAlgorithm,
         offset: u64,
-        hasher_state: &[u8],
+        hasher_state: Option<&[u8]>,
     ) -> Result<Upload> {
         let path = upload_path(&self.root, id.as_str());
         let id = id.clone();
-        let hasher = Hasher::restore(algorithm, hasher_state)?;
+        let hasher = match hasher_state {
+            Some(state) => Hasher::restore(algorithm, state)?,
+            None if offset == 0 => Hasher::new(algorithm),
+            None => {
+                return Err(SummError::Storage(format!(
+                    "upload {id} records offset {offset} but no hasher state"
+                )))
+            }
+        };
         tokio::task::spawn_blocking(move || {
             let file = open_staging(&path, false)?;
             let len = file

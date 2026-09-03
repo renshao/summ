@@ -178,7 +178,7 @@ Two traps worth stating explicitly:
 
 ## Status
 
-**Built** (`cargo test` — 261 passing):
+**Built** (`cargo test` — 282 passing):
 
 ```
 summ-core     digest (sha256/sha512), key encoding, value types, errors
@@ -190,7 +190,8 @@ summ-storage  filesystem blob store: 3-level CAS, upload staging, resumable
 summ-registry ops layer: manifest push/pull/delete as WriteBatch builders,
               tags, referrers, cursor-paged discovery
 summ-server   HTTP: full /v2/ route table, spec error model, upload state
-              machine, CLI. Runs on an in-memory store — see below
+              machine, CLI, and the wiring that runs it on the three crates
+              above
 ```
 
 Notable properties already covered by tests: cursor paging never exceeds its
@@ -202,12 +203,27 @@ contiguous in key order across every in-domain range, which is the property
 postcard round trip; all four upload flows, all six blob range cases, and both
 `Content-Range` grammars.
 
-**The one thing not yet done in Phase 1 is the wiring.** The four packages were
-built concurrently against a fixed schema, so `summ-server` currently runs on
-`memory::MemoryRegistry` behind its `seam::Registry` trait rather than on
-`summ-registry` + `summ-storage` + `summ-meta`. The seam exists precisely to be
-replaced. Until then blob bodies are buffered rather than streamed, though
-`BlobRead.body` is already `axum::body::Body`, so the shape is right.
+**The wiring has landed** — `summ-server/src/backend.rs`, package K. `summ serve`
+now runs on `summ-registry` over `summ-meta` with `summ-storage` holding the
+bytes; `memory::MemoryRegistry` stays as the second implementation of
+`seam::Registry`, which is what keeps that trait a seam rather than a formality.
+`summ-server/tests/wiring.rs` drives the same router as `tests/api.rs` against a
+real store on a temp directory, and the tests that matter reopen it — a registry
+that loses a push on restart passes every test in `api.rs`.
+
+Verified end to end, by test and by hand against the binary: push and pull of
+manifests and blobs, byte-exact manifest return, tags and catalog, ranges
+including containerd's open-ended `bytes=N-`, cross-repo mount, per-repo blob
+isolation, delete cascade, and all of it surviving a restart. A chunked upload
+**resumes across a process restart** — the offset and the 104-byte hasher state
+come back from the `U` record and the commit still verifies — which is the claim
+that keeps chunked uploads from being an HA constraint, and it was untested
+until there was a store to test it against.
+
+**Both directions stream.** A pull is a `BlobStream` over 1 MiB `pread`s; a push
+is written through frame by frame, so neither costs memory proportional to the
+blob. Measured on the release binary: pushing a 200 MB blob moved the server's
+RSS from 15.6 MB to 15.8 MB, and serving it back took it to 20 MB.
 
 **Not built**: purge, conformance harness, the extension API and UI, analytics
 writers, everything in Phases 2b–6.
@@ -236,22 +252,31 @@ FAIL count can conceal an entire unimplemented API.
 
 Perf baseline with `../container-registry/bench` is still to do.
 
-### Phase 1 — skeleton — **substantially done, pending wiring**
+### Phase 1 — skeleton — **built, pending the conformance run**
 axum, full route table, spec error model, config, single binary. Filesystem blob
 store, naive metadata. **Exit: conformance push + pull pass.**
 
 Built: the route table, the error model, all four upload flows, all six range
-cases, both `Content-Range` grammars, the blob store, and the ops layer. What
-remains before the exit criterion can even be attempted is package K, the
-wiring, plus package A, the harness.
+cases, both `Content-Range` grammars, the blob store, the ops layer, and the
+wiring that joins them. `summ serve --data-dir <d>` is a real registry that
+keeps what it is given. What remains before the exit criterion can be attempted
+is package A, the harness — nothing else.
 
 **One thing to set before running the suite:** the ops layer validates that a
 manifest's referenced blobs exist, behind `RegistryOptions::validate_references`
 and defaulted on. R1 recommends *against* validating — it is optional per spec,
 costs N lookups, breaks a client pushing layers and manifest concurrently, and
 `OCI_DATA_SPARSE` pushes exactly that shape. **The harness will need it off for
-the sparse data sets.** Defaulting it on is the safer production posture; the
-flag is there so conformance does not have to argue with it.
+the sparse data sets**, which is `summ serve --allow-missing-references` (or
+`SUMM_ALLOW_MISSING_REFERENCES=1`). Defaulting it on is the safer production
+posture; the flag is there so conformance does not have to argue with it. With
+it on, a manifest naming an absent blob is `400 MANIFEST_BLOB_UNKNOWN` — its own
+code, not `MANIFEST_INVALID`, because the document is well-formed and the fix is
+to push the blob.
+
+**The other switch the harness needs** is `--engine redb`, which runs the whole
+binary on the second `MetaEngine`. Running the suite against both is the
+cheapest possible proof that nothing has leaked past the trait.
 
 Two things R1 moved *into* this phase that looked like later work:
 
@@ -323,23 +348,25 @@ concurrently; each owns its files.
 | ~~C~~ | ~~Filesystem blob store~~ — **done** | `summ-storage/` | — |
 | ~~D~~ | ~~Upload session handling~~ — **done** in the HTTP layer; still on the in-memory seam, so `U` keys are not yet written | `summ-server/`, `U` keys | B, C |
 | ~~E~~ | ~~Registry ops layer~~ — **done** | `summ-registry/` | — |
-| K | **Wiring** — replace `summ-server`'s `seam::Registry` in-memory impl with `summ-registry` + `summ-storage` + `summ-meta`, and stream blob bodies | `summ-server/` | B, C, E |
+| ~~K~~ | ~~Wiring~~ — **done**, `summ-server/src/backend.rs`. Bodies stream in both directions | `summ-server/` | B, C, E |
 | F | Purge | `summ-purge/` | E |
 | G | Scale benchmark — synthetic 10M-repo dataset, engine A/B | `benches/` | — |
 | H | Extension API — cursor-paged discovery endpoints | `summ-server/` | E |
 | I | Built-in web UI — embedded assets, served on the same port | `summ-ui/` | H |
 | J | Analytics — pull-count queue, aggregation worker, retention sweep | `summ-analytics/` | E |
 
-Packages B, C, E and D are done. **Package K, the wiring, is the next step** and
-is what turns four tested libraries into a registry: the four were built
-concurrently against a fixed schema, which is why the seam exists at all.
+Packages B, C, D, E and K are done, so there is a working registry. **Package A,
+the conformance harness, is the next step**: it is the only thing standing
+between here and the Phase 1 exit criterion, and everything it needs now exists.
 
-One thing that fell out of building them concurrently and is worth keeping:
-`summ-server` reaches the layers below only through `seam::Registry`, whose
-failures are in spec vocabulary (`OpsError::{RepoUnknown, BlobUnknown,
-OffsetMismatch, …}`). The layer below never learns about HTTP. Keep that
-property when wiring — it is what makes the ops layer testable without a
-server, and the server testable without a store.
+The property that survived the wiring and must keep surviving: `summ-server`
+reaches the layers below only through `seam::Registry`, whose failures are in
+spec vocabulary (`OpsError::{RepoUnknown, BlobUnknown, OffsetMismatch, …}`). The
+layer below never learns about HTTP, and nothing under `handlers/` imports
+`summ-registry`, `summ-meta` or `summ-storage` — `backend.rs` is the single
+module that names them. That is what makes the ops layer testable without a
+server and the server testable without a store, and it is why the same test
+harness runs over both implementations.
 
 ## Engine choice — RocksDB (decided)
 
@@ -818,7 +845,36 @@ the same pass, exactly once. Kept here as the record of what changed and why.
   change, and there is no S3 driver until Phase 5. The version marker that
   landed in this batch is exactly what makes adding them later safe.
 
-**Found during implementation, still open:**
+**Found while wiring (package K), still open:**
+
+- **Metadata reads run inline on the reactor; only writes get `spawn_blocking`.**
+  `summ-registry` is synchronous throughout, and a write reaches RocksDB's WAL,
+  so `Backend::write` moves those off the reactor. Reads are left inline on the
+  bet that they are block-cache hits measured in microseconds and that a
+  `spawn_blocking` round trip (~5 µs, measured in R2) would cost more than the
+  lookup it protects. That bet is unmeasured, and a cold read on a
+  ten-million-repo store is exactly where it would be wrong. Phase 3.
+- **`referrers` scans a fixed 1000 edges and does not page.** The endpoint has
+  no pagination in the spec, so the bound had to come from somewhere and an
+  unbounded scan is the one shape this design forbids. `Registry::referrers`
+  underneath is properly cursor-paged; the seam is what flattens it. Revisit
+  with the endpoint in Phase 6 — a subject with more than 1000 referrers is
+  silently truncated today.
+- **Anonymous cross-repo mount is served from `L` alone.** `?mount=<digest>`
+  with no `from=` grants membership on the strength of "the content exists
+  somewhere", which is what the spec's anonymous mount means and what makes it
+  one lookup. It is also the only place `L` decides anything a client can
+  observe, so if a private-repository model ever arrives, this is the line that
+  has to change.
+- **A push rejected mid-body leaves staged bytes behind.** The declared-length
+  check moved into the body consumer when pushes stopped being buffered, so a
+  short body is detected after some bytes have reached the staging file. The
+  session record is not written, so the recorded offset is unchanged and the
+  next resume truncates the excess — the client sees exactly what it saw before.
+  Worth knowing when reading the staging directory, and worth a purge sweep for
+  the case where the client never comes back.
+
+**Found during earlier implementation, still open:**
 
 - **`ManifestRecord.artifact_type` cannot answer a referrers query on its own.**
   The value the response must carry is the *effective* artifact type: an image
@@ -839,7 +895,9 @@ the same pass, exactly once. Kept here as the record of what changed and why.
 - **`SummError` has no `Io` variant and no `OffsetMismatch { expected, got }`.**
   An out-of-order upload append — which the HTTP layer must turn into a 416 —
   currently rides on `InvalidData`. Matchable without parsing messages, but a
-  dedicated variant is the honest end state.
+  dedicated variant is the honest end state. The wiring works around it rather
+  than fixing it: `Backend::append_upload` compares the session's own offset
+  before touching the file, so the storage error never has to be classified.
 - **`DigestAlgorithm` lives in `summ-storage`, not `summ-core`.** An upload
   picks an algorithm at POST time from `?digest-algorithm=`, before any hash
   exists, and `Digest` can only name one after the fact. It belongs beside

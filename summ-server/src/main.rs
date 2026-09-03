@@ -1,15 +1,15 @@
 //! The `summ` binary.
 //!
-//! `serve` currently backs the API with [`MemoryRegistry`]: `summ-registry` and
-//! `summ-storage` are being built alongside this crate, and the HTTP layer
-//! reaches them only through [`summ_server::seam::Registry`], so swapping the
+//! `serve` backs the API with [`Backend`]: `summ-registry` over `summ-meta`,
+//! with `summ-storage` holding the bytes. The HTTP layer reaches all three only
+//! through [`summ_server::seam::Registry`], which is why choosing an
 //! implementation is one line here.
 
 use std::sync::Arc;
 
 use clap::Parser;
+use summ_server::backend::Backend;
 use summ_server::config::{Cli, Command, ServeArgs};
-use summ_server::memory::MemoryRegistry;
 use summ_server::{router, AppState};
 use tracing_subscriber::EnvFilter;
 
@@ -30,13 +30,20 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let state = AppState::new(Arc::new(MemoryRegistry::new()), args.server_config());
+    // Opened before the listener binds. A store that cannot be opened - a
+    // newer schema version, a directory we cannot write - must be a startup
+    // failure with a message, never a server that accepts connections and
+    // answers 500 to every one of them.
+    let backend = Backend::open(&args.data_dir, args.engine, args.registry_options())?;
+    let state = AppState::new(Arc::new(backend), args.server_config());
     let app = router(state);
 
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     tracing::info!(
         listen = %listener.local_addr()?,
         data_dir = %args.data_dir.display(),
+        engine = ?args.engine,
+        validate_references = !args.allow_missing_references,
         "summ listening"
     );
 
