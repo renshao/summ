@@ -35,7 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use axum::body::{Body, Bytes};
 use futures_util::StreamExt;
-use summ_core::{Digest, SummError};
+use summ_core::{Digest, ManifestRecord, Platform, SummError};
 use summ_meta::{MetaEngine, RedbEngine, RocksEngine};
 use summ_registry::error::RegistryError;
 use summ_registry::{Reference as OpsReference, Registry as Ops, RegistryOptions, UploadKey};
@@ -44,8 +44,9 @@ use summ_storage::{BlobStore, DigestAlgorithm, UploadId};
 use crate::range::ByteRange;
 use crate::reference::Reference;
 use crate::seam::{
-    BlobRead, Descriptor, ManifestPut, ManifestStat, OpsError, OpsResult, Page, Referrers,
-    Registry, UploadBody,
+    BlobRead, Descriptor, ManifestInfo, ManifestPut, ManifestStat, OpsError, OpsResult, Page,
+    Referrers, Registry, RepoDetail, RepoSummary, TagInfo, Tally, UploadBody, COUNT_CEILING,
+    TAGS_PER_MANIFEST,
 };
 
 /// Which metadata engine `serve` opens.
@@ -67,6 +68,120 @@ pub enum Engine {
 /// design forbids. A subject with more referrers than this is a signature farm,
 /// and truncating is better than either a timeout or an OOM.
 const REFERRERS_LIMIT: usize = 1000;
+
+/// How many keys one turn of a bounded count reads.
+///
+/// A count runs to [`COUNT_CEILING`] in steps of this, rather than asking the
+/// engine for the ceiling in one call: the engine materialises the keys of a
+/// page, so a single 10,000-key request would allocate ten thousand keys to
+/// discard all of them. A step is one seek and a sequential block walk, which
+/// is the cheap shape.
+const COUNT_STEP: usize = 500;
+
+/// `os/arch` or `os/arch/variant`. The variant is part of the identity - a
+/// `linux/arm64` and a `linux/arm64/v8` image are different images - so it is
+/// rendered rather than dropped.
+fn platform_label(platform: &Platform) -> String {
+    match &platform.variant {
+        Some(variant) => format!("{}/{}/{}", platform.os, platform.arch, variant),
+        None => format!("{}/{}", platform.os, platform.arch),
+    }
+}
+
+/// Walk a prefix in [`COUNT_STEP`] steps until it ends or [`COUNT_CEILING`]
+/// does, whichever comes first.
+///
+/// `step` is handed the cursor and returns `(counted, next)`. The ceiling is
+/// checked *after* adding a page rather than before requesting one, so a repo
+/// with exactly the ceiling's worth of keys reports a complete count instead of
+/// a floor that happens to be right.
+fn count_to_ceiling<C, F>(mut step: F) -> summ_registry::Result<Tally>
+where
+    F: FnMut(Option<&C>) -> summ_registry::Result<(u64, Option<C>)>,
+{
+    let mut count = 0u64;
+    let mut cursor: Option<C> = None;
+    loop {
+        let (added, next) = step(cursor.as_ref())?;
+        count += added;
+        match next {
+            None => return Ok(Tally::exact(count)),
+            Some(_) if count >= COUNT_CEILING => {
+                return Ok(Tally {
+                    count,
+                    complete: false,
+                })
+            }
+            Some(next) => cursor = Some(next),
+        }
+    }
+}
+
+fn count_tags(ops: &Ops, repo: &str) -> summ_registry::Result<Tally> {
+    count_to_ceiling(|cursor: Option<&String>| {
+        let page = ops.count_tags(repo, cursor.map(String::as_str), COUNT_STEP)?;
+        Ok((page.tags, page.next))
+    })
+}
+
+fn count_manifests(ops: &Ops, repo: &str) -> summ_registry::Result<Tally> {
+    count_to_ceiling(|cursor: Option<&Digest>| {
+        let page = ops.count_manifests(repo, cursor, COUNT_STEP)?;
+        Ok((page.manifests, page.next))
+    })
+}
+
+/// Blob count and byte total, folded to the same ceiling.
+///
+/// `repo_usage` is paged for the same reason everything else is: there is no
+/// stored total, deliberately, because keeping one would be a read-modify-write
+/// on the push path.
+fn count_usage(ops: &Ops, repo: &str) -> summ_registry::Result<(Tally, u64)> {
+    let mut bytes = 0u64;
+    let blobs = count_to_ceiling(|cursor: Option<&Digest>| {
+        let page = ops.repo_usage(repo, cursor, COUNT_STEP)?;
+        bytes = bytes.saturating_add(page.bytes);
+        Ok((page.blobs, page.next))
+    })?;
+    Ok((blobs, bytes))
+}
+
+/// A stored record plus the two things a list row needs that it does not hold.
+fn manifest_info(
+    ops: &Ops,
+    repo: &str,
+    record: ManifestRecord,
+) -> summ_registry::Result<ManifestInfo> {
+    // An image manifest carries its own platform; an index carries none and
+    // its children carry theirs. Deduplicated because an index may list the
+    // same platform twice - an attestation manifest alongside an image, say.
+    let mut platforms: Vec<String> = record.platform.iter().map(platform_label).collect();
+    for child in &record.children {
+        if let Some(label) = child.platform.as_ref().map(platform_label) {
+            if !platforms.contains(&label) {
+                platforms.push(label);
+            }
+        }
+    }
+    let tags = ops
+        .tags_of_manifest(repo, &record.digest, None, TAGS_PER_MANIFEST)?
+        .tags;
+
+    Ok(ManifestInfo {
+        digest: record.digest,
+        media_type: record.media_type,
+        size: record.size,
+        blob_size: record.total_layer_size,
+        artifact_type: record.artifact_type,
+        subject: record.subject,
+        pushed_at: record.pushed_at,
+        platforms,
+        blobs: record.layers.len() as u64,
+        children: record.children.len() as u64,
+        tags,
+        annotations: record.annotations,
+    })
+}
 
 pub struct Backend {
     ops: Arc<Ops>,
@@ -138,6 +253,30 @@ impl Backend {
     /// trip would cost more than the lookup it protects. Phase 3 is where that
     /// assumption gets measured rather than asserted.
     async fn write<T, F>(&self, f: F) -> OpsResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Ops) -> summ_registry::Result<T> + Send + 'static,
+    {
+        self.offload(f).await
+    }
+
+    /// Run a bounded *scan* off the reactor.
+    ///
+    /// The read policy above is that a point lookup is cheaper than a
+    /// `spawn_blocking` round trip, and it is. A discovery fold is the case it
+    /// was not written for: counting a repository's manifests walks up to
+    /// [`COUNT_CEILING`] keys, and a page of summaries does that once per
+    /// repository, so it is milliseconds of CPU rather than microseconds. That
+    /// belongs off the reactor whichever way the point-lookup bet turns out.
+    async fn scan<T, F>(&self, f: F) -> OpsResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Ops) -> summ_registry::Result<T> + Send + 'static,
+    {
+        self.offload(f).await
+    }
+
+    async fn offload<T, F>(&self, f: F) -> OpsResult<T>
     where
         T: Send + 'static,
         F: FnOnce(&Ops) -> summ_registry::Result<T> + Send + 'static,
@@ -722,6 +861,143 @@ impl Registry for Backend {
                 .collect(),
             filter_applied: list.filter_applied,
         })
+    }
+
+    // ---- discovery beyond the spec ---------------------------------------
+
+    async fn repository_summaries(
+        &self,
+        prefix: &str,
+        last: Option<&str>,
+        limit: usize,
+    ) -> OpsResult<Page<RepoSummary>> {
+        let prefix = prefix.to_string();
+        let last = last.map(str::to_string);
+        self.scan(move |ops| {
+            let page = ops.search_repos(&prefix, last.as_deref(), limit)?;
+            let mut items = Vec::with_capacity(page.repos.len());
+            for name in page.repos {
+                items.push(RepoSummary {
+                    tags: count_tags(ops, &name)?,
+                    manifests: count_manifests(ops, &name)?,
+                    name,
+                });
+            }
+            Ok(Page {
+                items,
+                more: page.next.is_some(),
+            })
+        })
+        .await
+    }
+
+    async fn repository_detail(&self, name: &str) -> OpsResult<RepoDetail> {
+        let name = name.to_string();
+        self.scan(move |ops| {
+            // Not `repo_exists` first: every fold below already resolves the
+            // name through the interner and raises `NameUnknown` if it cannot,
+            // so a separate existence check would only be a fourth lookup
+            // saying what the first one already said.
+            let tags = count_tags(ops, &name)?;
+            let manifests = count_manifests(ops, &name)?;
+            let (blobs, size_bytes) = count_usage(ops, &name)?;
+            Ok(RepoDetail {
+                name,
+                tags,
+                manifests,
+                blobs,
+                size_bytes,
+            })
+        })
+        .await
+    }
+
+    async fn tag_details(
+        &self,
+        name: &str,
+        last: Option<&str>,
+        limit: usize,
+    ) -> OpsResult<Page<TagInfo>> {
+        let name = name.to_string();
+        let last = last.map(str::to_string);
+        self.scan(move |ops| {
+            let page = ops.list_tags(&name, last.as_deref(), limit)?;
+            let mut items = Vec::with_capacity(page.tags.len());
+            for tag in page.tags {
+                // `T` then `M`, the same two point lookups a `HEAD` makes. The
+                // list is already bounded, so this is bounded with it.
+                let Some(record) = ops.get_tag(&name, &tag)? else {
+                    // The key was in the scan and gone by the lookup: a delete
+                    // landed between the two. Skipping is the honest answer -
+                    // the tag no longer exists.
+                    continue;
+                };
+                let manifest = match ops.get_manifest_record(&name, &record.digest)? {
+                    Some(m) => Some(manifest_info(ops, &name, m)?),
+                    None => None,
+                };
+                items.push(TagInfo {
+                    name: tag,
+                    digest: record.digest,
+                    tagged_at: record.tagged_at,
+                    manifest,
+                });
+            }
+            Ok(Page {
+                items,
+                more: page.next.is_some(),
+            })
+        })
+        .await
+    }
+
+    async fn manifest_details(
+        &self,
+        name: &str,
+        last: Option<&Digest>,
+        limit: usize,
+    ) -> OpsResult<Page<ManifestInfo>> {
+        let name = name.to_string();
+        let last = last.copied();
+        self.scan(move |ops| {
+            let page = ops.list_manifests(&name, last.as_ref(), limit)?;
+            let mut items = Vec::with_capacity(page.manifests.len());
+            for record in page.manifests {
+                items.push(manifest_info(ops, &name, record)?);
+            }
+            Ok(Page {
+                items,
+                more: page.next.is_some(),
+            })
+        })
+        .await
+    }
+
+    async fn manifest_detail(&self, name: &str, reference: &Reference) -> OpsResult<ManifestInfo> {
+        let name = name.to_string();
+        let reference = as_ops_reference(reference);
+        self.scan(move |ops| {
+            let digest = match &reference {
+                OpsReference::Digest(digest) => *digest,
+                OpsReference::Tag(tag) => match ops.get_tag(&name, tag)? {
+                    Some(record) => record.digest,
+                    None => {
+                        return Err(RegistryError::ManifestUnknown {
+                            repo: name.clone(),
+                            reference: tag.clone(),
+                        })
+                    }
+                },
+            };
+            match ops.get_manifest_record(&name, &digest)? {
+                Some(record) => manifest_info(ops, &name, record),
+                None => Err(RegistryError::ManifestUnknown {
+                    repo: name.clone(),
+                    reference: digest.to_string(),
+                }),
+            }
+        })
+        .await
     }
 }
 

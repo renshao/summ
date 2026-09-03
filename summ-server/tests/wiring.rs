@@ -232,6 +232,154 @@ async fn push_image(h: &Harness, repo: &str, tag: &str) -> String {
     sha256_hex(&body)
 }
 
+// ---------------------------------------------------------------- discovery --
+
+/// The discovery API over the real store, which is the only place several of
+/// its fields are anything but zero.
+///
+/// `MemoryRegistry` recovers a manifest's shape by parsing the body back; the
+/// backend reads a `ManifestRecord` written at push time, and `pushed_at`,
+/// `total_layer_size` and the platform of an index child exist only there. A
+/// test that ran solely against the in-memory store would assert nothing about
+/// any of them.
+#[tokio::test]
+async fn the_discovery_api_reads_what_the_push_path_wrote() {
+    let dir = TempDir::new().expect("tempdir");
+    let h = Harness::rocks(dir.path());
+    let digest = push_image(&h, "demo/app", "v1").await;
+    push_image(&h, "other", "latest").await;
+
+    let repos = h.get("/api/v1/repositories").await.json();
+    let names: Vec<&str> = repos["repositories"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["demo/app", "other"],
+        "name order across the interner"
+    );
+    assert_eq!(repos["repositories"][0]["tags"]["count"], 1);
+    assert_eq!(repos["repositories"][0]["manifests"]["count"], 1);
+
+    // A prefix search is a narrowed key scan, all the way down to RocksDB.
+    let found = h.get("/api/v1/repositories?q=demo").await.json();
+    assert_eq!(found["repositories"].as_array().unwrap().len(), 1);
+    assert_eq!(found["repositories"][0]["name"], "demo/app");
+
+    let detail = h.get("/api/v1/repositories/demo/app").await.json();
+    assert_eq!(detail["blobs"]["count"], 2);
+    assert_eq!(
+        detail["size_bytes"].as_u64().unwrap(),
+        (CONFIG.len() + LAYER.len()) as u64,
+        "the size is folded from `P`, which is the repo's own blob set"
+    );
+
+    let manifests = h.get("/api/v1/manifests/demo/app").await.json();
+    let manifest = &manifests["manifests"][0];
+    assert_eq!(manifest["digest"], digest);
+    assert_eq!(manifest["blobs"], 2, "config plus layer");
+    assert_eq!(
+        manifest["blob_size"].as_u64().unwrap(),
+        (CONFIG.len() + LAYER.len()) as u64,
+        "`blob_size` is the record's own total, not a re-parse of the body"
+    );
+    assert_eq!(
+        manifest["platforms"],
+        serde_json::json!([]),
+        "an image manifest carries no platform of its own - it is in the config \
+         blob, which the push path deliberately does not read"
+    );
+    assert_eq!(
+        manifest["tags"],
+        serde_json::json!(["v1"]),
+        "the `G` reverse index is what says which manifests are still tagged"
+    );
+    assert!(
+        manifest["pushed_at"].as_u64().unwrap() > 0,
+        "the push clock is stamped by the backend and only exists there"
+    );
+
+    let tags = h.get("/api/v1/tags/demo/app").await.json();
+    assert_eq!(tags["tags"][0]["name"], "v1");
+    assert_eq!(tags["tags"][0]["digest"], digest);
+    assert!(tags["tags"][0]["tagged_at"].as_u64().unwrap() > 0);
+    assert_eq!(tags["tags"][0]["manifest"]["digest"], digest);
+
+    // And the same manifest by either reference.
+    let by_tag = h.get("/api/v1/manifests/demo/app@v1").await.json();
+    assert_eq!(by_tag, *manifest);
+}
+
+/// Deleting a tag must show up in discovery immediately, and must not take the
+/// manifest with it - it is still there, untagged, which is exactly the state
+/// the reclaimable-set query exists to find.
+#[tokio::test]
+async fn an_untagged_manifest_still_lists_with_no_tags() {
+    let dir = TempDir::new().expect("tempdir");
+    let h = Harness::rocks(dir.path());
+    push_image(&h, "demo/app", "v1").await;
+
+    let reply = h
+        .request(
+            Method::DELETE,
+            "/v2/demo/app/manifests/v1",
+            Vec::new(),
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::ACCEPTED);
+
+    let detail = h.get("/api/v1/repositories/demo/app").await.json();
+    assert_eq!(detail["tags"]["count"], 0);
+    assert_eq!(detail["manifests"]["count"], 1);
+
+    let manifests = h.get("/api/v1/manifests/demo/app").await.json();
+    assert_eq!(
+        manifests["manifests"][0]["tags"],
+        serde_json::json!([]),
+        "the manifest is reachable by digest and has nothing pointing at it"
+    );
+}
+
+/// The one shape that does report a platform: an index, from its children.
+///
+/// `ManifestRecord.platform` is never set on an image manifest - the platform
+/// is in the config blob and reading it would put a blob fetch on the push path
+/// - so `ChildRef` is the only place a platform enters the store, and this is
+/// the only test that can prove it comes back out.
+#[tokio::test]
+async fn an_index_reports_the_platforms_of_its_children() {
+    let dir = TempDir::new().expect("tempdir");
+    let h = Harness::rocks(dir.path());
+
+    let child = push_image(&h, "demo/multi", "amd64").await;
+    let body = format!(
+        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"{IMAGE_MANIFEST}","digest":"{child}","size":{},"platform":{{"os":"linux","architecture":"amd64"}}}},{{"mediaType":"{IMAGE_MANIFEST}","digest":"{child}","size":{},"platform":{{"os":"linux","architecture":"arm64","variant":"v8"}}}}]}}"#,
+        manifest().len(),
+        manifest().len(),
+    )
+    .into_bytes();
+    assert_eq!(
+        h.push_manifest("demo/multi", "latest", &body).await.status,
+        StatusCode::CREATED
+    );
+
+    let index = h.get("/api/v1/manifests/demo/multi@latest").await.json();
+    assert_eq!(
+        index["platforms"],
+        serde_json::json!(["linux/amd64", "linux/arm64/v8"]),
+        "a variant is part of an image's identity, so it is rendered"
+    );
+    assert_eq!(index["children"], 2);
+    assert_eq!(
+        index["blobs"], 0,
+        "an index references manifests, not blobs; its weight is in its children"
+    );
+}
+
 // ------------------------------------------------------------ persistence --
 
 #[tokio::test]

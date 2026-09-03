@@ -241,9 +241,19 @@ async fn an_unknown_path_and_an_invalid_name_are_distinguished() {
     h.get("/v2/foo")
         .await
         .assert_error(StatusCode::NOT_FOUND, ErrorCode::NameUnknown);
-    h.get("/notv2/foo")
+    h.get("/api/v1/nothing")
         .await
         .assert_error(StatusCode::NOT_FOUND, ErrorCode::NameUnknown);
+
+    // Outside `/v2/` and `/api/` the answer is the web UI, not an error: the
+    // UI routes client-side, so a deep link into a repository page has to come
+    // back as the shell rather than as a 404.
+    let response = h.get("/notv2/foo").await;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(
+        response.header(header::CONTENT_TYPE),
+        Some("text/html; charset=utf-8")
+    );
 }
 
 #[tokio::test]

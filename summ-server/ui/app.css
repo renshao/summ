@@ -1,0 +1,444 @@
+/*
+ * The whole visual system. No framework, no build step, no CDN - a registry is
+ * exactly the kind of service that runs in an air-gapped network, and a UI that
+ * needs the public internet to render is useless there.
+ *
+ * Colour lives in custom properties defined twice: once for light, once inside
+ * a `prefers-color-scheme` block. Nothing below the palette names a literal
+ * colour, so the dark theme is the palette and nothing else.
+ */
+
+:root {
+  --bg:            #ffffff;
+  --bg-subtle:     #f6f8fa;
+  --bg-raised:     #ffffff;
+  --bg-hover:      #f6f8fa;
+  --border:        #d8dee4;
+  --border-subtle: #e6ebf0;
+  --text:          #1f2328;
+  --text-muted:    #656d76;
+  --text-faint:    #8c959f;
+  --accent:        #0b7285;
+  --accent-soft:   #e5f2f5;
+  --shadow:        0 1px 2px rgba(31, 35, 40, .06);
+  --radius:        8px;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg:            #0d1117;
+    --bg-subtle:     #131920;
+    --bg-raised:     #161b22;
+    --bg-hover:      #1c232c;
+    --border:        #2a313c;
+    --border-subtle: #21262d;
+    --text:          #e6edf3;
+    --text-muted:    #9198a1;
+    --text-faint:    #6e7681;
+    --accent:        #56c8dd;
+    --accent-soft:   #12303a;
+    --shadow:        0 1px 2px rgba(0, 0, 0, .3);
+  }
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 var(--sans);
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.shell {
+  width: 100%;
+  max-width: 1040px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+.skip {
+  position: absolute;
+  left: -9999px;
+}
+.skip:focus {
+  left: 12px; top: 12px;
+  z-index: 10;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 12px;
+}
+
+/* ---- top bar ---------------------------------------------------------- */
+
+.topbar {
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-subtle);
+}
+
+.topbar-inner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 56px;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--text);
+  font-weight: 600;
+}
+.brand:hover { text-decoration: none; }
+
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 24px; height: 24px;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.host {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 2px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+}
+
+.topbar-nav { margin-left: auto; font-size: 13px; }
+.topbar-nav a { color: var(--text-muted); }
+
+/* ---- page furniture --------------------------------------------------- */
+
+main { flex: 1; padding-top: 28px; padding-bottom: 48px; }
+
+.crumbs {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+.crumbs a { color: var(--text-muted); }
+.crumbs .sep { padding: 0 6px; color: var(--text-faint); }
+
+h1 {
+  margin: 0 0 4px;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -.01em;
+  overflow-wrap: anywhere;
+}
+h1 .mono { font-family: var(--mono); font-size: 20px; }
+
+.subtitle {
+  margin: 0 0 24px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.foot {
+  padding-top: 16px;
+  padding-bottom: 24px;
+  border-top: 1px solid var(--border-subtle);
+  color: var(--text-faint);
+  font-size: 12px;
+}
+.foot a { color: var(--text-faint); }
+.foot .dot { padding: 0 8px; }
+
+/* ---- search ----------------------------------------------------------- */
+
+.toolbar {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.search {
+  position: relative;
+  flex: 1;
+  max-width: 380px;
+}
+
+.search input {
+  width: 100%;
+  padding: 7px 11px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  outline: none;
+}
+.search input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.search input::placeholder { color: var(--text-faint); }
+
+.count {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-left: auto;
+}
+
+/* ---- stat strip ------------------------------------------------------- */
+
+/* Four fixed columns, dropping to two - never `auto-fit`. With four stats an
+   auto-fit track count of three leaves one orphan cell, and because the grid
+   draws its gaps as a background the orphan renders as a broken grey tile
+   rather than as empty space. */
+.stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1px;
+  background: var(--border-subtle);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius);
+  overflow: hidden;
+  margin-bottom: 24px;
+}
+
+.stat {
+  background: var(--bg-raised);
+  padding: 14px 16px;
+}
+.stat dt {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--text-muted);
+  margin: 0 0 4px;
+}
+.stat dd {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.stat dd .unit {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-muted);
+  margin-left: 3px;
+}
+
+/* ---- tabs ------------------------------------------------------------- */
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: 16px;
+}
+
+.tab {
+  padding: 8px 12px;
+  font-size: 13px;
+  color: var(--text-muted);
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  cursor: pointer;
+  background: none;
+  border-top: 0; border-left: 0; border-right: 0;
+  font-family: inherit;
+}
+.tab:hover { color: var(--text); text-decoration: none; }
+.tab[aria-selected="true"] {
+  color: var(--text);
+  font-weight: 600;
+  border-bottom-color: var(--accent);
+}
+.tab .n {
+  margin-left: 6px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-muted);
+  background: var(--bg-subtle);
+  border-radius: 999px;
+  padding: 1px 6px;
+}
+
+/* ---- lists ------------------------------------------------------------ */
+
+.list {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 13px 16px;
+  border-top: 1px solid var(--border-subtle);
+}
+.row:first-child { border-top: 0; }
+a.row { color: inherit; }
+a.row:hover { background: var(--bg-hover); text-decoration: none; }
+
+.row-main { min-width: 0; flex: 1; }
+
+.row-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  font-weight: 600;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+a.row:hover .row-title { color: var(--accent); }
+
+.row-sub {
+  margin-top: 3px;
+  font-size: 12px;
+  color: var(--text-muted);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.row-meta {
+  display: flex;
+  gap: 22px;
+  flex: none;
+  text-align: right;
+}
+.row-meta div { min-width: 58px; }
+.row-meta .v {
+  font-size: 14px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.row-meta .k {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+
+/* ---- small parts ------------------------------------------------------ */
+
+.mono { font-family: var(--mono); }
+
+.digest {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.chip {
+  display: inline-block;
+  font-size: 11px;
+  line-height: 18px;
+  padding: 0 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-subtle);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+/* Chips butt against each other without this: they are appended as siblings
+   with no whitespace between them, which is deliberate - a text node would be
+   selectable and would end up in a copied line. */
+.chips {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.chip.tag {
+  border-color: transparent;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.more {
+  display: block;
+  width: 100%;
+  padding: 11px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--accent);
+  background: var(--bg-subtle);
+  border: 0;
+  border-top: 1px solid var(--border-subtle);
+  cursor: pointer;
+}
+.more:hover { background: var(--bg-hover); }
+.more[disabled] { color: var(--text-faint); cursor: default; }
+
+.empty, .loading, .error {
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 32px 24px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+.error { border-style: solid; border-color: var(--border); }
+.error .code {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-faint);
+  display: block;
+  margin-top: 6px;
+}
+.empty .hint {
+  display: block;
+  margin-top: 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+/* ---- key/value table on a manifest page -------------------------------- */
+
+.kv {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 10px 24px;
+  margin: 0;
+  padding: 16px;
+  font-size: 13px;
+}
+.kv dt { color: var(--text-muted); }
+.kv dd { margin: 0; overflow-wrap: anywhere; }
+
+@media (max-width: 720px) {
+  .stats { grid-template-columns: repeat(2, 1fr); }
+}
+
+@media (max-width: 640px) {
+  .shell { padding: 0 16px; }
+  .row { flex-wrap: wrap; }
+  .row-meta { gap: 18px; text-align: left; }
+  .kv { grid-template-columns: 1fr; gap: 2px 0; }
+  .kv dd { margin-bottom: 10px; }
+}

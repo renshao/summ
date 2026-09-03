@@ -52,7 +52,7 @@ pub use registry::{
 pub use delete::{BlobRefDeleted, ManifestDeleted};
 pub use discovery::{
     BlobReference, BlobReferenceList, DigestList, ManifestCountPage, ManifestList, RepoList,
-    RepoUsagePage,
+    RepoUsagePage, TagCountPage,
 };
 pub use referrers::{ReferrerEntry, ReferrerList};
 pub use tags::{TagList, TagSet};

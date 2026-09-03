@@ -30,9 +30,11 @@ use tower_http::trace::TraceLayer;
 use crate::config::ServerConfig;
 use crate::error::{ApiError, ErrorCode};
 use crate::handlers;
+use crate::handlers::api::ApiEndpoint;
 use crate::query;
 use crate::reference::valid_name;
 use crate::seam::Registry;
+use crate::ui;
 
 /// Optional, and sent anyway: it costs one header and placates tooling old
 /// enough to look for it. The companion `Docker-Upload-UUID` is not sent - it
@@ -185,6 +187,69 @@ pub fn route(path: &str) -> Result<Endpoint, RouteError> {
     Err(RouteError::NoMatch)
 }
 
+/// Split an `/api/v1/` path into an [`ApiEndpoint`].
+///
+/// Unlike [`route`], this does **not** match a suffix - and that is the whole
+/// design. A repository name may contain `/`, so a nested
+/// `/repositories/<name>/tags` is ambiguous: a registry holding both `foo` and
+/// `foo/tags` has one path that means two things, and whichever way it is
+/// resolved the other repository becomes unreachable or, worse, silently
+/// answers with the first one's data. `/v2/` lives with that because its shapes
+/// are fixed by the spec; this API is ours, so it is built out of the
+/// ambiguity instead.
+///
+/// Each collection is therefore its own top-level resource and the name is
+/// everything after it, to the end of the path. A single manifest is
+/// `<name>@<reference>`, split at the last `@`, which is unambiguous because
+/// `@` appears in neither the name grammar nor the tag grammar nor a digest.
+pub fn api_route(path: &str) -> Result<ApiEndpoint, RouteError> {
+    let rest = path.strip_prefix("/api/v1/").ok_or(RouteError::NoMatch)?;
+    let (resource, remainder) = match rest.split_once('/') {
+        Some((resource, remainder)) => (resource, remainder),
+        None => (rest, ""),
+    };
+
+    // Percent-decoded per segment, after the split, so an encoded `%2F` inside
+    // a tag can never become a path separator.
+    let decode = |raw: &str| {
+        raw.split('/')
+            .map(query::path_decode)
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+    let name_of = |raw: &str| {
+        let name = decode(raw);
+        if name.is_empty() {
+            Err(RouteError::NoMatch)
+        } else if valid_name(&name) {
+            Ok(name)
+        } else {
+            Err(RouteError::InvalidName(name))
+        }
+    };
+
+    let remainder = remainder.strip_suffix('/').unwrap_or(remainder);
+    match resource {
+        "repositories" if remainder.is_empty() => Ok(ApiEndpoint::Repositories),
+        "repositories" => Ok(ApiEndpoint::Repository {
+            name: name_of(remainder)?,
+        }),
+        "tags" => Ok(ApiEndpoint::Tags {
+            name: name_of(remainder)?,
+        }),
+        "manifests" => match remainder.rsplit_once('@') {
+            Some((name, reference)) => Ok(ApiEndpoint::Manifest {
+                name: name_of(name)?,
+                reference: query::path_decode(reference),
+            }),
+            None => Ok(ApiEndpoint::Manifests {
+                name: name_of(remainder)?,
+            }),
+        },
+        _ => Err(RouteError::NoMatch),
+    }
+}
+
 /// Build the application.
 ///
 /// The middleware stack is short on purpose. There is no compression layer
@@ -197,6 +262,11 @@ pub fn router(state: AppState) -> Router {
         .route("/v2", any(dispatch))
         .route("/v2/", any(dispatch))
         .route("/v2/{*rest}", any(dispatch))
+        .route("/api/v1/{*rest}", any(dispatch_api))
+        // Everything else is the web UI: its own assets by path, and the shell
+        // for any other route so a deep link into a repository page survives a
+        // reload. A path under `/api/` that matched no route above must not be
+        // swallowed by that - see `fallback`.
         .fallback(fallback)
         // Blob bodies are gigabytes; axum's 2 MB default would reject them.
         // Manifests get their own limit in the handler, because exceeding it
@@ -227,13 +297,48 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
     }
 }
 
-/// Anything outside `/v2/`. The UI and the extension API will claim their own
-/// prefixes later; until then this is an honest `404`.
+async fn dispatch_api(State(state): State<AppState>, request: Request) -> Response {
+    let path = request.uri().path().to_owned();
+    match api_route(&path) {
+        Ok(endpoint) => {
+            let (parts, _) = request.into_parts();
+            let ctx = handlers::Ctx {
+                state,
+                method: parts.method,
+                path: parts.uri.path().to_owned(),
+                query: query::pairs(parts.uri.query().unwrap_or("")),
+                headers: parts.headers,
+            };
+            handlers::api::handle(&ctx, endpoint)
+                .await
+                .unwrap_or_else(IntoResponse::into_response)
+        }
+        Err(RouteError::InvalidName(name)) => ApiError::new(ErrorCode::NameInvalid)
+            .with_detail(name)
+            .into_response(),
+        Err(RouteError::NoMatch) => ApiError::new(ErrorCode::NameUnknown)
+            .with_message("unknown endpoint")
+            .with_detail(path)
+            .into_response(),
+    }
+}
+
+/// Anything that matched no route above.
+///
+/// Two populations, and conflating them would be the bug: a machine asking for
+/// an API path that does not exist needs a JSON error, and a browser asking for
+/// `/r/library/nginx` needs the UI shell, because the UI routes client-side and
+/// a deep link has to survive a reload. So `/api/` and `/v2/` keep the error and
+/// everything else gets the shell.
 async fn fallback(request: Request) -> Response {
-    ApiError::new(ErrorCode::NameUnknown)
-        .with_message("not found")
-        .with_detail(request.uri().path().to_owned())
-        .into_response()
+    let path = request.uri().path();
+    if path.starts_with("/api/") || path.starts_with("/v2/") {
+        return ApiError::new(ErrorCode::NameUnknown)
+            .with_message("not found")
+            .with_detail(path.to_owned())
+            .into_response();
+    }
+    ui::serve(request.method(), path)
 }
 
 #[cfg(test)]

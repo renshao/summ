@@ -52,6 +52,12 @@ pub struct ManifestCountPage {
     pub next: Option<Digest>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TagCountPage {
+    pub tags: u64,
+    pub next: Option<String>,
+}
+
 /// A manifest that references a blob, and the repo it lives in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobReference {
@@ -73,7 +79,26 @@ impl Registry {
     /// stable cursor need the former. Using `i` would be faster to write and
     /// would silently return repositories in creation order.
     pub fn list_repos(&self, start_after: Option<&str>, limit: usize) -> Result<RepoList> {
-        let prefix = keys::repos_by_name();
+        self.search_repos("", start_after, limit)
+    }
+
+    /// Repositories whose name begins with `prefix`, in name order.
+    ///
+    /// This is [`Registry::list_repos`] with a longer scan prefix and nothing
+    /// else: `n <name>` is the name itself appended to one type byte, so a name
+    /// prefix *is* a key prefix, and the search costs one seek and a sequential
+    /// walk of exactly the matching run. No index, no filter, no scan of the
+    /// non-matching remainder.
+    ///
+    /// The empty prefix is the whole range, which is why `list_repos` is a call
+    /// to this rather than the other way round.
+    pub fn search_repos(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<RepoList> {
+        let prefix = keys::repo_by_name(prefix);
         let cursor = start_after.map(keys::repo_by_name);
         let page = self.engine().scan_keys(&prefix, cursor.as_deref(), limit)?;
 
@@ -190,6 +215,36 @@ impl Registry {
         Ok(ManifestCountPage {
             manifests: page.keys.len() as u64,
             next: cursor_digest(page.next.as_deref(), "manifest cursor")?,
+        })
+    }
+
+    /// Tag count for a repo, one page of `T` at a time.
+    ///
+    /// Counts keys without decoding the names, which is the only thing that
+    /// separates it from [`Registry::list_tags`] - a caller that only wants a
+    /// number should not pay to allocate a `String` per tag on the way to
+    /// discarding it.
+    pub fn count_tags(
+        &self,
+        repo: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<TagCountPage> {
+        let repo_id = self.require_repo(repo)?;
+        let prefix = keys::tags_in_repo(repo_id);
+        let cursor = start_after.map(|t| keys::tag(repo_id, t));
+        let page = self.engine().scan_keys(&prefix, cursor.as_deref(), limit)?;
+        let next = match page.next.as_deref() {
+            Some(key) => Some(
+                keys::parse_tag_suffix(key)
+                    .ok_or_else(|| RegistryError::corrupt("tag cursor"))?
+                    .to_string(),
+            ),
+            None => None,
+        };
+        Ok(TagCountPage {
+            tags: page.keys.len() as u64,
+            next,
         })
     }
 

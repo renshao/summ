@@ -33,8 +33,8 @@ use summ_core::Digest;
 use crate::range::ByteRange;
 use crate::reference::Reference;
 use crate::seam::{
-    BlobRead, Descriptor, ManifestPut, ManifestStat, OpsError, OpsResult, Page, Referrers,
-    Registry, UploadBody,
+    BlobRead, Descriptor, ManifestInfo, ManifestPut, ManifestStat, OpsError, OpsResult, Page,
+    Referrers, Registry, RepoDetail, RepoSummary, TagInfo, Tally, UploadBody, TAGS_PER_MANIFEST,
 };
 
 #[derive(Debug, Clone)]
@@ -169,6 +169,105 @@ fn hash_like(bytes: &[u8], like: &Digest) -> Digest {
     match like {
         Digest::Sha256(_) => sha256(bytes),
         Digest::Sha512(_) => sha512(bytes),
+    }
+}
+
+/// Describe a stored manifest the way the discovery API does.
+///
+/// The real backend reads a `ManifestRecord` written at push time; there is no
+/// such record here, so the shape is recovered from the body. It is the same
+/// answer by a slower route, which is what makes this a second implementation
+/// of the seam rather than a stub of it - a discovery test that passes here and
+/// fails against the backend is a real disagreement.
+fn describe(repo: &Repo, digest: &Digest, stored: &StoredManifest) -> ManifestInfo {
+    let parsed: serde_json::Value = serde_json::from_slice(&stored.body).unwrap_or_default();
+
+    let mut platforms = Vec::new();
+    let mut push_platform = |value: &serde_json::Value| {
+        let os = value.get("os").and_then(|v| v.as_str());
+        let arch = value.get("architecture").and_then(|v| v.as_str());
+        if let (Some(os), Some(arch)) = (os, arch) {
+            let label = match value.get("variant").and_then(|v| v.as_str()) {
+                Some(variant) => format!("{os}/{arch}/{variant}"),
+                None => format!("{os}/{arch}"),
+            };
+            if !platforms.contains(&label) {
+                platforms.push(label);
+            }
+        }
+    };
+
+    let children = parsed
+        .get("manifests")
+        .and_then(|v| v.as_array())
+        .map(|entries| {
+            for entry in entries {
+                if let Some(platform) = entry.get("platform") {
+                    push_platform(platform);
+                }
+            }
+            entries.len() as u64
+        })
+        .unwrap_or(0);
+
+    // Config *and* layers, in that order, which is the set the backend records
+    // and the set the push writes an `R` edge for. Counting only `layers` here
+    // would make the two implementations quietly disagree by one blob.
+    let referenced: Vec<&serde_json::Value> = parsed
+        .get("config")
+        .into_iter()
+        .chain(
+            parsed
+                .get("layers")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten(),
+        )
+        .collect();
+    let blobs = referenced.len() as u64;
+    let blob_size = referenced
+        .iter()
+        .filter_map(|e| e.get("size").and_then(serde_json::Value::as_u64))
+        .sum();
+
+    // The reverse of `T`, which the real store keeps as its own `G` range and
+    // this one has to find by looking.
+    let tags: Vec<String> = repo
+        .tags
+        .iter()
+        .filter(|(_, d)| *d == digest)
+        .map(|(tag, _)| tag.clone())
+        .take(TAGS_PER_MANIFEST)
+        .collect();
+
+    ManifestInfo {
+        digest: *digest,
+        media_type: stored.media_type.clone(),
+        size: stored.body.len() as u64,
+        blob_size,
+        artifact_type: stored.artifact_type.clone(),
+        subject: stored.subject,
+        // No push clock here. The backend stamps `pushed_at` from the request
+        // and this store has no request to stamp from, so it reports the one
+        // honest value rather than inventing one.
+        pushed_at: 0,
+        platforms,
+        blobs,
+        children,
+        tags,
+        // From the body, not from `stored`: the backend parses these out at
+        // push time and `seed_manifest` never sets them, so reading the field
+        // would make this implementation quietly weaker than the one it exists
+        // to check.
+        annotations: parsed
+            .get("annotations")
+            .and_then(|v| v.as_object())
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+                    .collect()
+            })
+            .unwrap_or_else(|| stored.annotations.clone()),
     }
 }
 
@@ -579,6 +678,123 @@ impl Registry for MemoryRegistry {
             manifests,
             filter_applied: artifact_type.is_some(),
         })
+    }
+
+    // ---- discovery beyond the spec ---------------------------------------
+
+    async fn repository_summaries(
+        &self,
+        prefix: &str,
+        last: Option<&str>,
+        limit: usize,
+    ) -> OpsResult<Page<RepoSummary>> {
+        let state = self.lock();
+        let names = paginate(
+            state
+                .repos
+                .keys()
+                .filter(|name| name.starts_with(prefix))
+                .cloned(),
+            last.map(str::to_owned).as_ref(),
+            limit,
+        );
+        // Counts are exact here because the whole registry fits in a map. The
+        // ceiling the real backend stops at is a property of scanning ten
+        // million keys, not of the contract.
+        let items = names
+            .items
+            .into_iter()
+            .map(|name| {
+                let repo = &state.repos[&name];
+                RepoSummary {
+                    name: name.clone(),
+                    tags: Tally::exact(repo.tags.len() as u64),
+                    manifests: Tally::exact(repo.manifests.len() as u64),
+                }
+            })
+            .collect();
+        Ok(Page {
+            items,
+            more: names.more,
+        })
+    }
+
+    async fn repository_detail(&self, name: &str) -> OpsResult<RepoDetail> {
+        let state = self.lock();
+        let repo = state.repo(name)?;
+        Ok(RepoDetail {
+            name: name.to_owned(),
+            tags: Tally::exact(repo.tags.len() as u64),
+            manifests: Tally::exact(repo.manifests.len() as u64),
+            blobs: Tally::exact(repo.blobs.len() as u64),
+            size_bytes: repo.blobs.values().map(|b| b.len() as u64).sum(),
+        })
+    }
+
+    async fn tag_details(
+        &self,
+        name: &str,
+        last: Option<&str>,
+        limit: usize,
+    ) -> OpsResult<Page<TagInfo>> {
+        let state = self.lock();
+        let repo = state.repo(name)?;
+        let page = paginate(
+            repo.tags.keys().cloned(),
+            last.map(str::to_owned).as_ref(),
+            limit,
+        );
+        let items = page
+            .items
+            .into_iter()
+            .map(|tag| {
+                let digest = repo.tags[&tag];
+                TagInfo {
+                    name: tag,
+                    digest,
+                    tagged_at: 0,
+                    manifest: repo
+                        .manifests
+                        .get(&digest)
+                        .map(|m| describe(repo, &digest, m)),
+                }
+            })
+            .collect();
+        Ok(Page {
+            items,
+            more: page.more,
+        })
+    }
+
+    async fn manifest_details(
+        &self,
+        name: &str,
+        last: Option<&Digest>,
+        limit: usize,
+    ) -> OpsResult<Page<ManifestInfo>> {
+        let state = self.lock();
+        let repo = state.repo(name)?;
+        let page = paginate(repo.manifests.keys().copied(), last, limit);
+        let items = page
+            .items
+            .iter()
+            .map(|digest| describe(repo, digest, &repo.manifests[digest]))
+            .collect();
+        Ok(Page {
+            items,
+            more: page.more,
+        })
+    }
+
+    async fn manifest_detail(&self, name: &str, reference: &Reference) -> OpsResult<ManifestInfo> {
+        let state = self.lock();
+        let repo = state.repo(name)?;
+        let digest = state.resolve(repo, reference)?;
+        let stored = repo
+            .manifests
+            .get(&digest)
+            .ok_or(OpsError::ManifestUnknown)?;
+        Ok(describe(repo, &digest, stored))
     }
 }
 

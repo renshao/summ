@@ -8,6 +8,7 @@
 //! the body, and a `HEAD` that has to carry a real `Content-Length` with an
 //! empty body is not that.
 
+pub mod api;
 pub mod base;
 pub mod blobs;
 pub mod catalog;

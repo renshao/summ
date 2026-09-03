@@ -49,7 +49,8 @@ summ-meta     MetaEngine trait, WriteBatch, RocksDB + redb engines, repo
               interner, schema version + migration seam
 summ-storage  filesystem blob store (Unix only: pread/pwrite)
 summ-registry ops layer — spec operations as WriteBatch builders
-summ-server   axum HTTP layer, /v2/ route table, the `summ` binary, and
+summ-server   axum HTTP layer, /v2/ route table, /api/v1/ discovery API, the
+              embedded web UI (`ui/` + `src/ui.rs`), the `summ` binary, and
               `backend.rs` — the one module that wires the three above together
 ```
 
@@ -58,3 +59,23 @@ failures are in spec vocabulary. **Nothing under `handlers/` may import
 `summ-registry`, `summ-meta` or `summ-storage`** — `backend.rs` is the only
 module that names them, and `memory.rs` is a second implementation of the same
 trait, kept so the seam stays one.
+
+## The discovery API and the UI
+
+- **`/api/v1/`'s route table is flat, and must stay flat.** Each collection is
+  its own top-level resource (`repositories`, `tags`, `manifests`) with the
+  repository name running to the end of the path. Nesting a collection under the
+  name is ambiguous when a registry holds both `foo` and `foo/tags`, and the
+  wrong resolution does not 404 — it answers with the other repository's data.
+- **Every count is bounded and carries `complete`.** There is no stored total
+  and there must not be one; a count folds pages to `seam::COUNT_CEILING` and
+  reports whether it reached the end. A number that is silently wrong above a
+  threshold is worse than no number.
+- **Discovery reads go through `spawn_blocking`.** They are the one read path
+  that is a fold rather than a point lookup.
+- **The UI ships in the binary and loads nothing from the network.** No build
+  step, no framework, no CDN — a registry runs air-gapped. Nothing reaches the
+  DOM as a string either: repository names, tags and annotations are all pushed
+  by whoever can reach the registry.
+- **The discovery API and the UI carry their own tests** (`tests/discovery.rs`),
+  because no conformance suite covers them and none ever will.

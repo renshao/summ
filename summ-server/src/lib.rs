@@ -32,6 +32,7 @@ pub mod query;
 pub mod range;
 pub mod reference;
 pub mod seam;
+pub mod ui;
 
 pub use app::{router, AppState};
 pub use config::ServerConfig;

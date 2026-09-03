@@ -119,7 +119,7 @@ Two traps worth stating explicitly:
 
 ## Status
 
-`cargo test` — **282 passing**. Every crate in CLAUDE.md's Layout is built, and
+`cargo test` — **303 passing**. Every crate in CLAUDE.md's Layout is built, and
 **the wiring has landed** (package K, `summ-server/src/backend.rs`): `summ
 serve` runs on `summ-registry` over `summ-meta` with `summ-storage` holding the
 bytes. `tests/wiring.rs` drives the same router as `tests/api.rs` against a real
@@ -145,8 +145,17 @@ every in-domain range, which is what `prefix_same_as_start` relies on; every
 stored record survives a postcard round trip; all four upload flows, all six
 blob range cases, both `Content-Range` grammars.
 
-**Not built**: purge, conformance harness, extension API and UI, analytics
-writers, Phases 2b–6.
+**The discovery API and the web UI have landed** (packages H and I, first cut).
+`/api/v1/` serves four cursor-paged read-only endpoints and `/` serves a
+built-in UI over them — repository list with per-repo tag and manifest counts,
+name-prefix search, a repository page with tags and manifests, and a manifest
+page. Assets are `include_str!`d, so `cargo build` is the whole pipeline and the
+page loads nothing from the network. Verified by hand against a real corpus:
+`oras cp` of alpine, busybox, nginx, postgres and redis, browsed end to end.
+
+**Not built**: purge, conformance harness, analytics writers, Phases 3–6, and
+the rest of the discovery surface (blob fan-in, untagged set, tag history, pull
+counts — all listed under **Beyond the spec**).
 
 ## Phases
 
@@ -201,12 +210,44 @@ echoes a bare `Range: 0-<end>`. Blob *download* uses RFC 9110
 Largely subsumed by package K. **Must include a synthetic load at target scale**
 — see Risks.
 
-### Phase 2b — discovery API and web UI
+### Phase 2b — discovery API and web UI — **first cut landed**
 
 Cursor-paged extension endpoints (see **Beyond the spec**), then the UI on them.
 Deliberately before the performance phase: the UI is what exposes an unbounded
 scan or an accidental full-table sort, and those are cheaper to find before
 tuning than after.
+
+Built: `/api/v1/repositories`, `/api/v1/repositories/<name>`,
+`/api/v1/tags/<name>`, `/api/v1/manifests/<name>` and
+`/api/v1/manifests/<name>@<reference>`, and the UI over them. Four decisions
+that are now contract:
+
+- **The route table is flat, and it has to be.** A nested
+  `/repositories/<name>/tags` is ambiguous when a registry holds both `foo` and
+  `foo/tags`, and the wrong resolution does not 404 — it silently answers with
+  the other repository's data. Each collection is its own top-level resource and
+  the name runs to the end of the path. `/v2/` lives with the ambiguity because
+  its shapes are fixed by the spec; this API is ours, so it is built out of it.
+- **Counts are bounded and say so.** There is no stored total — keeping one
+  would be the read-modify-write on the push path the schema exists to avoid —
+  so a count folds pages to a ceiling (`seam::COUNT_CEILING`, 10,000) and
+  carries `complete`. A UI renders `complete: false` as `10,000+`.
+- **Search is a name prefix, not a substring.** `n <name>` is the name appended
+  to one type byte, so a name prefix *is* a key prefix: `?q=` narrows the scan
+  to one seek and a walk of the matching run. A substring search would be a pass
+  over the catalogue and is deliberately not offered.
+- **These reads go through `spawn_blocking`.** They are the exception to the
+  inline-read bet below: a page of summaries folds a bounded count per row, so
+  it is milliseconds of CPU rather than the microseconds a point lookup costs.
+
+The UI lives in `summ-server/ui/` and `summ-server/src/ui.rs`, not the
+`summ-ui/` crate the work-package table names. With no build step there is
+nothing for a crate to own but three `include_str!`s; give it one when there is
+an asset pipeline to put in it.
+
+Still to build here: blob fan-in ("what shares this layer"), the untagged /
+reclaimable set, tag history and pull counts — the schema and the ops-layer
+queries exist for all of them.
 
 ### Phase 3 — performance
 
@@ -236,13 +277,13 @@ S3, chunked upload → multipart. **6** referrers, auth, full conformance.
 | A | **Conformance harness — the next step** | `conformance/` | — |
 | F | Purge | `summ-purge/` | E |
 | G | Scale benchmark — synthetic 10M-repo dataset, engine A/B | `benches/` | — |
-| H | Extension API — cursor-paged discovery endpoints | `summ-server/` | E |
-| I | Built-in web UI — embedded assets, same port | `summ-ui/` | H |
+| H | Extension API — *first cut done*; blob fan-in, untagged set, history remain | `summ-server/` | E |
+| I | Built-in web UI — *first cut done*; assets embedded, same port | `summ-server/ui/` | H |
 | J | Analytics — pull-count queue, aggregation worker, retention | `summ-analytics/` | E |
 
 Done: **B** HTTP skeleton, **C** blob store, **D** upload sessions, **E** ops
-layer, **K** wiring. Package A is all that stands between here and the Phase 1
-exit criterion.
+layer, **K** wiring, and the first cut of **H** and **I**. Package A is all that
+stands between here and the Phase 1 exit criterion.
 
 ## Engine choice — RocksDB (decided)
 
@@ -521,6 +562,25 @@ implementation has since turned up, is below.
   Worth knowing when reading the staging directory, and worth a purge sweep for
   the case where the client never comes back.
 
+**Found while building the discovery API and UI (packages H and I):**
+
+- **An image manifest's platform is not in the store, and the UI shows it as
+  blank.** `ManifestRecord.platform` is only ever populated for an index's
+  children: an image manifest carries no platform of its own — it is
+  `architecture`/`os` in the *config blob* — and reading it would put a blob
+  fetch on the push path. So a repository of standalone single-arch images shows
+  no platforms at all. Options, none taken yet: store the config's platform at
+  push time (one extra blob read per push, and only for manifests whose config
+  is already present), or accept it. Related to the `config_media_type` item
+  below — both want the same read.
+- **`COUNT_CEILING` is 10,000 and unmeasured.** It bounds a fold, so the worst
+  case for a repository-list page is `page_size × 2 × CEILING` key reads
+  (100 × 2 × 10,000 with a maximal `?n=`). That is bounded, which is the point,
+  but nobody has measured what it costs on a store at target scale. Package G.
+- **The discovery API has no `HEAD`-cheap variant of a count.** A UI that wants
+  only "how many repositories" still pages the list. Not a problem at the sizes
+  reached so far; worth a `/api/v1/registry` summary if it becomes one.
+
 **Found during earlier implementation, still open:**
 
 - **`ManifestRecord.artifact_type` cannot answer a referrers query on its own.**
@@ -606,19 +666,21 @@ are ours to choose. The cost is that nothing external validates it, so the
 extension API needs its own test suite.
 
 Surface to build, all cursor-paged, all backed by prefix scans over the key
-schema:
+schema. **Built** means served on `/api/v1/` and used by the UI; the ops-layer
+query exists for every row here either way.
 
-| Query | Backed by |
-|---|---|
-| List repositories | `n` (name-ordered) |
-| List tags in a repo | `T <repo>` |
-| List manifests in a repo, with counts | `M <repo>` |
-| Repo size and manifest count | `P <repo>` |
-| Which manifests reference this layer | `R <digest>` |
-| Which tags point at this manifest | `G <repo> <digest>` |
-| Untagged / reclaimable manifests | `M` minus `G` |
-| Pull counts by day, for a wall | `A m <repo> <digest>` |
-| Tag history, newest first | `H <repo> <tag>` |
+| Query | Backed by | Status |
+|---|---|---|
+| List repositories | `n` (name-ordered) | **built** |
+| Search repositories by name prefix | `n <prefix>` | **built** |
+| List tags in a repo | `T <repo>` | **built** |
+| List manifests in a repo, with counts | `M <repo>` | **built** |
+| Repo size and manifest count | `P <repo>` | **built** |
+| Which tags point at this manifest | `G <repo> <digest>` | **built** |
+| Which manifests reference this layer | `R <digest>` | ops layer only |
+| Untagged / reclaimable manifests | `M` minus `G` | ops layer only |
+| Pull counts by day, for a wall | `A m <repo> <digest>` | no writer yet |
+| Tag history, newest first | `H <repo> <tag>` | no writer yet |
 
 summdb prototyped several of these (`/v1/repos/:repo/stats`,
 `/v1/layers/:digest/manifests`) along with the UI that consumes them; that code

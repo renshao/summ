@@ -162,6 +162,113 @@ impl UploadBody {
     }
 }
 
+// ---- discovery beyond the spec ------------------------------------------
+//
+// Nothing below is in the Distribution Spec. `_catalog` was removed before
+// v1.0.0 and nothing standard answers "what is in this registry", so the
+// shapes here are ours to choose - which also means nothing external
+// validates them, and they carry their own tests.
+
+/// How far a bounded count scans before it reports a floor instead of a total.
+///
+/// The scale target is 10M manifests in one repository, so "count the
+/// manifests" is not an operation that may run to completion on a request
+/// thread. It runs to this ceiling and then stops, and the caller is told which
+/// happened. A UI renders the difference as `10,000+`.
+///
+/// The alternative - a stored counter - is the read-modify-write on the push
+/// path that the whole key schema exists to avoid.
+pub const COUNT_CEILING: u64 = 10_000;
+
+/// How many tags one manifest row reports.
+///
+/// The `G` range is a fan-in: a manifest may carry thousands of tags, and a
+/// list of them is not what a list row is for. The first few are the useful
+/// signal; the rest are on the manifest's own page.
+pub const TAGS_PER_MANIFEST: usize = 8;
+
+/// A count that may have stopped early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Tally {
+    pub count: u64,
+    /// `false` when the scan hit [`COUNT_CEILING`], which makes `count` a floor
+    /// rather than a total. Reported rather than hidden: a number that is
+    /// silently wrong above a threshold is worse than no number.
+    pub complete: bool,
+}
+
+impl Tally {
+    pub fn exact(count: u64) -> Self {
+        Tally {
+            count,
+            complete: true,
+        }
+    }
+}
+
+/// One row of the repository list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoSummary {
+    pub name: String,
+    pub tags: Tally,
+    pub manifests: Tally,
+}
+
+/// Everything a repository's own page shows above its lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoDetail {
+    pub name: String,
+    pub tags: Tally,
+    pub manifests: Tally,
+    pub blobs: Tally,
+    /// Summed over the blobs `blobs` counted, so a floor whenever
+    /// `blobs.complete` is `false`.
+    pub size_bytes: u64,
+}
+
+/// A manifest as the discovery API describes it - the stored record, with the
+/// two things a row needs that the record does not hold: the platforms it
+/// covers, and the tags pointing at it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestInfo {
+    pub digest: Digest,
+    pub media_type: String,
+    /// Size of the manifest document itself.
+    pub size: u64,
+    /// Bytes of the blobs this manifest directly references.
+    ///
+    /// The config counts: it is a blob, it gets an `R` edge like any other, and
+    /// a total that agreed with the UI but not with the edge set would be a
+    /// number nobody could reconcile. Not recursive either - an index reports
+    /// zero here, because its weight is in its children.
+    pub blob_size: u64,
+    pub artifact_type: Option<String>,
+    pub subject: Option<Digest>,
+    pub pushed_at: u64,
+    /// `os/arch[/variant]`, once per platform: the manifest's own for an image,
+    /// its children's for an index.
+    pub platforms: Vec<String>,
+    /// Count of those same blobs: config plus layers, matching `blob_size`.
+    pub blobs: u64,
+    /// Child manifests, for an index. Zero for an image manifest.
+    pub children: u64,
+    /// Tags pointing at this manifest, at most [`TAGS_PER_MANIFEST`] of them.
+    pub tags: Vec<String>,
+    pub annotations: BTreeMap<String, String>,
+}
+
+/// A tag with the manifest it resolves to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagInfo {
+    pub name: String,
+    pub digest: Digest,
+    pub tagged_at: u64,
+    /// `None` when `T` names a manifest `M` does not have. That is corruption
+    /// rather than a miss, but a list page is the wrong place to fail: the row
+    /// says what it knows and the rest of the page still renders.
+    pub manifest: Option<ManifestInfo>,
+}
+
 /// Failures the layers below can report, in the vocabulary of the spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpsError {
@@ -338,4 +445,45 @@ pub trait Registry: Send + Sync + 'static {
         subject: &Digest,
         artifact_type: Option<&str>,
     ) -> OpsResult<Referrers>;
+
+    // ---- discovery beyond the spec ---------------------------------------
+
+    /// Repository names with their tag and manifest counts, in name order.
+    ///
+    /// `prefix` narrows the scan to names beginning with it, and `""` is the
+    /// whole registry. It is a *scan* prefix, not a filter: `n <name>` is the
+    /// name appended to one type byte, so this costs one seek and a walk of the
+    /// matching run.
+    ///
+    /// Counting is bounded per repository - see [`COUNT_CEILING`] - so the cost
+    /// of a page is bounded by `limit * CEILING` key reads and not by the size
+    /// of the registry.
+    async fn repository_summaries(
+        &self,
+        prefix: &str,
+        last: Option<&str>,
+        limit: usize,
+    ) -> OpsResult<Page<RepoSummary>>;
+
+    /// Counts and size for one repository.
+    async fn repository_detail(&self, name: &str) -> OpsResult<RepoDetail>;
+
+    /// Tags in name order, each resolved to the manifest it points at.
+    async fn tag_details(
+        &self,
+        name: &str,
+        last: Option<&str>,
+        limit: usize,
+    ) -> OpsResult<Page<TagInfo>>;
+
+    /// Manifests in digest order, each with the tags pointing at it.
+    async fn manifest_details(
+        &self,
+        name: &str,
+        last: Option<&Digest>,
+        limit: usize,
+    ) -> OpsResult<Page<ManifestInfo>>;
+
+    /// One manifest, or [`OpsError::ManifestUnknown`].
+    async fn manifest_detail(&self, name: &str, reference: &Reference) -> OpsResult<ManifestInfo>;
 }

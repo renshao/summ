@@ -60,6 +60,7 @@ engine_tests!(
     interning_the_same_name_twice_is_stable,
     an_unknown_repo_is_not_silently_created_by_lookup,
     catalog_pages_by_name_not_by_id,
+    a_name_prefix_scan_is_bounded_to_the_matching_run,
     scan_keys_agrees_with_scan_over_every_new_range,
     scan_keys_pages_a_valueless_edge_range_identically,
     the_pull_count_wall_is_one_bounded_chronological_scan,
@@ -85,6 +86,7 @@ engine_tests!(
     interning_the_same_name_twice_is_stable,
     an_unknown_repo_is_not_silently_created_by_lookup,
     catalog_pages_by_name_not_by_id,
+    a_name_prefix_scan_is_bounded_to_the_matching_run,
     scan_keys_agrees_with_scan_over_every_new_range,
     scan_keys_pages_a_valueless_edge_range_identically,
     the_pull_count_wall_is_one_bounded_chronological_scan,
@@ -295,6 +297,62 @@ mod suite {
             .map(|(k, _)| keys::parse_repo_name(k).unwrap())
             .collect();
         assert_eq!(names, ["alpine", "nginx", "zebra"]);
+    }
+
+    /// A name prefix is a key prefix, and both engines must honour one longer
+    /// than a single type byte.
+    ///
+    /// This is what makes repository search a seek rather than a filter, and it
+    /// is not free on RocksDB: the `n` range is deliberately outside the prefix
+    /// extractor's domain, so a scan here relies on `iterate_upper_bound`
+    /// alone while `prefix_same_as_start` is still set. If RocksDB ever started
+    /// classifying an out-of-domain seek key, the iterator would stop after the
+    /// first key and this would catch it.
+    pub fn a_name_prefix_scan_is_bounded_to_the_matching_run(db: &dyn MetaEngine) {
+        let interner = RepoInterner::with_capacity(8);
+        for name in [
+            "alpine",
+            "nginx",
+            "nginx-ingress",
+            "nginx/base",
+            "nginy",
+            "zebra",
+        ] {
+            interner.intern(db, name).unwrap();
+        }
+
+        let page = db
+            .scan_keys(&keys::repo_by_name("nginx"), None, 10)
+            .unwrap();
+        let names: Vec<_> = page
+            .keys
+            .iter()
+            .map(|k| keys::parse_repo_name(k).unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["nginx", "nginx-ingress", "nginx/base"],
+            "the run must start at an exact match and stop before `nginy`"
+        );
+
+        // And the cursor still works inside the narrowed range.
+        let page = db
+            .scan_keys(
+                &keys::repo_by_name("nginx"),
+                Some(&keys::repo_by_name("nginx")),
+                10,
+            )
+            .unwrap();
+        let names: Vec<_> = page
+            .keys
+            .iter()
+            .map(|k| keys::parse_repo_name(k).unwrap())
+            .collect();
+        assert_eq!(names, ["nginx-ingress", "nginx/base"]);
+
+        // A prefix nothing matches is empty, not the whole range.
+        let page = db.scan_keys(&keys::repo_by_name("q"), None, 10).unwrap();
+        assert!(page.keys.is_empty());
     }
 
     // --- keys-only scans -----------------------------------------------
