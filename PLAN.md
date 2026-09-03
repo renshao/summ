@@ -161,14 +161,30 @@ through `OCI-Filters-Applied`, and `--no-referrers` to turn the endpoint off
 again. Two rules are load-bearing and easy to regress — see **The referrers
 API** below.
 
-**summ passes the conformance suite**: 862 checks, **zero failures**, exit 0, at
-`OCI_VERSION=1.1` per R1's recipe. Only five rows are `Disabled`, all by the
-suite's own default config (*Blob upload cancel*, *Manifest put with tag
-params*, *Sparse Manifests*, *Tag Param*, *Tag Param sha512*) — nothing is
-`Skip`, so no row is hiding an unimplemented API behind `errRegUnsupported`.
+**summ passes the conformance suite at every profile**, per R1's recipe:
 
-**Both engines pass.** The same run against `--engine redb` is also 862/0, which
+| Run | Checks | FAIL | Not passing |
+|---|---|---|---|
+| `OCI_VERSION=1.1` — the certification profile | 862 | 0 | 5 rows `Disabled` by the suite's defaults |
+| `OCI_VERSION=dev` — R1's stretch target | 986 | 0 | *Sparse Manifests*, off by default |
+| `dev` + `OCI_DATA_SPARSE=true`, server on `--allow-missing-references` | **1032** | **0** | nothing — every row `Pass` |
+
+All three exit 0, and nothing is ever `Skip`, so no row is hiding an
+unimplemented API behind `errRegUnsupported`. `dev` is the harder profile: it
+additionally demands `Docker-Content-Digest` on blob *and* manifest responses,
+requires upload-cancel, and turns on `?tag=` params for manifest PUT. For scale,
+distribution v3.1.1 scores 743/91 at 1.1 and 826/143 at `dev`.
+
+*Sparse Manifests* needs `--allow-missing-references` because it pushes
+manifests and layers concurrently. That stays off by default: validation is
+optional in the spec and costs N lookups on every push.
+
+**Both engines pass.** The 1.1 run against `--engine redb` is also 862/0, which
 is the cheapest available proof that nothing has leaked past `MetaEngine`.
+
+**None of this is a gate yet.** Every run above was driven by hand, so nothing
+stops the next commit regressing it — that is package A. And conformance is the
+floor: it says nothing about the discovery API, the UI, auth or purge.
 
 Two bugs stood between the first run and this one, both found by the suite and
 both fixed:
