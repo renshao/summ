@@ -14,7 +14,9 @@
 //!   through [`BlobStore`] and only then applies a [`WriteBatch`]. An orphan
 //!   blob is garbage that purge reclaims; metadata naming a blob that is not
 //!   there is corruption that surfaces as a failed pull, days later, to
-//!   somebody else.
+//!   somebody else. A manifest push obeys the same order for its own document,
+//!   which is why it plans its batch and applies it as two steps rather than
+//!   one. See [`Backend::archive_manifest`].
 //! - **A pull streams.** `get_blob` hands back a [`BlobStream`] over 1 MiB
 //!   `pread`s, never a buffered body. containerd 2.1+ opens `bytes=N-`, reads
 //!   8 MiB and drops the connection, so buffering a 900 MB layer to answer it
@@ -458,8 +460,12 @@ impl Registry for Backend {
         let content_type = content_type.to_string();
         let tags = tags.to_vec();
         let echo = tags.clone();
+        let document = body.clone();
 
-        let outcome = self
+        // Planned, not applied. Planning is where the body is parsed, the
+        // reference checked against it and the digest computed, so it is also
+        // the only place the digest is known before anything has been written.
+        let planned = self
             .write(move |ops| {
                 let req = summ_registry::ManifestPut {
                     repo: &name,
@@ -471,7 +477,19 @@ impl Registry for Backend {
                 // The manifest, every edge it implies, and every tag it lands
                 // under, in one batch. A push is atomic or it is a manifest
                 // that resolves by digest under a tag that does not exist.
-                let planned = ops.plan_manifest_put_tagged(&req, &tags)?;
+                ops.plan_manifest_put_tagged(&req, &tags)
+            })
+            .await?;
+
+        // Then the archive copy, fsynced - see `archive_manifest`. It goes here
+        // and not after the batch for the same reason a layer does: the batch
+        // is the commit point, and everything the store will need must already
+        // be on disk when it lands.
+        self.archive_manifest(&planned.outcome.digest, document)
+            .await?;
+
+        let outcome = self
+            .write(move |ops| {
                 ops.engine().apply(&planned.batch)?;
                 Ok(planned.outcome)
             })
@@ -1018,6 +1036,81 @@ impl Registry for Backend {
 }
 
 impl Backend {
+    /// Write a copy of a manifest document into the blob store, under its own
+    /// digest.
+    ///
+    /// The first mitigation for Risk 0: manifest bytes otherwise live only
+    /// under `B <repo> <digest>`, so a lost metadata store leaves a disk of
+    /// blobs that nothing on it can identify - no way to tell a config from a
+    /// layer, no way to tell which layers belong together, and no way to name
+    /// any of it. A manifest is content-addressed by construction, so the copy
+    /// is `digest -> bytes` and needs no new concept: the corpus becomes
+    /// self-describing, because every manifest is discoverable in it and every
+    /// manifest names its config and layers.
+    ///
+    /// Four decisions, all of which the next change here has to keep:
+    ///
+    /// - **No `L` or `P` record, deliberately.** Those are what make bytes
+    ///   servable through `GET /v2/<name>/blobs/<digest>`, and a manifest is
+    ///   not a blob of its repository: publishing one as though it were is a
+    ///   client-visible change nothing asked for, and it would put manifest
+    ///   bytes into the blob count and byte total `P` is folded for. The
+    ///   consequence is that the copy has no metadata at all, so **purge must
+    ///   retain a blob whose digest appears as a manifest digest.** `M` is the
+    ///   record that keeps it - no second one is invented here, because the
+    ///   blob store holds bytes and not relationships.
+    /// - **The delete path does not remove it**, exactly as `delete_blob` does
+    ///   not remove a layer's bytes. `M` is repo-scoped and the store is
+    ///   global, so a manifest deleted from one repository may still be named
+    ///   by another's `M`; deciding that nothing names it is purge's job and
+    ///   needs the whole sweep to decide it.
+    /// - **A failure here fails the push.** The copy is redundant - `B` is
+    ///   still the read path - so this cannot corrupt anything, and a warning
+    ///   would be tempting. But the state it would leave is metadata with no
+    ///   copy, silently, which is the exact state the mitigation exists to
+    ///   prevent and which nobody discovers until they are already recovering.
+    ///   One small file on a filesystem the push has just written layers to
+    ///   fails when the disk does, and then the push should fail too.
+    /// - **A re-push is a no-op.** Content-addressed: if the digest is present
+    ///   the bytes are already right, and they are complete, because a blob
+    ///   only ever appears by a rename of a sealed and fsynced staging file.
+    async fn archive_manifest(&self, digest: &Digest, body: Bytes) -> OpsResult<()> {
+        if self.blobs.contains(digest).await.map_err(storage_error)? {
+            return Ok(());
+        }
+
+        // A staging id, like the one `put_blob` mints, and for the same reason:
+        // it never enters a `WriteBatch`, and it lives only as long as it takes
+        // to rename the file to its digest.
+        let id = UploadId::new(format!("manifest-{}", uuid::Uuid::new_v4()))
+            .map_err(|e| OpsError::Internal(e.to_string()))?;
+        let mut upload = self
+            .blobs
+            .create_upload(&id, DigestAlgorithm::of(digest))
+            .await
+            .map_err(storage_error)?;
+
+        let commit = async {
+            upload.append(0, body).await.map_err(storage_error)?;
+            // The digest is recomputed from the bytes as they are written and
+            // checked against the one planning derived from the same bytes, so
+            // the copy cannot land under a name that is not its own.
+            self.blobs
+                .commit_upload(upload, digest)
+                .await
+                .map_err(storage_error)
+        }
+        .await;
+
+        if let Err(e) = commit {
+            // Bounded by `max_manifest_bytes`, but nothing above will ever ask
+            // about this id again, so leaving it staged would leak it forever.
+            let _ = self.blobs.cancel_upload(&id).await;
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Reopen a session's staging file with its hasher rehydrated.
     ///
     /// Done per chunk rather than by keeping the handle in a map, and that is

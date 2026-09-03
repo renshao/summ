@@ -10,17 +10,21 @@
 //! and the ones that matter most reopen it. A registry that loses a push on
 //! restart passes every test in `api.rs`.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
 use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use axum::Router;
+use futures_util::StreamExt;
 use sha2::{Digest as _, Sha256, Sha512};
+use summ_core::Digest;
 use summ_registry::RegistryOptions;
 use summ_server::backend::{Backend, Engine};
 use summ_server::config::ServerConfig;
 use summ_server::{router, AppState};
+use summ_storage::BlobStore;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -1478,4 +1482,185 @@ async fn a_foreign_layer_that_was_pushed_anyway_is_an_ordinary_blob() {
     let get = h.get(&format!("/v2/demo/win/blobs/{layer_digest}")).await;
     assert_eq!(get.status, StatusCode::OK);
     assert_eq!(&get.body[..], LAYER);
+}
+
+// ------------------------------------------------------- the manifest copy --
+
+/// Read a blob back out of the store on `dir`, or `None` if it is not there.
+///
+/// Through `BlobStore` rather than by reconstructing a path: where a digest
+/// lives is the store's business, and a test that hard-coded the fan-out would
+/// pass while asserting nothing about the store's own idea of the layout.
+async fn archived(dir: &Path, digest: &str) -> Option<Vec<u8>> {
+    let digest: Digest = digest.parse().expect("a digest");
+    let store = BlobStore::open(dir).expect("blob store opens");
+    let blob = store.open_blob(&digest).await.ok()?;
+    let mut stream = blob.stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        bytes.extend_from_slice(&chunk.expect("a chunk"));
+    }
+    Some(bytes)
+}
+
+/// Risk 0's first mitigation: the corpus is self-describing.
+///
+/// Manifest bytes live under `B <repo> <digest>` and nowhere else, so a lost
+/// metadata store leaves a disk of blobs that nothing on it can identify. The
+/// copy is what makes the manifests findable again - byte-exact, because the
+/// digest is over exactly these bytes and a recovery that cannot verify what it
+/// found has recovered nothing.
+#[tokio::test]
+async fn a_pushed_manifest_is_copied_into_the_blob_store_under_its_own_digest() {
+    let dir = TempDir::new().expect("tempdir");
+    let h = Harness::rocks(dir.path());
+    let digest = push_image(&h, "acme/app", "v1").await;
+
+    assert_eq!(
+        archived(dir.path(), &digest).await.as_deref(),
+        Some(manifest().as_slice()),
+        "the copy is the document as pushed, not a re-serialisation of it",
+    );
+
+    // And it is a copy, not a move: `B` is still the read path, and the bytes
+    // it returns are the ones the client sent.
+    let pulled = h.get("/v2/acme/app/manifests/v1").await;
+    assert_eq!(pulled.status, StatusCode::OK);
+    assert_eq!(pulled.body.as_ref(), manifest().as_slice());
+}
+
+/// The copy carries no `L` or `P` record, and this is the observable
+/// consequence of that decision.
+///
+/// Writing them would make a manifest servable as a blob of its repository and
+/// would fold its bytes into the repository's blob count and size. It is not a
+/// blob of the repository; `M` is the record that keeps it, and purge has to
+/// honour that rather than reclaiming a file nothing appears to reference.
+#[tokio::test]
+async fn the_copy_is_not_servable_as_a_blob_and_is_not_counted_as_one() {
+    let dir = TempDir::new().expect("tempdir");
+    let h = Harness::rocks(dir.path());
+    let digest = push_image(&h, "acme/app", "v1").await;
+    assert!(archived(dir.path(), &digest).await.is_some());
+
+    let served = h.get(&format!("/v2/acme/app/blobs/{digest}")).await;
+    assert_eq!(served.status, StatusCode::NOT_FOUND);
+    assert_eq!(served.error_code(), "BLOB_UNKNOWN");
+
+    let detail = h.get("/api/v1/repositories/acme/app").await;
+    assert_eq!(
+        detail.json()["blobs"]["count"],
+        2,
+        "the config and the layer, and not the manifest",
+    );
+    assert_eq!(
+        detail.json()["size_bytes"],
+        (CONFIG.len() + LAYER.len()) as u64,
+    );
+}
+
+/// A re-push writes the same content to the same name, so it must be a no-op
+/// rather than a second file or a failure.
+#[tokio::test]
+async fn re_pushing_a_manifest_leaves_one_identical_copy() {
+    let dir = TempDir::new().expect("tempdir");
+    let h = Harness::rocks(dir.path());
+    let digest = push_image(&h, "acme/app", "v1").await;
+
+    // Same bytes, a second tag, and then the same tag again.
+    for reference in ["v2", "v1"] {
+        let reply = h.push_manifest("acme/app", reference, &manifest()).await;
+        assert_eq!(reply.status, StatusCode::CREATED);
+    }
+    // And into a second repository, where the manifest is new to `M` but the
+    // content is already in the store.
+    h.push_blob("acme/other", CONFIG).await;
+    h.push_blob("acme/other", LAYER).await;
+    assert_eq!(
+        h.push_manifest("acme/other", "v1", &manifest())
+            .await
+            .status,
+        StatusCode::CREATED,
+    );
+
+    assert_eq!(
+        archived(dir.path(), &digest).await.as_deref(),
+        Some(manifest().as_slice()),
+    );
+}
+
+/// Deleting a manifest does not remove the copy.
+///
+/// The same rule as `DELETE /v2/<name>/blobs/<digest>`, which drops membership
+/// and leaves the bytes: `M` is repo-scoped and the store is global, so another
+/// repository may still name these bytes. Deciding that nothing does is purge's
+/// job, and it takes the whole sweep to decide it.
+#[tokio::test]
+async fn deleting_a_manifest_leaves_the_copy_for_purge() {
+    let dir = TempDir::new().expect("tempdir");
+    let h = Harness::rocks(dir.path());
+    let digest = push_image(&h, "acme/app", "v1").await;
+
+    let deleted = h
+        .request(
+            Method::DELETE,
+            &format!("/v2/acme/app/manifests/{digest}"),
+            Vec::new(),
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(deleted.status, StatusCode::ACCEPTED);
+    assert_eq!(
+        h.get("/v2/acme/app/manifests/v1").await.status,
+        StatusCode::NOT_FOUND,
+    );
+
+    assert_eq!(
+        archived(dir.path(), &digest).await.as_deref(),
+        Some(manifest().as_slice()),
+        "a manifest delete is a metadata operation; reclaiming bytes is purge's",
+    );
+}
+
+/// The ordering rule, from the failing side: no metadata without the bytes.
+///
+/// The copy is redundant - `B` is still the read path - so a warning would be
+/// tempting here. It is refused: the state that would leave is metadata with no
+/// copy, silently, which is exactly the state the mitigation exists to prevent
+/// and which nobody discovers until they are already recovering.
+#[tokio::test]
+async fn a_push_that_cannot_write_the_copy_commits_no_metadata() {
+    let dir = TempDir::new().expect("tempdir");
+    let h = Harness::rocks(dir.path());
+    h.push_blob("acme/app", CONFIG).await;
+    h.push_blob("acme/app", LAYER).await;
+
+    // Every commit into the store is a rename out of `uploads/`, so sealing
+    // that directory is the one way to fail a blob write without corrupting
+    // anything.
+    let uploads = dir.path().join("uploads");
+    let mode = std::fs::metadata(&uploads).expect("uploads/").permissions();
+    std::fs::set_permissions(&uploads, std::fs::Permissions::from_mode(0o500))
+        .expect("sealing uploads/");
+    let reply = h.push_manifest("acme/app", "v1", &manifest()).await;
+    std::fs::set_permissions(&uploads, mode).expect("unsealing uploads/");
+
+    if reply.status == StatusCode::CREATED {
+        // Running as root, where the mode is advisory. Nothing was learned
+        // about the failure path, so assert what is still true and stop.
+        assert!(archived(dir.path(), &sha256_hex(&manifest()))
+            .await
+            .is_some());
+        return;
+    }
+    assert_eq!(reply.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        h.get("/v2/acme/app/manifests/v1").await.status,
+        StatusCode::NOT_FOUND,
+        "the batch is the commit point and it never ran",
+    );
+    assert_eq!(
+        h.get("/v2/acme/app/tags/list").await.json()["tags"],
+        serde_json::json!([]),
+    );
 }

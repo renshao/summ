@@ -119,7 +119,7 @@ Two traps worth stating explicitly:
 
 ## Status
 
-`cargo test` — **324 passing**. Every crate in CLAUDE.md's Layout is built, and
+`cargo test` — **329 passing**. Every crate in CLAUDE.md's Layout is built, and
 **the wiring has landed** (package K, `summ-server/src/backend.rs`): `summ
 serve` runs on `summ-registry` over `summ-meta` with `summ-storage` holding the
 bytes. `tests/wiring.rs` drives the same router as `tests/api.rs` against a real
@@ -136,6 +136,11 @@ with reference validation on, and it read back byte-exact.
 
 **Both directions stream.** Pushing a 200 MB blob moved release-binary RSS from
 15.6 MB to 15.8 MB; serving it back took it to 20 MB.
+
+**Every manifest is also in the blob store**, under its own digest, written and
+fsynced before the push's batch commits. `B` is still the read path; the copy
+exists so a disk of blobs is self-describing rather than unidentifiable content.
+See Risk 0, which carries the rule purge has to honour.
 
 Properties the tests pin down: cursor paging never exceeds its limit nor strays
 across a repo boundary; `exists_prefix` correctly gates purge; batches are
@@ -319,7 +324,9 @@ actually does**.
 
 ### Phases 4–6
 
-**4** offline purge exploiting `R` and `G`. **5** storage driver abstraction +
+**4** offline purge exploiting `R` and `G` — and retaining every blob whose
+digest is a manifest digest, or it destroys Risk 0's mitigation on its first
+run. **5** storage driver abstraction +
 S3, chunked upload → multipart. **6** auth and full conformance — **referrers
 landed early**, because the `F` edges had been written since Phase 1 and what
 was left was a page and a switch.
@@ -576,18 +583,38 @@ that constrain other work:
 
 ## Risks
 
-0. **A lost or corrupt RocksDB is a dead registry.** This is the largest
-   durability gap and it was previously unlisted. Manifest bytes live only under
-   `B` and tags only under `T`, so the metadata store is authoritative with no
-   way to reconstruct it. A full disk of blobs would be unidentifiable. zot does
-   not have this problem — its metadata is a derived cache rebuilt by walking
-   storage — which is also why its migration patch lists are empty: it can always
-   rebuild. Two mitigations to decide on before v1 ships, in `research/R4`:
-   write manifest bytes to the blob store as well as `B` (one small object per
-   manifest, makes the corpus self-describing), and add a `DBVersion` key plus a
-   migration hook now, because retrofitting a version marker onto a populated
-   store is unpleasant. Neither recovers tags; the planned WAL is what covers
-   those.
+0. **A lost or corrupt RocksDB is a dead registry** — **partly mitigated**. Tags
+   live only under `T`, so the metadata store is still authoritative with no way
+   to reconstruct it. zot does not have this problem — its metadata is a derived
+   cache rebuilt by walking storage — which is also why its migration patch lists
+   are empty: it can always rebuild. Both mitigations R4 proposed have now
+   landed: the schema version marker plus migration hook (`summ-meta::version`),
+   and **the manifest copy**.
+
+   **The corpus is self-describing.** A manifest push writes its document into
+   the blob store under its own digest as well as under `B`, fsynced before the
+   batch like any other blob (`Backend::archive_manifest`). A manifest is
+   content-addressed already, so this is `digest -> bytes` and invents no
+   concept: recovery walks the blob store, finds the documents that parse as
+   manifests, and from each one gets its media type, its config and its layers.
+
+   What it does **not** recover: tags, repository membership, `pushed_at`, and
+   which repository anything belonged to. All of that is `T`, `P` and `M`, and
+   the planned WAL is what covers it. Nor is a recovery sweep written — this is
+   the raw material for one, not the tool.
+
+   **The consequence for purge (package F), which must not be discovered by
+   accident.** The copy carries no `L` and no `P` record, deliberately: those
+   make bytes servable through `GET /v2/<name>/blobs/<digest>` and fold them
+   into the repo's blob count and byte total, and a manifest is not a blob of
+   its repository. So the copy looks exactly like garbage to a sweep that asks
+   only "does anything reference these bytes". **Purge must retain a blob whose
+   digest appears as a manifest digest.** `M` is the record that keeps it; an
+   offline sweep walks `M` to build the live set anyway, so this costs it
+   nothing. No second record was invented for it, because the blob store holds
+   bytes and not relationships. For the same reason a manifest delete leaves the
+   copy alone — `M` is repo-scoped and the store is global, so only the sweep
+   can tell that nothing names it any more.
 
 1. **RocksDB at 10¹⁰ keys is chosen but unmeasured.** The engine decision is
    made; the *tuning* is not, and post-compaction size on disk is the number that
@@ -695,6 +722,42 @@ implementation has since turned up, is below.
   next resume truncates the excess — the client sees exactly what it saw before.
   Worth knowing when reading the staging directory, and worth a purge sweep for
   the case where the client never comes back.
+
+**Found while adding the manifest copy (Risk 0):**
+
+- **The copy costs one uncompressed manifest per manifest, and nobody has
+  sized it.** `B` holds the document zstd-compressed; the blob store holds it
+  as pushed, because it is content-addressed and the digest is over the
+  plaintext. At Risk 2's assumed ~10⁹ manifests and a couple of kilobytes each
+  that is the same order as the `R` keyspace, which makes it a real number and
+  not a rounding error. Package G should measure it alongside the rest.
+- **A repository's reported `size_bytes` no longer matches its footprint.**
+  The count folds `P`, and the copy deliberately has no `P` record, so the
+  manifests a repository owns are on the disk and not in the number. Correct as
+  a definition — those bytes are not blobs of the repository — and worth saying
+  out loud before somebody reconciles the two and "fixes" it.
+- **Two writes of the same manifest race harmlessly, and only because the
+  content is addressed.** Concurrent pushes of one document both see
+  `contains` false, both stage, and both rename onto the same path; the second
+  rename wins and the bytes are identical either way. Nothing here relies on
+  that beyond what `commit_upload` already documents, but it is the reason no
+  lock appears on this path.
+
+- **The manifest push now plans and applies in two steps, with disk I/O in
+  between.** `Backend::put_manifest` plans its batch, writes the archive copy,
+  then applies — so validation reads (reference checks, and the `exists_prefix`
+  that decides whether `P`'s `added_at` grace clock is rewritten) are separated
+  from the apply by an `await` on a create-append-fsync-rename, which is
+  milliseconds rather than the microseconds the single closure used to be. The
+  race is not new — `write` is a `spawn_blocking` hop with no lock, so two
+  pushes have always been able to interleave against the engine — but the window
+  is now wide enough to hit. The bad outcome is a manifest committing against a
+  blob that was deleted after it was validated, which is metadata pointing at
+  missing content. Options: re-check references inside the applying closure, or
+  make the push path take the repo write lock the WAL will want anyway. Note the
+  ordering rule forces the copy to precede the batch, so the fix is not
+  "reorder"; and per the rule in **What the client actually does**, any lock
+  here must never be held across a request-body read.
 
 **Found while building the discovery API and UI (packages H and I):**
 
