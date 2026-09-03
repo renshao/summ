@@ -1,5 +1,8 @@
 # Summ Container Registry
 
+[![CI](https://github.com/renshao/summ/actions/workflows/ci.yml/badge.svg)](https://github.com/renshao/summ/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 Summ is currently a research and engineering project. I want to create an OCI/docker container registry that is:
 - Easy to use - get up and running very quickly, requires minimal configuration, with sensible defaults.
 - Practical utilities - web ui to visualise repository size, manifests and tags count, manifest <-> layer blob bidirectional map, artifact pull statistics, tag change history. In other container registry products, these features are often missing or an after thought, Summ provide first-class support to those features.
