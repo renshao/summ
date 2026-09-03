@@ -8,6 +8,7 @@ operation rather than an afterthought.
 
 ## Working rules
 
+- **Commit on main branch** unless I speficially ask you to branch out
 - **PLAN.md is the source of truth** for scope, decisions, schema, and status.
   Update it as work lands rather than restating it elsewhere.
 - **No stored value may grow with the size of the registry.** Fan-in goes in its
