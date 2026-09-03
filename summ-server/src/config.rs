@@ -81,7 +81,20 @@ pub enum Command {
 
 #[derive(Debug, Parser)]
 pub struct ServeArgs {
-    /// Address to listen on.
+    /// Address to listen on, as `<host>:<port>`.
+    ///
+    /// `127.0.0.1:5000` for this machine only, `0.0.0.0:5000` for every IPv4
+    /// interface, `[::]:5000` for every interface on both families. Port `0`
+    /// binds an ephemeral port, which the startup banner then reports.
+    ///
+    /// One value rather than separate host and port flags, because a bind
+    /// address is one thing: it maps onto a `SocketAddr` with no reassembly
+    /// step, it is how an address is quoted between people, and it is the only
+    /// shape that stays expressible if this ever has to accept more than one.
+    ///
+    /// A host, not a hostname: a name can resolve to several addresses and a
+    /// listener binds exactly one, so resolving here would only hide which one
+    /// we picked.
     #[arg(long, default_value = "127.0.0.1:5000", env = "SUMM_LISTEN")]
     pub listen: SocketAddr,
 
