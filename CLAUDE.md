@@ -77,5 +77,13 @@ trait, kept so the seam stays one.
   step, no framework, no CDN — a registry runs air-gapped. Nothing reaches the
   DOM as a string either: repository names, tags and annotations are all pushed
   by whoever can reach the registry.
+- **The product is `Summ`; the binary, the crates and the paths are `summ`.**
+  Prose and anything a person reads — the UI title, the topbar, the README —
+  take the capital. Identifiers do not: `summ serve`, `summ-server`, `SUMM_LOG`
+  and the startup banner are the executable's name, not the product's.
+- **The logo has one definition, `summ-server/ui/logo.svg`** — a sigma, for
+  summation, served at `/logo.svg` as the favicon. The topbar carries an inline
+  copy of the path so the tile can take `--accent` and follow the theme, which
+  an `<img>` cannot; the two are the only duplication and must stay in step.
 - **The discovery API and the UI carry their own tests** (`tests/discovery.rs`),
   because no conformance suite covers them and none ever will.

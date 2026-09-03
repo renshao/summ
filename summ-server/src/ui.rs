@@ -1,4 +1,4 @@
-//! The built-in web UI: three files, compiled into the binary.
+//! The built-in web UI: four files, compiled into the binary.
 //!
 //! The UI is a headline feature rather than an extra, and the reason is the
 //! honesty check it performs: a catalogue browser that stays responsive over
@@ -24,6 +24,7 @@ use axum::response::{IntoResponse, Response};
 const INDEX_HTML: &str = include_str!("../ui/index.html");
 const APP_CSS: &str = include_str!("../ui/app.css");
 const APP_JS: &str = include_str!("../ui/app.js");
+const LOGO_SVG: &str = include_str!("../ui/logo.svg");
 
 /// Assets are served from a fixed table rather than from a directory walk.
 /// There is no filesystem to traverse at runtime, so there is also no path that
@@ -32,6 +33,9 @@ fn asset(path: &str) -> Option<(&'static str, &'static str)> {
     match path {
         "/app.css" => Some(("text/css; charset=utf-8", APP_CSS)),
         "/app.js" => Some(("text/javascript; charset=utf-8", APP_JS)),
+        // The favicon. Served as a file rather than inlined as a `data:` URI
+        // in the shell so the mark has exactly one definition to edit.
+        "/logo.svg" => Some(("image/svg+xml; charset=utf-8", LOGO_SVG)),
         _ => None,
     }
 }

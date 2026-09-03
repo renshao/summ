@@ -480,6 +480,16 @@ async fn the_ui_is_served_from_the_binary_on_every_non_api_path() {
         Some("text/javascript; charset=utf-8")
     );
     assert!(!js.is_empty());
+
+    // The favicon is an asset, not a client-side route: served as SVG, never
+    // as the shell. Getting this wrong shows up as a blank tab icon rather
+    // than as an error, which is why it is pinned here.
+    let (_, content_type, logo) = h.send(Method::GET, "/logo.svg").await;
+    assert_eq!(
+        content_type.as_deref(),
+        Some("image/svg+xml; charset=utf-8")
+    );
+    assert!(logo.starts_with(b"<svg"));
 }
 
 #[tokio::test]
@@ -505,8 +515,15 @@ async fn the_ui_loads_nothing_from_the_network() {
         .expect("the script is in the crate");
     let css = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.css"))
         .expect("the stylesheet is in the crate");
+    let logo = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/logo.svg"))
+        .expect("the logo is in the crate");
 
-    for (name, source) in [("index.html", &html), ("app.js", &js), ("app.css", &css)] {
+    for (name, source) in [
+        ("index.html", &html),
+        ("app.js", &js),
+        ("app.css", &css),
+        ("logo.svg", &logo),
+    ] {
         // Anything the browser would *fetch*. An XML namespace identifier such
         // as `xmlns='http://www.w3.org/2000/svg'` is a name, not a URL, and is
         // never dereferenced - so the check is on the attributes and at-rules

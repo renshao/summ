@@ -242,7 +242,7 @@ that are now contract:
 
 The UI lives in `summ-server/ui/` and `summ-server/src/ui.rs`, not the
 `summ-ui/` crate the work-package table names. With no build step there is
-nothing for a crate to own but three `include_str!`s; give it one when there is
+nothing for a crate to own but four `include_str!`s; give it one when there is
 an asset pipeline to put in it.
 
 Still to build here: blob fan-in ("what shares this layer"), the untagged /

@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="Summ">
+  <title>Summ</title>
+  <!--
+    The mark: a sigma, for summation, drawn as a stack of strokes - which is
+    also what a registry holds. One path on a 32-unit grid, mitred joins, no
+    curves and no gradient, so it survives a 16px favicon and a one-colour
+    stencil alike. Served from the binary at /logo.svg; the topbar carries an
+    inline copy in `currentColor` so it can follow the theme, which an <img>
+    cannot. Keep the two in step.
+  -->
+  <rect width="32" height="32" rx="7" fill="#0b7285"/>
+  <path d="M22 8H10l6 8-6 8h12" fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="square"/>
+</svg>

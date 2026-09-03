@@ -452,14 +452,14 @@ async function manifestPage(name, reference) {
 function route() {
   const path = decodeURI(location.pathname);
   const query = new URLSearchParams(location.search);
-  document.title = 'summ';
+  document.title = 'Summ';
 
   if (path === '/' || path === '') return repositoriesPage(query);
 
   if (path.startsWith('/r/')) {
     const name = path.slice(3).replace(/\/+$/, '');
     if (!name) return repositoriesPage(query);
-    document.title = `${name} · summ`;
+    document.title = `${name} · Summ`;
     const manifest = query.get('manifest');
     return manifest ? manifestPage(name, manifest) : repositoryPage(name, query);
   }
