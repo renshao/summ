@@ -1,94 +1,40 @@
 # summ — build plan
 
 An OCI Distribution Spec compliant container registry in Rust. One binary, no
-dependencies, a built-in web UI, and a purpose-built metadata store that makes
-discovery — what is in here, how much of it, and what references what — a
+dependencies, a built-in web UI, and a metadata store that makes discovery a
 first-class operation rather than an afterthought.
 
-This document is the entry point for a fresh session. It records what is decided,
-what is built, and what is open. Update it as work lands.
+This document is the entry point for a fresh session and is loaded into every
+one of them, so it holds only what a session needs *before* starting work:
+decisions, schema, status, invariants, and what is open. Working that has served
+its purpose lives in `research/` and `design/`, linked from here.
 
 ## Why this exists
 
-Four goals. They are not independent: the metadata store that makes discovery
-fast is the same one that makes pulls fast, and the UI is what proves both are
-real.
+Four goals that are one engineering problem. `README.md` has the pitch.
 
-### 1. Extremely fast
+1. **Extremely fast.** R2 measured the byte path at 2–5 % of an 8-vCPU box at
+   line rate, where a perfect implementation saves ~1 % — throughput is not
+   where the race is won. R5 found four of the five serial steps in a cold
+   containerd pull are metadata lookups, and their latencies add. **Metadata
+   latency is the product.**
+2. **First-class discovery.** The spec is a transfer protocol and cannot tell
+   you what is in your registry; `_catalog` is not even in it. Every registry
+   bolts discovery on over a store designed for transfer, and it is slow.
+   **Catalog and list operations degrading at high repo counts, plus ECR/ACR
+   rate limiting, is the concrete failure that started this project.** summ
+   inverts the order: the store is designed for discovery, transfer served from
+   it.
+3. **Simple to run.** One binary, no database, no sidecar. Every feature needing
+   an external service must justify itself against that; the answer is usually
+   to build it in.
+4. **A built-in web UI**, same port, embedded assets. It is the honesty check on
+   goal 2 — if it browses a ten-million-repo catalog responsively, the API is
+   genuinely cursor-paged.
 
-Fast is the point, not a feature. Two things follow from the research, and they
-are not what we assumed going in:
-
-- **The byte path is nearly free.** Serving blob bytes well costs 2–5 % of an
-  8-vCPU box at line rate, and the best possible implementation would save about
-  1 % (`research/R2`). Throughput is not where the race is won.
-- **Metadata latency is the product.** Four of the five serial steps in a cold
-  containerd pull are metadata lookups, and being sequential their latencies add
-  (`research/R5`). A registry that answers those in microseconds instead of
-  milliseconds is a *visibly* faster registry, on exactly the path every pull
-  takes.
-
-So the speed goal and the discovery goal below are the same engineering problem,
-approached from two directions.
-
-### 2. First-class metadata discovery
-
-The Distribution Spec is a transfer protocol. It can tell you the bytes of a
-manifest you already know the name of; it cannot tell you what is in your
-registry, how big it is, what a layer is shared by, or which manifests are
-untagged and reclaimable. `GET /v2/_catalog` is not even in the spec — it was
-removed before v1.0.0 and now sits in a reserved extension namespace, so
-*nothing* standard answers the most basic question an operator has.
-
-Every registry therefore bolts discovery on afterwards, over a store that was
-designed for transfer, and it is slow: distribution walks the filesystem, zot
-does a whole-repo read-modify-write, and the managed registries throttle or
-time out. This is the concrete failure that started the project — **catalog and
-list operations degrading at high repo counts, and provider rate limiting** on
-ECR and ACR.
-
-summ inverts the order. The metadata store is designed for discovery first, and
-transfer is served from it. Listing repositories, listing tags, counting
-manifests, summing a repo's size, and asking which manifests reference a layer
-are all ordered prefix scans over an index built for exactly that — at ten
-million repositories, with cursor pagination throughout and no operation that
-materialises an unbounded set.
-
-### 3. Simple to run — batteries included
-
-One binary. No database to provision, no object store to configure before first
-use, no sidecar, no migration step. `summ serve` on a laptop and on a
-ten-million-repo host should be the same command. RocksDB is compiled in and
-statically linked precisely so that "install the registry" is "copy one file".
-
-This is a design constraint, not a convenience: every feature that would require
-an external service has to justify itself against it, and the answer is usually
-to build the capability in rather than depend out.
-
-### 4. A built-in web UI
-
-Shipped in the binary, served on the same port, no separate build or deploy.
-Browse repositories, tags, manifests and their counts and sizes; drill into a
-manifest; see what a layer is shared by.
-
-The UI is not a side project — it is the reason goal 2 has a visible payoff, and
-it is the honesty check on the extension API. If the UI can render a
-ten-million-repo catalog responsively, the API underneath is genuinely
-cursor-paged and genuinely fast. If it cannot, no amount of benchmark numbers
-will cover for it. summdb already prototyped both the UI and the queries behind
-it, so this is proven ground rather than speculation.
-
-### Consequences
-
-- The **extension API is core product surface**, not a nice-to-have. It is what
-  the UI runs on and what makes summ worth choosing. It is also unstandardised,
-  so it needs its own tests — nothing external will check it.
-- **Everything is cursor-paged**, including the UI's own queries. A view that
-  sorts or counts across the whole registry is a bug, however convenient.
-- **Embedding the UI** means asset bundling in the binary and a UI that can be
-  developed without a separate toolchain in the release path.
-- Conformance remains the floor, not the ceiling: summ must pass the OCI suite,
-  but passing it is not the goal.
+Consequences: the extension API is core product surface and carries its own
+tests, because nothing external validates it. Everything is cursor-paged.
+Conformance is the floor, not the ceiling.
 
 ## Decisions locked
 
@@ -111,25 +57,20 @@ and untagged manifests. Rust has no runtime GC; the terms are unrelated.
 
 ## The scale constraint that shapes everything
 
-summdb (the prototype) stored fan-in relationships as vectors inside a single
-value: `LayerRecord.manifests: Vec<ManifestRef>`, `ManifestRecord.tags:
-Vec<String>`. That is fine at prototype scale and fatal at ours. A popular base
-layer referenced by 10M manifests is a ~360 MB value, and it would be
-read-modify-written inside a write transaction on **every push touching that
-layer**.
+summdb stored fan-in as vectors inside a value (`LayerRecord.manifests`,
+`ManifestRecord.tags`). Fine at prototype scale, fatal at ours: a base layer
+referenced by 10M manifests is a ~360 MB value, read-modify-written **on every
+push touching that layer**. Hence the no-growing-values rule in CLAUDE.md —
+fan-*out* is bounded and stays inline, fan-*in* becomes one key per edge.
 
-**Rule: no stored value may grow with the size of the registry.** Fan-*out* data
-(a manifest's own layers and children) is bounded and stays inline. Fan-*in* data
-becomes one key per edge.
-
-Three things fall out of this, and they are why the schema is shaped this way:
+Three things fall out, and they are why the schema is shaped this way:
 
 - Adding a reference is an O(1) insert instead of an O(N) rewrite.
 - "Is this blob still referenced?" is a single seek on a prefix — which is what
   makes purge affordable.
 - Read-modify-write disappears from the write path entirely. There is no `merge`
-  primitive. That in turn makes every `WriteBatch` idempotent and replayable,
-  which is the HA seam, obtained for free.
+  primitive, so every `WriteBatch` is replayable, which is the HA seam obtained
+  for free.
 
 ## Key schema
 
@@ -178,347 +119,231 @@ Two traps worth stating explicitly:
 
 ## Status
 
-**Built** (`cargo test` — 282 passing):
+`cargo test` — **282 passing**. Every crate in CLAUDE.md's Layout is built, and
+**the wiring has landed** (package K, `summ-server/src/backend.rs`): `summ
+serve` runs on `summ-registry` over `summ-meta` with `summ-storage` holding the
+bytes. `tests/wiring.rs` drives the same router as `tests/api.rs` against a real
+store, and the tests that matter reopen it — a registry that loses a push on
+restart passes every test in `api.rs`.
 
-```
-summ-core     digest (sha256/sha512), key encoding, value types, errors
-summ-meta     MetaEngine trait, WriteBatch op log, RocksDB engine (v1),
-              redb engine (kept to keep the trait honest), LRU repo interner,
-              schema version marker + migration seam
-summ-storage  filesystem blob store: 3-level CAS, upload staging, resumable
-              hashing, 1 MiB pread range serving
-summ-registry ops layer: manifest push/pull/delete as WriteBatch builders,
-              tags, referrers, cursor-paged discovery
-summ-server   HTTP: full /v2/ route table, spec error model, upload state
-              machine, CLI, and the wiring that runs it on the three crates
-              above
-```
+Verified end to end, by test and by hand: push and pull, byte-exact manifest
+return, tags and catalog, ranges including containerd's open-ended `bytes=N-`,
+cross-repo mount, per-repo blob isolation, delete cascade, and all of it
+surviving a restart. A chunked upload **resumes across a process restart** —
+offset and the 104-byte hasher state come back from the `U` record and the
+commit still verifies. `oras cp` has pushed a real multi-arch `nginx:latest`
+with reference validation on, and it read back byte-exact.
 
-Notable properties already covered by tests: cursor paging never exceeds its
-limit and never strays across a repo boundary; `exists_prefix` correctly gates
-purge; batches are atomic across every key a push touches; the interner stays
-correct with its cache fully evicted (the 10M-repo case); prefix groups stay
-contiguous in key order across every in-domain range, which is the property
-`prefix_same_as_start` actually relies on; every stored record survives a
-postcard round trip; all four upload flows, all six blob range cases, and both
-`Content-Range` grammars.
+**Both directions stream.** Pushing a 200 MB blob moved release-binary RSS from
+15.6 MB to 15.8 MB; serving it back took it to 20 MB.
 
-**The wiring has landed** — `summ-server/src/backend.rs`, package K. `summ serve`
-now runs on `summ-registry` over `summ-meta` with `summ-storage` holding the
-bytes; `memory::MemoryRegistry` stays as the second implementation of
-`seam::Registry`, which is what keeps that trait a seam rather than a formality.
-`summ-server/tests/wiring.rs` drives the same router as `tests/api.rs` against a
-real store on a temp directory, and the tests that matter reopen it — a registry
-that loses a push on restart passes every test in `api.rs`.
+Properties the tests pin down: cursor paging never exceeds its limit nor strays
+across a repo boundary; `exists_prefix` correctly gates purge; batches are
+atomic across every key a push touches; the interner stays correct with its
+cache fully evicted (the 10M-repo case); prefix groups stay contiguous across
+every in-domain range, which is what `prefix_same_as_start` relies on; every
+stored record survives a postcard round trip; all four upload flows, all six
+blob range cases, both `Content-Range` grammars.
 
-Verified end to end, by test and by hand against the binary: push and pull of
-manifests and blobs, byte-exact manifest return, tags and catalog, ranges
-including containerd's open-ended `bytes=N-`, cross-repo mount, per-repo blob
-isolation, delete cascade, and all of it surviving a restart. A chunked upload
-**resumes across a process restart** — the offset and the 104-byte hasher state
-come back from the `U` record and the commit still verifies — which is the claim
-that keeps chunked uploads from being an HA constraint, and it was untested
-until there was a store to test it against.
-
-**Both directions stream.** A pull is a `BlobStream` over 1 MiB `pread`s; a push
-is written through frame by frame, so neither costs memory proportional to the
-blob. Measured on the release binary: pushing a 200 MB blob moved the server's
-RSS from 15.6 MB to 15.8 MB, and serving it back took it to 20 MB.
-
-**Not built**: purge, conformance harness, the extension API and UI, analytics
-writers, everything in Phases 2b–6.
+**Not built**: purge, conformance harness, extension API and UI, analytics
+writers, Phases 2b–6.
 
 ## Phases
 
-Ordering rationale: the storage driver abstraction comes *after* a fast
-filesystem driver exists, so the trait is shaped by measured requirements rather
-than guesses. distribution's driver interface is the cautionary tale — its
-Reader/Writer abstraction forces buffering that S3 does not need.
+The storage driver abstraction comes *after* a fast filesystem driver exists, so
+the trait is shaped by measured requirements. distribution's Reader/Writer
+abstraction, which forces buffering S3 does not need, is the counter-example.
 
-### Phase 0 — baseline — **done**, see `research/R1-spec-conformance.md`
-Conformance harness recipe verified end to end against `distribution` v3.1.1,
-with the exact commands in R1. Two gotchas worth not rediscovering: **on macOS
-port 5000 is AirPlay Receiver** (it answers 403 with `Server: AirTunes`), so use
-15000; and `storage.delete.enabled: true` must be set or the delete APIs skip.
+### Phase 0 — baseline — **done**, `research/R1-spec-conformance.md`
 
-**Do not treat distribution as a passing baseline.** It scores 743/91/16 against
-the 1.1 certification profile, because it has no referrers route at all and no
-sha512. On its honest feature set it is 511 pass / 0 fail. Calibrate against that,
-not against the raw totals.
+Harness recipe verified against `distribution` v3.1.1; exact commands in R1.
+Three things not to rediscover:
 
-**Read the result vocabulary, not the FAIL count.** `errRegUnsupported` silently
-downgrades FAIL to Skip (405 on delete, 202 on single-POST or mount), so a low
-FAIL count can conceal an entire unimplemented API.
+- **On macOS port 5000 is AirPlay Receiver.** It holds `*:5000` on both address
+  families and answers 403 with `Server: AirTunes`, so a summ bound to
+  `127.0.0.1` never sees a request to `localhost`. Use 15000.
+- **distribution is not a passing baseline.** Its 743/91/16 against the 1.1
+  profile reflects having no referrers route and no sha512. On its honest
+  feature set it is 511 pass / 0 fail.
+- **Read the result vocabulary, not the FAIL count.** `errRegUnsupported`
+  downgrades FAIL to Skip, so a low FAIL count can hide an unimplemented API.
 
-Perf baseline with `../container-registry/bench` is still to do.
+Perf baseline with `../container-registry/bench` still to do.
 
 ### Phase 1 — skeleton — **built, pending the conformance run**
-axum, full route table, spec error model, config, single binary. Filesystem blob
-store, naive metadata. **Exit: conformance push + pull pass.**
 
-Built: the route table, the error model, all four upload flows, all six range
-cases, both `Content-Range` grammars, the blob store, the ops layer, and the
-wiring that joins them. `summ serve --data-dir <d>` is a real registry that
-keeps what it is given. What remains before the exit criterion can be attempted
-is package A, the harness — nothing else.
+Everything is built. **Package A, the harness, is all that remains** before the
+exit criterion (conformance push + pull pass) can be attempted. It will need:
 
-**One thing to set before running the suite:** the ops layer validates that a
-manifest's referenced blobs exist, behind `RegistryOptions::validate_references`
-and defaulted on. R1 recommends *against* validating — it is optional per spec,
-costs N lookups, breaks a client pushing layers and manifest concurrently, and
-`OCI_DATA_SPARSE` pushes exactly that shape. **The harness will need it off for
-the sparse data sets**, which is `summ serve --allow-missing-references` (or
-`SUMM_ALLOW_MISSING_REFERENCES=1`). Defaulting it on is the safer production
-posture; the flag is there so conformance does not have to argue with it. With
-it on, a manifest naming an absent blob is `400 MANIFEST_BLOB_UNKNOWN` — its own
-code, not `MANIFEST_INVALID`, because the document is well-formed and the fix is
-to push the blob.
+- `--allow-missing-references`. Reference validation defaults on; R1 recommends
+  against it because it is optional, costs N lookups, and breaks a client
+  pushing layers and manifest concurrently — which is what `OCI_DATA_SPARSE`
+  does. On, a manifest naming an absent blob is `400 MANIFEST_BLOB_UNKNOWN`, its
+  own code rather than `MANIFEST_INVALID`, because the document is well-formed
+  and the fix is to push the blob.
+- `--engine redb`, running the whole binary on the second `MetaEngine` — the
+  cheapest proof nothing has leaked past the trait.
+- `--listen '[::]:15000'`, per the AirPlay note.
 
-**The other switch the harness needs** is `--engine redb`, which runs the whole
-binary on the second `MetaEngine`. Running the suite against both is the
-cheapest possible proof that nothing has leaked past the trait.
+Two things R1 moved *into* this phase: **blob range serving is a correctness
+requirement**, not a Phase 3 optimisation; and **write `F` edges from Phase 1**
+even though `/referrers/` stays 404 until Phase 6, because retrofitting them
+costs a full manifest rescan plus a spec-mandated ingest of the fallback tag
+schema.
 
-Two things R1 moved *into* this phase that looked like later work:
-
-- **Blob range serving is a Phase 1 correctness requirement, not a Phase 3
-  optimisation.** The suite exercises six range cases with exact expected
-  headers.
-- **Write `F <repo> <subject> <referrer>` edges from Phase 1**, even though
-  `/referrers/` stays 404 until Phase 6. Retrofitting them later costs a full
-  manifest rescan plus a spec-mandated ingest of the fallback tag schema.
-
-And one trap worth stating once: **there are two `Content-Range` grammars.**
-Chunked *upload* uses a bare `0-1023` (`^[0-9]+-[0-9]+$`, no `bytes ` prefix, no
-`/total`), and the `202` response echoes a bare `Range: 0-<end>`. Blob *download*
-uses ordinary RFC 9110 `bytes 500-1499/<len>`. Out-of-order chunks MUST get
-`416`.
+**There are two `Content-Range` grammars.** Chunked *upload* uses a bare
+`0-1023` (`^[0-9]+-[0-9]+$`, no `bytes ` prefix, no `/total`) and the `202`
+echoes a bare `Range: 0-<end>`. Blob *download* uses RFC 9110
+`bytes 500-1499/<len>`. Out-of-order chunks MUST get `416`.
 
 ### Phase 2 — metadata engine
-Wire `summ-meta` behind the HTTP layer. Catalog and tag pagination end-to-end.
-**Must include a synthetic load at target scale before committing to redb** — see
-Risks.
+
+Largely subsumed by package K. **Must include a synthetic load at target scale**
+— see Risks.
 
 ### Phase 2b — discovery API and web UI
-The payoff for goals 2 and 4, and the honesty check on both. Cursor-paged
-extension endpoints (see "Beyond the spec"), then the embedded UI on top of them.
-The pull-count wall and the tag-history view would ride on this same surface if
-they land — see **Analytics** for whether the schema can carry them.
 
-Deliberately placed before the performance phase, not after. The UI is the thing
-that will expose an unbounded scan or an accidental full-table sort, and it is
-much cheaper to find those before tuning than after. If the UI can browse a
-ten-million-repo catalog responsively, the API underneath is honest.
+Cursor-paged extension endpoints (see **Beyond the spec**), then the UI on them.
+Deliberately before the performance phase: the UI is what exposes an unbounded
+scan or an accidental full-table sort, and those are cheaper to find before
+tuning than after.
 
 ### Phase 3 — performance
-Benchmark against distribution on the existing rig.
 
-**R2 settled the blob-serving question, and the answer is "do the simple thing
-well".** Measured on the bench host, cost of moving 1 GiB from page cache to
-socket: a naive 4 KiB `ReaderStream` burns 11–15 % of an 8-vCPU box at line rate;
-64 KiB chunks 5–11 %; **1 MiB chunks 2–5 %**; true `sendfile` 2–2.4 %. So the gap
-between a badly-tuned copy loop and a well-tuned one is **3–5×**, and the gap
-between a well-tuned loop and true zero-copy is **about 1 % of the machine** —
-bought at the price of fighting hyper for the socket, breaking under TLS, and
-blocking the reactor on page-cache misses. Bad trade.
+**R2 settled blob serving: do the simple thing well.** Moving 1 GiB from page
+cache to socket costs 11–15 % of an 8-vCPU box with a naive 4 KiB
+`ReaderStream`, 5–11 % at 64 KiB, **2–5 % at 1 MiB**, 2–2.4 % for true
+`sendfile`. So a bad copy loop costs 3–5× a good one, and zero-copy buys ~1 % of
+the machine at the price of fighting hyper for the socket, breaking under TLS,
+and blocking the reactor on page-cache misses.
 
-**Do:** `pread` in `spawn_blocking`, **1 MiB chunks**, `Bytes` into hyper's
-`writev`. **Do not:** `sendfile`, `mmap`, or an io_uring runtime. Tokio is
-bringing io_uring in-tree transparently; revisit then, for free.
+**Do:** `pread` in `spawn_blocking`, 1 MiB chunks, `Bytes` into hyper's
+`writev`. **Do not:** `sendfile`, `mmap`, or an io_uring runtime — Tokio is
+bringing io_uring in-tree transparently.
 
-The real Phase 3 work is therefore metadata latency, not byte throughput — see
-the client findings below.
+The real work here is metadata latency, not throughput. See **What the client
+actually does**.
 
-### Phase 4 — purge
-Offline sweep exploiting `R` and `G`.
+### Phases 4–6
 
-### Phase 5 — storage driver abstraction + S3
-Chunked upload → S3 multipart.
-
-### Phase 6 — referrers, auth, full conformance
+**4** offline purge exploiting `R` and `G`. **5** storage driver abstraction +
+S3, chunked upload → multipart. **6** referrers, auth, full conformance.
 
 ## Work packages (parallelisable)
 
-Independent enough to hand to separate subagents. Phase 1 packages can run
-concurrently; each owns its files.
-
 | # | Package | Owns | Depends on |
 |---|---|---|---|
-| A | Conformance harness — script to run the suite against a local binary, wired into CI | `conformance/` | — |
-| ~~B~~ | ~~HTTP skeleton~~ — **done**, on an in-memory seam | `summ-server/` | — |
-| ~~C~~ | ~~Filesystem blob store~~ — **done** | `summ-storage/` | — |
-| ~~D~~ | ~~Upload session handling~~ — **done** in the HTTP layer; still on the in-memory seam, so `U` keys are not yet written | `summ-server/`, `U` keys | B, C |
-| ~~E~~ | ~~Registry ops layer~~ — **done** | `summ-registry/` | — |
-| ~~K~~ | ~~Wiring~~ — **done**, `summ-server/src/backend.rs`. Bodies stream in both directions | `summ-server/` | B, C, E |
+| A | **Conformance harness — the next step** | `conformance/` | — |
 | F | Purge | `summ-purge/` | E |
 | G | Scale benchmark — synthetic 10M-repo dataset, engine A/B | `benches/` | — |
 | H | Extension API — cursor-paged discovery endpoints | `summ-server/` | E |
-| I | Built-in web UI — embedded assets, served on the same port | `summ-ui/` | H |
-| J | Analytics — pull-count queue, aggregation worker, retention sweep | `summ-analytics/` | E |
+| I | Built-in web UI — embedded assets, same port | `summ-ui/` | H |
+| J | Analytics — pull-count queue, aggregation worker, retention | `summ-analytics/` | E |
 
-Packages B, C, D, E and K are done, so there is a working registry. **Package A,
-the conformance harness, is the next step**: it is the only thing standing
-between here and the Phase 1 exit criterion, and everything it needs now exists.
-
-The property that survived the wiring and must keep surviving: `summ-server`
-reaches the layers below only through `seam::Registry`, whose failures are in
-spec vocabulary (`OpsError::{RepoUnknown, BlobUnknown, OffsetMismatch, …}`). The
-layer below never learns about HTTP, and nothing under `handlers/` imports
-`summ-registry`, `summ-meta` or `summ-storage` — `backend.rs` is the single
-module that names them. That is what makes the ops layer testable without a
-server and the server testable without a store, and it is why the same test
-harness runs over both implementations.
+Done: **B** HTTP skeleton, **C** blob store, **D** upload sessions, **E** ops
+layer, **K** wiring. Package A is all that stands between here and the Phase 1
+exit criterion.
 
 ## Engine choice — RocksDB (decided)
 
-**Decided for v1: RocksDB**, compiled from source by `librocksdb-sys` and
-statically linked, so the registry ships as one binary with no RocksDB to
-install. Verified: the only dynamic dependencies are OS-provided (`libc++`,
-`libiconv`, `libSystem` on macOS; expect `libstdc++` + `libc` on Linux — a fully
-static musl build is a separate exercise if wanted).
+**RocksDB for v1**, compiled by `librocksdb-sys` and statically linked, so the
+registry ships as one binary. Verified: the only dynamic dependencies are
+OS-provided. Full working in `research/R3`.
 
-### Why an LSM
+**Why an LSM.** Reads are point lookups and short prefix scans, and
+prefix-*existence* checks are the purge hot path. Each push inserts tens of
+**randomly distributed** keys (digest-prefixed, so effectively uniform) — where
+a B-tree is weakest and an LSM absorbs into sequential writes. Bulk deletes
+become cheap tombstones. Block compression matters more than usual, because most
+of the keyspace is valueless edge keys sharing long digest prefixes.
 
-- Reads are point lookups and short ordered prefix scans; prefix-*existence*
-  checks are the purge hot path.
-- Writes are rare relative to reads, but each push inserts tens of **randomly
-  distributed** keys (digest-prefixed, so effectively uniform).
-- Purge does bulk deletes.
-
-Random-key insert at volume is where a B-tree is weakest: page splits and write
-amplification across a multi-terabyte tree. An LSM absorbs those into sequential
-writes. Bulk deletes become cheap tombstones. And block compression matters more
-here than usual, because most of the keyspace is valueless edge keys sharing long
-digest prefixes.
-
-### Sizing — measured
-
-The one-key-per-edge rule trades O(N) write amplification for O(E) space, where E
-is the number of reference edges. That is the right trade — space is cheap,
-rewriting a 360 MB value per push is not — but E is large.
-
-Measured on 20 M synthetic edge keys (`research/R3` §6): 79 B/key raw →
-**53.12 B/key with no compression at all**, purely from RocksDB's block key
-delta encoding, → **42.00 B/key** with zstd and 16 KiB blocks. Delta encoding
-does more work here than compression does, which is what you would hope given
-that edge keys share long digest prefixes.
+**Sizing — measured.** On 20 M synthetic edge keys: 79 B/key raw → **53.12 B
+with no compression at all**, purely from RocksDB's block key delta encoding →
+**42.00 B** with zstd and 16 KiB blocks. Delta encoding does more work here than
+compression does.
 
 **The dominant unknown is not a knob — it is the blob fan-out distribution.**
-At the same 20 M keys, varying references per blob: 1 → 78.24 B/key (a 1 %
-saving; delta encoding has nothing to bite on), 2 → 55.55, 10 → 42.00,
-100 → 39.41. So aggregate `R` size is governed by how widely blobs are shared in
-the real corpus, giving a planning range of roughly **800 GB to 1.6 TB**. That
-spread is wider than every tuning option combined. See Risk 2.
+References per blob at the same key count: 1 → 78.24 B/key, 2 → 55.55,
+10 → 42.00, 100 → 39.41. So `R` is governed by how widely blobs are shared in
+the real corpus: a planning range of **800 GB to 1.6 TB**, wider than every
+tuning option combined. See Risk 2.
 
-One idea from R3 worth more than all the tuning: **interning manifest digests to
-a `u32`, as repo names already are, would roughly halve the `R` range.** Not yet
-adopted — it is a schema change with its own costs — but it is the largest single
-lever available.
+**Tuning — settled and applied** in `RocksEngine::open`. The headline:
+**RocksDB's default `filter_policy` is `nullptr`** (`table.h:590`), so before
+this the engine had no bloom filters at all.
 
-### Tuning — settled, see `research/R3`
-
-Applied in `RocksEngine::open`. The headline: **RocksDB's default
-`filter_policy` is `nullptr`** (`table.h:590`), so before this the engine had no
-bloom filters at all.
-
-- **Custom `SliceTransform` (`"summ.prefix.v1"`).** The prefix-consistency
-  property RocksDB demands *is* satisfied by a variable-length transform,
-  because the bytes deciding the length — the type byte, and for digest-bearing
-  keys the algorithm byte — are themselves inside the prefix. Proved and verified
-  experimentally. There are **six** prefix lengths, not the four first assumed:
-  1, 5, 34, 38, 66, 70.
-- **Measured: 118 829 → 735 796 negative `exists_prefix`/s, a 6.2× win** on the
-  purge hot path, and the prefix filter costs **10× less space** than a
-  whole-key filter (0.125 vs 1.25 B/key) because it holds one entry per group.
+- **Custom `SliceTransform` (`summ.prefix.v2`).** RocksDB's prefix-consistency
+  property *is* satisfied by a variable-length transform, because the bytes
+  deciding the length — the type byte, and for digest-bearing keys the algorithm
+  byte — are themselves inside the prefix. There are **six** prefix lengths, not
+  the four first assumed: 1, 5, 34, 38, 66, 70.
+- **118 829 → 735 796 negative `exists_prefix`/s, a 6.2× win** on the purge hot
+  path, and the prefix filter costs **10× less space** than a whole-key filter
+  (0.125 vs 1.25 B/key), holding one entry per group.
 - **Whole-key blooms do nothing for `exists_prefix`** — it is a seek, not a
-  point lookup. Kept anyway for `get`.
-- **16 KiB blocks** shrink the index ~4× (a projected 11.2 GB → 2.9 GB) for the
-  same data size. That, not compression, is the reason to raise it.
-- **Explicit 512 MiB LRU block cache** — RocksDB's default is 32 MiB.
-- **Rejected:** `optimize_for_point_lookup` (silently replaces the table factory
-  and cache), `optimize_filters_for_hits` (drops exactly the filters purge
-  needs), universal compaction, zstd dictionaries (measured *worse*), and
-  column families. Cross-CF `WriteBatch` **is** atomic — verified by 12 rounds of
-  SIGKILL during ~7000 three-CF batches, zero torn — so CFs were viable, but
-  there is no merged cross-CF iterator and they leak a RocksDB concept into
-  `MetaOp` and the replication log for nothing the transform does not already
-  give.
-- `auto_prefix_mode` is unusable: not exposed by the binding, and carries a
-  documented `BUG:` in 11.8.1.
+  point lookup. Kept for `get`.
+- **16 KiB blocks** shrink the index ~4× (11.2 GB → 2.9 GB projected); that, not
+  compression, is the reason to raise it. **512 MiB LRU block cache** — the
+  default is 32 MiB.
+- **Rejected:** `optimize_for_point_lookup`, `optimize_filters_for_hits` (drops
+  exactly the filters purge needs), universal compaction, zstd dictionaries
+  (measured *worse*), and column families — cross-CF `WriteBatch` **is** atomic
+  (12 rounds of SIGKILL during ~7000 three-CF batches, zero torn), but there is
+  no merged cross-CF iterator and they leak a RocksDB concept into `MetaOp` and
+  the replication log for nothing the transform does not already give.
+  `auto_prefix_mode` is unusable: not exposed by the binding, documented `BUG:`
+  in 11.8.1.
 
-### redb
+**Interning manifest digests to a `u32`**, as repo names already are, would
+roughly halve the `R` range — a bigger win than every tuning knob combined. Not
+adopted; it is a schema change with its own costs, and wants its own measurement.
 
-Kept as a second `MetaEngine` implementation, not as a fallback plan. The whole
-integration suite runs against both, which is what keeps the trait honest and the
-decision genuinely reversible. If it ever becomes a maintenance drag, delete it —
-the tests are the asset, not the engine.
+**redb** is a second `MetaEngine` implementation, not a fallback. The whole
+integration suite runs against both, which keeps the trait honest and the
+decision reversible. If it becomes a drag, delete it — the tests are the asset.
 
 ## Blob storage — what to take from distribution
 
 **Take the content-addressed blob store. Reject the link structure.**
 
-distribution's on-disk layout (`registry/storage/paths.go`) is two things fused
-together: a content-addressed blob store, and a set of *link files* — tiny files
-whose paths encode repo→blob membership, tag→manifest, and manifest revisions.
+distribution fuses two things in `registry/storage/paths.go`: a content-addressed
+store, and *link files* whose paths encode repo→blob membership, tag→manifest
+and revisions. Those exist because **distribution has no metadata database** —
+it encodes relationships as paths so it can run on S3 alone. We have RocksDB,
+where they live as `P`, `R`, `T` and `G`. Reproducing them on disk means two
+sources of truth that silently diverge, and it is exactly what makes
+distribution's GC a full storage-tree walk and its catalog a recursive directory
+listing — LIST storms on S3. Slow catalog and list operations are the reason
+this project exists.
 
-The link files exist because **distribution has no metadata database**. It encodes
-relationships as filesystem paths so it can run against S3 alone. We have
-RocksDB, where those relationships already live as `P`, `R`, `T`, and `G` keys.
-Reproducing them on disk would mean two sources of truth that can silently
-diverge — and it is precisely what makes distribution's GC a full storage-tree
-walk and its catalog a recursive directory listing. On S3 those become LIST
-storms. Slow catalog and list operations are the reason this project exists;
-inheriting their cause would be self-defeating.
+So: a pure content-addressed store with **no directory structure that carries
+meaning**, `digest → bytes`. That keeps the driver trait small, which is what
+makes an S3 driver clean later. Four deliberate deviations:
 
-So blob storage becomes a pure content-addressed object store with **no directory
-structure that carries meaning**: `digest → bytes`, nothing else. That keeps the
-driver trait small, which is what makes an S3 driver clean later.
-
-Four deliberate deviations:
-
-0. **The blob store is Unix-only.** `pread`/`pwrite` via
-   `std::os::unix::fs::FileExt`, which is what R2 argues for over
-   seek-then-read. Not a limitation worth removing — Linux is the deployment
-   target and macOS the development one — but it is a real constraint that was
-   not written down before.
-
-1. **Deeper fan-out, no per-blob directory.** distribution uses
-   `blobs/sha256/ab/<full-hex>/data` — 2 hex chars, so 256 first-level buckets,
-   which at 10⁸ blobs is ~400K subdirectories each; and the per-blob directory
-   doubles inode count to hold one file. Use `blobs/sha256/ab/cd/ef/<full-hex>`:
-   three levels of two hex chars is 16.7M buckets, ~6 blobs per directory at 10⁸,
-   and the file *is* the blob. On S3 the prefix depth is irrelevant, but keeping
-   one layout across drivers costs nothing.
-
-2. **Model `commit_upload`, not `move`.** distribution's driver trait exposes
-   `Move`, which on S3 is a lie — there is no rename, so it degrades to
-   copy-then-delete, and copying a multi-gigabyte layer to commit it is
-   pathological. Instead the driver should expose "commit this upload as this
-   digest" and implement it natively: the filesystem driver renames (atomic), the
-   S3 driver completes a multipart upload straight at the final key. This is the
-   single most important trait-design lesson to take from distribution, and it is
-   a lesson by counter-example.
-
-3. **Upload session state lives in RocksDB, not on disk.** distribution keeps
-   `_uploads/<id>/startedat` as a file to expire abandoned uploads. We have
-   `UploadSession` under `U` keys, which is cheaper to scan and already
+0. **Unix-only.** `pread`/`pwrite` via `std::os::unix::fs::FileExt`, per R2.
+   Linux is the deployment target, macOS the development one.
+1. **Deeper fan-out, no per-blob directory.** distribution's
+   `blobs/sha256/ab/<hex>/data` is 256 first-level buckets (~400K subdirectories
+   each at 10⁸ blobs) and the per-blob directory doubles inode count to hold one
+   file. Use `blobs/sha256/ab/cd/ef/<hex>`: 16.7M buckets, ~6 blobs each, and
+   the file *is* the blob.
+2. **Model `commit_upload`, not `move`.** distribution's `Move` is a lie on S3 —
+   no rename, so it degrades to copy-then-delete, and copying a multi-gigabyte
+   layer to commit it is pathological. The driver says "commit this upload as
+   this digest": the filesystem renames, an S3 driver completes a multipart
+   upload straight at the final key. **The most important trait-design lesson
+   from distribution, and it is a lesson by counter-example.**
+3. **Upload session state lives in RocksDB**, under `U` keys — cheaper to scan
+   than distribution's `_uploads/<id>/startedat` files, and already
    transactional with everything else.
-
-4. **Resumable hashing does port.** distribution serialises hasher state to
-   `hashstates/<algo>/<offset>` so a resumed chunked upload need not rehash from
-   zero, relying on Go's `encoding.BinaryMarshaler`. Rust has an equivalent:
-   `crypto-common` 0.2 exposes `hazmat::SerializableState`, and `sha2` 0.11
-   implements it for both `Sha256VarCore` and `Sha512VarCore` (verified by
-   experiment: state serialises to **104 bytes** for sha256 and **208 bytes**
-   for sha512, and a hasher rehydrated from it produces a digest identical to
-   the uninterrupted one).
-
-   This is better than distribution's arrangement, because 104 bytes fits
-   directly in the `UploadSession` record under the `U` key rather than needing
-   its own files on the storage driver. An interrupted chunked upload can then
-   resume on any process, which removes what would otherwise have been an HA
-   constraint. Note it requires `sha2` 0.11+; the trait does not exist in the
-   0.10 line. The trait is in a `hazmat` module and the serialised state is
-   sensitive - it must not be exposed outside the metadata store.
+4. **Resumable hashing ports.** `crypto-common` 0.2's `hazmat::SerializableState`,
+   implemented by `sha2` 0.11: **104 bytes** for sha256, 208 for sha512, and a
+   rehydrated hasher gives an identical digest. Better than distribution's
+   arrangement because it fits in the `UploadSession` record rather than needing
+   files on the storage driver — so an interrupted chunked upload resumes on any
+   process, removing what would be an HA constraint. Needs `sha2` 0.11+; the
+   trait does not exist in 0.10. The state is sensitive and must not escape the
+   metadata store.
 
 ### Crash consistency
 
@@ -527,223 +352,46 @@ first; the metadata batch is the commit point.** A blob with no metadata is
 harmless garbage that purge reclaims. Metadata referencing a missing blob is
 corruption that surfaces as a failed pull. Never the reverse.
 
-
 ## Replication and the WAL
 
-Planned direction: a write-ahead log for metadata, shipped to replicas.
+`WriteBatch` is already the log: a serialisable, self-contained description of a
+change. A WAL means persisting each batch alongside applying it, with no change
+to callers. What makes that work is that batches contain only `Put`, `Delete`
+and `DeletePrefix` — no read-modify-write anywhere, because the schema has no
+fan-in vectors needing one. Had we kept the prototype's `merge`, replay would
+have required exactly-once delivery.
 
-`WriteBatch` is already that log. It is a serialisable, self-contained
-description of a change, and adding a WAL means persisting each batch to a log
-alongside applying it — no change to callers.
+**One correction to an earlier, too-strong claim.** `Put` and `Delete` are
+self-contained; `DeletePrefix` is not — its blast radius depends on what is in
+the store when applied. So the log is safe to replay **in order, from a
+consistent point**, and an overlapping suffix replayed in order converges. It is
+*not* safe under arbitrary reordering, nor against a store a second writer is
+mutating outside the log. Do not call these batches simply "idempotent" without
+that qualifier; the WAL design must guarantee ordered replay.
 
-The property that makes this work is that batches contain only `Put`, `Delete`,
-and `DeletePrefix`. There is no read-modify-write anywhere, because the schema
-has no fan-in vectors that would need one. Had we kept the prototype's `merge`
-primitive, replay would have required exactly-once delivery — a far harder
-problem.
+The two constraints that protect this — no side-channel writes, no
+non-deterministic content in a batch — are in CLAUDE.md.
 
-**One correction to an earlier, too-strong claim here.** `Put` and `Delete` are
-self-contained: their effect is fully determined by the batch's own content.
-`DeletePrefix` is not — its blast radius depends on what happens to be in the
-store when it is applied. So a log of these batches is safe to replay **in
-order, from a consistent point**, and replaying an overlapping suffix in order
-converges. It is *not* safe under arbitrary reordering, nor against a store that
-a second writer is mutating outside the log. Do not describe the batches as
-simply "idempotent" without that qualifier; the WAL design must guarantee
-ordered replay.
-
-Two constraints to preserve, both already in CLAUDE.md:
-
-- No side-channel writes. Anything that bypasses `WriteBatch` is invisible to
-  the log and will silently diverge replicas.
-- No non-deterministic content in a batch. No timestamps generated at apply
-  time, no random ids minted inside the engine — the caller supplies them, so
-  the batch means the same thing wherever it is replayed.
-
-Blobs need no WAL: they are content-addressed and immutable, so replication is
-plain copy, or shared object storage.
+Blobs need no WAL: content-addressed and immutable, so replication is plain
+copy, or shared object storage.
 
 ## Analytics — pull counts and tag history
 
-Both are wanted, both are later-phase features, and neither is designed here.
-What this section settles is the narrower question: **can the key schema hold
-them at all, without a redesign when the time comes?** It can, and the working
-below is a feasibility sketch rather than a specification — key shapes, the
-constraints they have to respect, and the places where a choice would be
-expensive to reverse. The endpoints, the retention policy, and the aggregation
-details are all open, and should be designed properly when the feature is
-actually scheduled.
+Wanted, later-phase (package J), **not designed yet**. The `A`, `H` and `J`
+ranges already have key builders, value types and prefix groups, so the schema
+will not move when the feature is scheduled; nothing writes to them.
 
-### The invariant this has to survive
+The feasibility argument — why a counter works with no `merge` and no
+read-modify-write, the key shapes, and what it costs the engine — is in
+**`design/analytics.md`**. Read it before starting package J. Three conclusions
+that constrain other work:
 
-A counter is a read-modify-write, and there is no read-modify-write anywhere in
-this design: no `merge`, no side-channel writes, and every batch must mean the
-same thing wherever it is replayed. The resolution is to **aggregate in memory
-and persist absolute values**:
-
-- The pull path pushes `(repo, digest, kind)` onto a bounded in-process queue and
-  returns. It never touches the store, never blocks, and **drops events when the
-  queue is full** — a pull must not slow down, and must never fail, for a counter.
-- One background worker owns the aggregate. It holds `(scope, day) -> counts` in a
-  map, seeding an entry from the store with a single `get` the first time it
-  touches that entry after start-up.
-- Each flush interval it emits **one `WriteBatch` of plain `Put`s carrying the
-  current absolute value**. No merge, no delta, deterministic content, safe to
-  replay, and O(dirty buckets) rather than O(pulls).
-
-So the analytics feature needs no new engine primitive at all. What it needs is a
-writer that is allowed to hold state in RAM, which the `MetaEngine` contract has
-never forbidden.
-
-Two consequences to accept out loud:
-
-- **Pull counts are best-effort.** A crash loses up to one flush interval; a full
-  queue loses the peak of a spike. They are a popularity signal for an operator,
-  not billing data. The API should say so rather than implying exactness.
-- **Tag history is not best-effort**, and does not go through this pipeline at
-  all. See below.
-
-### Tag history — transactional, and shaped by the spec that may arrive
-
-`opencontainers/distribution-spec#606` proposes
-`GET /v2/<name>/_oci/tag-history/<reference>`: descending chronological order,
-`n` / `before` / `since` query parameters, and a response that is an OCI image
-index whose entries carry `org.opencontainers.distribution.tag.timestamp` and
-`.tag.event` (`created` | `deleted`) annotations. It is unmerged and the data
-model is still argued over, but the *storage* requirement it implies is stable,
-and one key range serves it:
-
-```
-H <repo> <tag> 0x00 <!timestamp:8> <digest>  ->  TagEvent { event, media_type, size }
-```
-
-Five things are doing work in that key:
-
-- **`0x00` is the separator.** Tag names match `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`
-  (`distribution-spec/spec.md:160`), so NUL cannot occur in one, and it sorts
-  below every legal tag byte. Without it a scan of tag `foo` would also sweep up
-  `foobar`'s history. `T <repo> <tag>` needs no such separator only because the
-  tag is terminal there.
-- **The timestamp is stored complemented** (`!ts`), so newest sorts first.
-  The spec wants descending order and `MetaEngine` has only a forward `scan` —
-  there is no reverse iterator in the trait, and adding one to both engines to
-  serve one endpoint is not worth it. Complementing costs nothing.
-- **`before` and `since` are then just `start_after`.** The spec's cursor model
-  falls straight out of the key encoding: `before=T` is a seek to
-  `H <repo> <tag> 0x00 !T`. There is no cursor token to invent and nothing to
-  keep consistent between pages.
-- **The digest is in the key, not only in the value**, because it is the
-  collision breaker. Simultaneous events sharing a timestamp is the open
-  objection on the PR; two events on one tag at the same instant with the same
-  digest are the same event, so putting the digest in the key closes it without a
-  sequence counter.
-- **The descriptor is denormalised into the value**, exactly as `F` /
-  `ReferrerRecord` already is. Not for speed: the spec requires history to remain
-  queryable after the manifest is deleted, so `M <repo> <digest>` may no longer
-  exist to look it up in. This is bounded fan-out — one event's own descriptor —
-  so it does not violate the no-growing-values rule.
-
-These events are written **in the same `WriteBatch` as the tag mutation itself**,
-never through the analytics queue. A dropped history record is a hole in an audit
-trail; a dropped pull count is a rounding error. Retagging writes one `created`
-event, per the PR; an explicit tag delete writes one `deleted` event carrying the
-digest that was displaced, which `T <repo> <tag>` supplies at that moment.
-
-`<reference>` in that endpoint is a tag **or a digest**, and the digest form is
-also the question the UI wants to ask ("what was this manifest ever tagged, and
-when"). It needs the other direction:
-
-```
-J <repo> <digest> <!timestamp:8> <tag>  ->  TagEvent
-```
-
-One extra key per tag event. Whether to write both directions from the start, or
-only `H` and accept that the digest form arrives later without back-history, is a
-question for the feature design — worth noting only because it is the kind of
-choice that is cheap up front and awkward afterwards.
-
-### Pull counts — day buckets, one key per bucket
-
-```
-A <scope> <...> <day:2> <shard:2>  ->  CounterBucket { manifest_pulls, blob_pulls, bytes_out }
-```
-
-Three scopes, all written by the same worker in the same flush:
-
-| Key | Answers |
-|---|---|
-| `A m <repo> <digest> <day> <shard>` | the per-manifest wall — the headline feature |
-| `A t <repo> <tag> 0x00 <day> <shard>` | which tags people actually pull |
-| `A r <repo> <day> <shard>` | repo totals |
-
-- **`day` is a big-endian `u16` of days since the Unix epoch, in UTC** (good to
-  2149). The bucket boundary is fixed at write time. The UI may relabel to a local
-  zone, but it must not re-bucket, or the same wall changes shape depending on who
-  is looking at it.
-- **The contribution-wall query is a single bounded scan.** 53 weeks is 371
-  buckets, so the entire visualisation is
-  `scan(A m <repo> <digest>, start_after = <cutoff day - 1>, limit = 371)`,
-  arriving in chronological order, with the handler zero-filling the gaps. No
-  pagination, no read-time aggregation, no unbounded set — the one query the
-  feature exists for is also the cheapest thing in the store.
-- **Every granularity you intend to query must be maintained on write.** Rolling
-  repo totals up out of per-manifest buckets would be a scan across up to 10M
-  manifests: an unbounded scan wearing a summary's clothing. Three scopes cost
-  three extra `Put`s per flush; discovering the rollup is impossible costs a
-  rewrite.
-- **The value is a struct, not a bare `u64`.** Bytes served and blob pulls are
-  wanted next to the pull count, and a second metric must not mean a second key
-  range. Note this makes the analytics values the first records likely to *gain*
-  fields later, which is the concrete argument for landing R4's `DBVersion` key
-  and migration hook before this rather than after: postcard is not
-  self-describing and will not decode a record written before a field was added.
-- **`<shard>` is reserved for the writing node's id**, `0` on a single node. Two
-  nodes each writing an absolute value for the same bucket is last-write-wins,
-  which is silent undercounting rather than a visible failure. The topology
-  decision is "single node, but keep HA viable"; reserving two bytes now is free,
-  and adding a key component to a populated store is a migration.
-- **No raw per-pull event log.** It is the only structure here that would grow
-  with traffic rather than with content, and it buys only the ability to re-bucket
-  retroactively — not worth it for a number already declared approximate.
-
-**What counts as a pull**, decided once so the numbers mean something:
-
-- `GET /v2/<name>/manifests/<ref>` is the pull event. `HEAD` is not — containerd
-  issues `HEAD` then `GET` on every cold pull (R5), so counting both doubles every
-  number.
-- Pulling a multi-platform image issues two manifest `GET`s, the index and the
-  chosen child. Count each against itself: the index's wall is "how often was this
-  image pulled", and the children's walls are the platform split. That falls out
-  of the rule rather than needing a special case.
-- Blob `GET`s increment `blob_pulls` and `bytes_out` on the repo scope only.
-  Attributing a shared layer's bytes to one manifest would be a lie, and the
-  fan-in needed to do it honestly is `R`, which is a scan.
-
-Rejected alternative: one key per manifest-year holding a 365-entry array. Fewer
-keys, but it rewrites ~730 bytes on every flush, keeps every version alive until
-compaction, and makes retention all-or-nothing. Per-day keys delta-encode almost
-perfectly — consecutive days for one manifest differ only in the last bytes —
-which is the case R3 measured at 42 B/key.
-
-### What this costs the engine
-
-- **New prefix groups in `summ_prefix_len`, and the extractor bumps to
-  `summ.prefix.v2`.** `A <scope> <repo> <digest>` groups at 39 or 71 bytes,
-  `A <scope> <repo>` at 6, and `H` / `J` at `<prefix> <repo>` = 5, alongside
-  `M`/`B`/`T`/`P`. Prefix consistency still holds by the existing argument: every
-  byte that decides the length — the type byte, the new scope byte, the digest
-  algorithm byte — is itself inside the prefix. Land these together with the
-  pending R4 changes so the extractor name moves once rather than three times.
-- **Retention becomes something that exists.** Every other key range is bounded by
-  current state; `A`, `H` and `J` are bounded only by time. Proposal: 400 days of
-  `A m` and `A t` (a year of wall plus slack), `A r` kept indefinitely because it
-  is tiny, and `H` / `J` trimmed only when the repo is deleted, which is what #606
-  permits. Enforcement belongs to the purge sweep, which already walks the store.
-- **Purge gains prefix deletes, no new machinery.** Dropping a manifest drops
-  `A m <repo> <digest>`; dropping a repo drops all of `A`, `H` and `J` under that
-  repo. All clean prefixes, so `DeletePrefix` covers them.
+- **Pull counts are best-effort** (bounded in-process queue, dropped on
+  overflow, absolute values flushed periodically). The API must say so.
+- **Tag history is not**, and skips that pipeline — its events are written in
+  the same `WriteBatch` as the tag mutation.
 - **Nothing changes in `MetaEngine`.** No merge operator, no reverse scan, no new
-  op in `MetaOp`. That is the test this design had to pass.
+  `MetaOp`. That is the test the design had to pass.
 
 ## Risks
 
@@ -828,12 +476,11 @@ manifest and descriptor types. `oci-client` 0.17.0 is worth having in dev
 dependencies for tests and the bench harness, not in the server. Detail and the
 rejected alternatives are in `research/R5`.
 
-## Schema changes from `research/R4` — **applied**
+## Open questions and deferred work
 
-Found by reviewing zot and Harbor, and deliberately batched so the key schema
-moved once rather than three times. Applied together now that R1 (spec) and R3
-(RocksDB tuning) have landed; the prefix extractor moved to `summ.prefix.v2` in
-the same pass, exactly once. Kept here as the record of what changed and why.
+The `research/R4` schema batch is applied; the record of what changed and why is
+in **`design/applied-schema-changes.md`**. What is still open from it, and what
+implementation has since turned up, is below.
 
 **Deferred, deliberately:**
 
@@ -903,44 +550,6 @@ the same pass, exactly once. Kept here as the record of what changed and why.
   exists, and `Digest` can only name one after the fact. It belongs beside
   `Digest`.
 
-The original list follows.
-
-- **`F` must carry a value.** The referrers response is an image index whose
-  entries require `artifactType` and `annotations`, and `?artifactType=`
-  filters on them. `F` is valueless and `ManifestRecord` has neither field, so
-  **a spec-compliant referrers response cannot be built from the current schema
-  at all.** Give `F` a `ReferrerRecord { media_type, artifact_type, size,
-  annotations }`. That is bounded fan-out — one referrer's own descriptor — so it
-  does not violate the no-growing-values rule, and it turns the endpoint into a
-  single ordered prefix scan with the filter applied during it. Harbor
-  denormalises identically onto `artifact_accessory`; two independent systems
-  landing on the same shape is a strong signal.
-- **Synthesise `F` edges for legacy cosign tags** (`^sha256-<hex>\.(sig|sbom|att)$`).
-  Otherwise deleting a subject manifest leaves the signature tag dangling
-  forever with its layers pinned by `R`, and purge — which keys entirely off "is
-  it tagged?" — never reclaims it. A leak, not a correctness bug, but silent.
-- **`P` gains `{size, added_at}`** — the grace clock for expiring
-  uploaded-but-unreferenced blobs has nowhere to live today.
-- **`ManifestRecord` gains `pushed_at`, `artifact_type`, `annotations`; `T`
-  gains `tagged_at`.** No timestamps anywhere means no retention story.
-- **`UploadSession` gains the serialised hasher state** (104 bytes, see Blob
-  storage) **and S3 multipart identifiers.**
-- **Purge must treat any `RepoId` referenced by a live `U` session as live**,
-  or it can retire an interner entry an in-flight upload still holds.
-- **`DeletePrefix` is the wrong primitive for a single blob's edge range** (it
-  is ~10 keys) — point-delete them instead, which also strengthens the case for
-  `scan_keys`.
-- **Consider interning manifest digests to a `u32`.** R3 measures this as
-  roughly halving the `R` keyspace — a bigger space win than every tuning knob
-  combined.
-- **Add the analytics ranges `A`, `H` and `J`** in the same pass, and bump the
-  prefix extractor to `summ.prefix.v2` once. Full rationale under **Analytics**;
-  the point of batching them here is that the extractor name should move exactly
-  once.
-- **`MetaEngine` gains `scan_keys`** (or `Page` becomes value-optional) — purge
-  scans millions of valueless edge keys and currently allocates an empty `Vec`
-  per row.
-
 Two rules to write down while they are fresh:
 
 - **Never hold a repo-scoped lock across a request-body read.** zot's
@@ -954,23 +563,19 @@ Two rules to write down while they are fresh:
 
 ## Research status
 
-Settled, with the finding recorded above: metadata engine (RocksDB), blob
-storage layout, resumable upload hashing, online-vs-offline purge.
+**R1–R6 are all done** and their findings are folded into the sections above.
+Read a file when you need the working behind a decision, not before.
 
-Still outstanding, most blocking first:
+| File | Question |
+|---|---|
+| `research/R1-spec-conformance.md` | What must summ implement to pass conformance? |
+| `research/R2-zero-copy-serving.md` | How should blob bytes reach the socket? *(Do not zero-copy.)* |
+| `research/R3-rocksdb-tuning.md` | Prefix bloom filters given six prefix lengths |
+| `research/R4-zot-prior-art.md` | What has zot already solved? |
+| `research/R5-clients-and-ecosystem.md` | What does the real client do? Plus the Rust ecosystem survey (R6). |
 
-| # | Topic | Blocks | Why it is not obvious |
-|---|---|---|---|
-| ~~R1~~ | ~~Spec + conformance~~ — **done**, `research/R1-spec-conformance.md` | ~~Phase 1~~ | The endpoint list is the easy part. The sharp edges are the error-code taxonomy, `Docker-Content-Digest`, chunked-upload `Content-Range` validation and out-of-order rejection, cross-repo mount, pagination `Link` headers, content negotiation, and the referrers fallback tag schema. Guessing these means failing conformance late. |
-| ~~R2~~ | ~~Zero-copy blob serving~~ — **done**, `research/R2-zero-copy-serving.md`; answer: do not. `sendfile` via `spawn_blocking` vs `io_uring`/`tokio-uring` maturity vs plain `tokio::fs` streaming; plus Range handling. | Phase 3 | This is where "very fast" is won. `../container-registry/notes/fs_limit.md` shows large pulls are network-saturated at ~1.56 GB/s, so the goal is near-zero CPU per byte, spending the headroom on concurrency. |
-| ~~R3~~ | ~~RocksDB tuning~~ — **done and applied**, `research/R3-rocksdb-tuning.md` | ~~Phase 2~~ | Prefix bloom filters are the biggest available win for `exists_prefix`, the purge hot path, but our prefixes come in four lengths (1, 5, 34, 66 bytes) and a fixed transform fits one. Column families would also let manifest bodies be tuned separately from small records. |
-| ~~R4~~ | ~~zot prior art~~ — **done**, `research/R4-zot-prior-art.md` | ~~Packages C, E~~ | The closest prior art: a real registry with an embedded metadata store and a working S3 driver. Our schema is settled, so this is a cross-check for things we have missed — referrers handling, signature/attestation artifacts — and a second opinion on the driver trait. |
-| ~~R5~~ | ~~Client behaviour + Rust ecosystem~~ — **done**, `research/R5-clients-and-ecosystem.md`. | Phase 3 | Determines what to optimise: request ordering, concurrency, whether it reuses connections, how it handles 206s. Optimising for a synthetic client is a way to win a benchmark and lose in production. |
-| ~~R6~~ | ~~Rust ecosystem survey~~ — **done**, folded into `research/R5` Part B. | — | — |
-
-Not research, but open and worth closing:
-
-- **Aggregate manifest count** (Risk 2) — the per-axis bounds do not size the store.
+Open, not research: **aggregate manifest count** (Risk 2) — the per-axis bounds
+do not size the store.
 
 ## Reference material (sibling directories)
 
