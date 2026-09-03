@@ -61,14 +61,6 @@ pub enum Engine {
     Redb,
 }
 
-/// How many referrers one `GET /v2/<name>/referrers/<digest>` will scan.
-///
-/// The endpoint has no pagination in the spec, so the bound has to come from
-/// somewhere; the alternative is an unbounded scan, which is the one shape this
-/// design forbids. A subject with more referrers than this is a signature farm,
-/// and truncating is better than either a timeout or an OOM.
-const REFERRERS_LIMIT: usize = 1000;
-
 /// How many keys one turn of a bounded count reads.
 ///
 /// A count runs to [`COUNT_CEILING`] in steps of this, rather than asking the
@@ -837,30 +829,49 @@ impl Registry for Backend {
 
     // ---- referrers -------------------------------------------------------
 
+    /// Off the reactor, like the discovery folds and unlike the point lookups.
+    ///
+    /// A page here is a prefix scan plus one postcard decode per edge, which is
+    /// the shape [`Backend::scan`] exists for: the inline-read bet is that a
+    /// block-cache hit beats a `spawn_blocking` round trip, and it is a bet
+    /// about a single lookup, not about a thousand of them.
     async fn referrers(
         &self,
         name: &str,
         subject: &Digest,
         artifact_type: Option<&str>,
+        last: Option<&Digest>,
+        limit: usize,
     ) -> OpsResult<Referrers> {
-        let list = self
-            .ops
-            .referrers(name, subject, artifact_type, None, REFERRERS_LIMIT)
-            .map_err(ops_error)?;
-        Ok(Referrers {
-            manifests: list
-                .entries
-                .into_iter()
-                .map(|entry| Descriptor {
-                    media_type: entry.record.media_type,
-                    digest: entry.digest,
-                    size: entry.record.size,
-                    artifact_type: entry.record.artifact_type,
-                    annotations: entry.record.annotations,
-                })
-                .collect(),
-            filter_applied: list.filter_applied,
+        let name = name.to_owned();
+        let subject = *subject;
+        let artifact_type = artifact_type.map(str::to_owned);
+        let last = last.copied();
+        self.scan(move |ops| {
+            let list = ops.referrers(
+                &name,
+                &subject,
+                artifact_type.as_deref(),
+                last.as_ref(),
+                limit,
+            )?;
+            Ok(Referrers {
+                manifests: list
+                    .entries
+                    .into_iter()
+                    .map(|entry| Descriptor {
+                        media_type: entry.record.media_type,
+                        digest: entry.digest,
+                        size: entry.record.size,
+                        artifact_type: entry.record.artifact_type,
+                        annotations: entry.record.annotations,
+                    })
+                    .collect(),
+                filter_applied: list.filter_applied,
+                next: list.next,
+            })
         })
+        .await
     }
 
     // ---- discovery beyond the spec ---------------------------------------

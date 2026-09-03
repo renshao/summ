@@ -1295,9 +1295,19 @@ async fn a_mount_succeeds_or_degrades_to_a_session() {
 
 // -------------------------------------------------------------- referrers --
 
+/// The switch off, which is not the same registry as one that never had the
+/// API: a `404` here is the client's instruction to use the referrers tag
+/// schema instead, so it has to stay reachable.
+fn referrers_disabled() -> Harness {
+    Harness::with_config(ServerConfig {
+        referrers_enabled: false,
+        ..ServerConfig::default()
+    })
+}
+
 #[tokio::test]
 async fn referrers_is_404_while_disabled_but_still_validates_the_digest() {
-    let h = Harness::new();
+    let h = referrers_disabled();
     let subject = sha256_hex(b"subject");
     let reply = h.get(&format!("/v2/demo/app/referrers/{subject}")).await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
@@ -1310,10 +1320,7 @@ async fn referrers_is_404_while_disabled_but_still_validates_the_digest() {
 
 #[tokio::test]
 async fn referrers_never_404s_once_enabled() {
-    let h = Harness::with_config(ServerConfig {
-        referrers_enabled: true,
-        ..ServerConfig::default()
-    });
+    let h = Harness::new();
     let unknown = sha256_hex(b"a subject nobody pushed");
 
     // Unknown subject *and* unknown repository: still `200` with an empty list.
@@ -1331,10 +1338,7 @@ async fn referrers_never_404s_once_enabled() {
 
 #[tokio::test]
 async fn referrers_lists_and_filters() {
-    let h = Harness::with_config(ServerConfig {
-        referrers_enabled: true,
-        ..ServerConfig::default()
-    });
+    let h = Harness::new();
     let subject_digest =
         h.registry
             .seed_manifest("demo/app", Some("v1"), IMAGE_MANIFEST, b"{\"subject\":1}");
@@ -1371,4 +1375,188 @@ async fn referrers_lists_and_filters() {
     assert_eq!(manifests[0]["artifactType"], "application/sig");
     assert_eq!(manifests[0]["digest"], sig.to_string());
     assert_eq!(filtered.header("oci-filters-applied"), Some("artifactType"));
+}
+
+#[tokio::test]
+async fn referrers_page_and_link_to_the_next_page() {
+    let h = Harness::with_config(ServerConfig {
+        default_page_size: 2,
+        max_page_size: 2,
+        ..ServerConfig::default()
+    });
+    let subject =
+        h.registry
+            .seed_manifest("demo/app", Some("v1"), IMAGE_MANIFEST, b"{\"subject\":1}");
+
+    let mut expected = Vec::new();
+    for i in 0..5 {
+        let digest = h.registry.seed_manifest(
+            "demo/app",
+            None,
+            IMAGE_MANIFEST,
+            format!("{{\"n\":{i}}}").as_bytes(),
+        );
+        h.registry
+            .seed_subject("demo/app", &digest, subject, Some("application/sig"));
+        expected.push(digest.to_string());
+    }
+    // The scan is in digest order, not push order.
+    expected.sort();
+
+    let mut seen = Vec::new();
+    let mut url = format!("/v2/demo/app/referrers/{subject}");
+    let mut pages = 0;
+    loop {
+        let reply = h.get(&url).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let manifests = reply.json()["manifests"].as_array().cloned().unwrap();
+        assert!(manifests.len() <= 2, "a page may never exceed the limit");
+        for entry in manifests {
+            seen.push(entry["digest"].as_str().expect("a digest").to_owned());
+        }
+        pages += 1;
+        assert!(pages < 10, "paging did not terminate");
+        match reply.header(header::LINK) {
+            Some(link) => {
+                let target = link
+                    .trim_start_matches('<')
+                    .split('>')
+                    .next()
+                    .expect("a bracketed URL");
+                url = target.to_owned();
+            }
+            None => break,
+        }
+    }
+
+    assert_eq!(seen, expected, "every referrer is returned exactly once");
+    assert_eq!(
+        pages, 3,
+        "5 referrers at 2 a page, and no wasted final page"
+    );
+
+    // `?n=0` is a request for nothing, and must not carry a `Link` on to a page
+    // that would be empty as well.
+    let none = h
+        .get(&format!("/v2/demo/app/referrers/{subject}?n=0"))
+        .await;
+    assert_eq!(none.status, StatusCode::OK);
+    assert_eq!(none.json()["manifests"], serde_json::json!([]));
+    assert_eq!(none.header(header::LINK), None);
+}
+
+#[tokio::test]
+async fn a_filtered_referrers_page_can_be_short_and_still_link_on() {
+    // The filter is applied inside the scan and the cursor advances over the
+    // edges scanned, so a page holding no matches is not the end of the walk.
+    // A `Link` driven by page fullness would stop here and report zero
+    // referrers of a type that does exist.
+    let h = Harness::with_config(ServerConfig {
+        default_page_size: 1,
+        max_page_size: 1,
+        ..ServerConfig::default()
+    });
+    let subject =
+        h.registry
+            .seed_manifest("demo/app", Some("v1"), IMAGE_MANIFEST, b"{\"subject\":1}");
+
+    let mut wanted = None;
+    for i in 0..4 {
+        let digest = h.registry.seed_manifest(
+            "demo/app",
+            None,
+            IMAGE_MANIFEST,
+            format!("{{\"n\":{i}}}").as_bytes(),
+        );
+        // Exactly one referrer carries the type being filtered for.
+        let artifact_type = if i == 3 {
+            "application/sbom"
+        } else {
+            "application/sig"
+        };
+        h.registry
+            .seed_subject("demo/app", &digest, subject, Some(artifact_type));
+        if i == 3 {
+            wanted = Some(digest.to_string());
+        }
+    }
+    let wanted = wanted.expect("seeded");
+
+    let mut url = format!("/v2/demo/app/referrers/{subject}?artifactType=application/sbom");
+    let mut found = None;
+    let mut short_pages = 0;
+    for _ in 0..10 {
+        let reply = h.get(&url).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(
+            reply.header("oci-filters-applied"),
+            Some("artifactType"),
+            "the filter is exact on every page, so it is claimed on every page"
+        );
+        let manifests = reply.json()["manifests"].as_array().cloned().unwrap();
+        if manifests.is_empty() {
+            short_pages += 1;
+        }
+        for entry in manifests {
+            found = Some(entry["digest"].as_str().expect("a digest").to_owned());
+        }
+        match reply.header(header::LINK) {
+            Some(link) => {
+                let target = link
+                    .trim_start_matches('<')
+                    .split('>')
+                    .next()
+                    .expect("a bracketed URL");
+                assert!(
+                    target.contains("artifactType=application%2Fsbom"),
+                    "the link must carry the filter through, got {target}"
+                );
+                url = target.to_owned();
+            }
+            None => break,
+        }
+    }
+
+    assert_eq!(found.as_deref(), Some(wanted.as_str()));
+    assert!(
+        short_pages > 0,
+        "the seeding is only meaningful if some page came back empty"
+    );
+}
+
+#[tokio::test]
+async fn a_referrers_cursor_that_is_not_a_digest_is_a_400() {
+    let h = Harness::new();
+    let subject = sha256_hex(b"subject");
+    h.get(&format!("/v2/demo/app/referrers/{subject}?last=notadigest"))
+        .await
+        .assert_error(StatusCode::BAD_REQUEST, ErrorCode::DigestInvalid);
+    // `?n=` keeps its own error code; the two cursors are not the same thing.
+    h.get(&format!("/v2/demo/app/referrers/{subject}?n=nope"))
+        .await
+        .assert_error(StatusCode::BAD_REQUEST, ErrorCode::PaginationNumberInvalid);
+}
+
+#[tokio::test]
+async fn oci_subject_is_withheld_when_referrers_is_off() {
+    // The header claims the subject was processed, which is only true for a
+    // registry that will list it. Sending it alongside a 404 on `/referrers/`
+    // tells a client the tag-schema fallback is both unnecessary and required.
+    let h = referrers_disabled();
+    let subject = sha256_hex(b"the subject");
+    let body = format!(
+        r#"{{"schemaVersion":2,"mediaType":"{IMAGE_MANIFEST}","artifactType":"application/example","config":{{"mediaType":"application/vnd.oci.empty.v1+json","digest":"{}","size":2}},"layers":[],"subject":{{"mediaType":"{IMAGE_MANIFEST}","digest":"{subject}","size":10}}}}"#,
+        sha256_hex(b"{}")
+    );
+
+    let put = h
+        .request(
+            Method::PUT,
+            "/v2/demo/app/manifests/sig",
+            vec![(header::CONTENT_TYPE.as_str(), IMAGE_MANIFEST.to_owned())],
+            Body::from(body),
+        )
+        .await;
+    assert_eq!(put.status, StatusCode::CREATED, "the push still succeeds");
+    assert_eq!(put.header("oci-subject"), None);
 }

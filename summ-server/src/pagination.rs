@@ -77,6 +77,33 @@ pub fn link_next(path: &str, last: &str, n: usize) -> Option<HeaderValue> {
     HeaderValue::from_str(&value).ok()
 }
 
+/// `Link` for the referrers endpoint, which must carry `artifactType` through.
+///
+/// A `Link` is a complete instruction to fetch the next page, so dropping the
+/// filter would hand the client a second page of a different query - and, worse
+/// than merely wrong, one that arrives without `OCI-Filters-Applied` and so
+/// looks authoritative. Parameters stay in alphabetical order, as in
+/// [`link_next`].
+pub fn link_next_referrers(
+    path: &str,
+    artifact_type: Option<&str>,
+    last: &str,
+    n: usize,
+) -> Option<HeaderValue> {
+    let filter = match artifact_type {
+        Some(t) => format!("artifactType={}&", query::query_escape(t)),
+        None => String::new(),
+    };
+    let value = format!(
+        "<{}?{}last={}&n={}>; rel=\"next\"",
+        path,
+        filter,
+        query::query_escape(last),
+        n
+    );
+    HeaderValue::from_str(&value).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +153,29 @@ mod tests {
         assert_eq!(p.last.as_deref(), Some("v1"));
         let p = parse(&query::pairs("last="), &config()).expect("valid");
         assert_eq!(p.last, None);
+    }
+
+    #[test]
+    fn a_referrers_link_carries_the_filter_through() {
+        let path = "/v2/demo/app/referrers/sha256:aa";
+        let link = link_next_referrers(path, None, "sha256:bb", 100).expect("valid header");
+        assert_eq!(
+            link,
+            "</v2/demo/app/referrers/sha256:aa?last=sha256%3Abb&n=100>; rel=\"next\""
+        );
+
+        let link = link_next_referrers(
+            path,
+            Some("application/vnd.example.sbom.v1"),
+            "sha256:bb",
+            2,
+        )
+        .expect("valid header");
+        assert_eq!(
+            link,
+            "</v2/demo/app/referrers/sha256:aa\
+             ?artifactType=application%2Fvnd.example.sbom.v1&last=sha256%3Abb&n=2>; rel=\"next\""
+        );
     }
 
     #[test]

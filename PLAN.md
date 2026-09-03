@@ -47,7 +47,7 @@ Conformance is the floor, not the ceiling.
 | Metadata engine | **RocksDB**, compiled from source and statically linked | Single binary, no RocksDB install. redb retained as a second implementation to keep the trait honest. |
 | Purge (GC) | Offline for v1 | Registry read-only during sweep. Schema already supports online later — see below. |
 | Digest algorithms | sha256 + sha512 | Tagged enum, algorithm byte in key encoding. |
-| Conformance bar | Core push/pull at Phase 1; referrers by Phase 6 | `distribution-spec/conformance` is the gate. |
+| Conformance bar | Core push/pull at Phase 1; referrers by Phase 6 | `distribution-spec/conformance` is the gate. Referrers landed early and passes; the suite's remaining failures are one sha512 upload bug. |
 | Web UI | Built in, served on the same port, assets embedded in the binary | No separate build or deploy. Constrains the extension API to be genuinely cursor-paged. |
 | Extension API | Core product surface, versioned separately from `/v2/` | Unstandardised, so it carries its own test suite. |
 | summdb | Prototype, not a dependency | Code copied in and reworked. summdb is not maintained once summ takes off. Its UI and stats queries are the starting point for Phase 2b. |
@@ -119,7 +119,7 @@ Two traps worth stating explicitly:
 
 ## Status
 
-`cargo test` — **303 passing**. Every crate in CLAUDE.md's Layout is built, and
+`cargo test` — **310 passing**. Every crate in CLAUDE.md's Layout is built, and
 **the wiring has landed** (package K, `summ-server/src/backend.rs`): `summ
 serve` runs on `summ-registry` over `summ-meta` with `summ-storage` holding the
 bytes. `tests/wiring.rs` drives the same router as `tests/api.rs` against a real
@@ -152,6 +152,21 @@ name-prefix search, a repository page with tags and manifests, and a manifest
 page. Assets are `include_str!`d, so `cargo build` is the whole pipeline and the
 page loads nothing from the network. Verified by hand against a real corpus:
 `oras cp` of alpine, busybox, nginx, postgres and redis, browsed end to end.
+
+**The referrers API is on** (end-12a/12b), which is the one part of Phase 6
+that landed early. The `F` edges have been written since Phase 1, so the work
+was pagination and a switch, not an index: `?n=`/`?last=` over the edge range
+with `Link: rel="next"`, `?artifactType=` filtered inside the scan and claimed
+through `OCI-Filters-Applied`, and `--no-referrers` to turn the endpoint off
+again. Two rules are load-bearing and easy to regress — see **The referrers
+API** below.
+
+**The conformance suite has been run against summ for the first time**, at
+`OCI_VERSION=1.1` per R1's recipe. Every referrers and subject check passes:
+*Referrers*, *Manifest put with subject*, *Artifacts with Subject*, *Index with
+Subject*, *Missing Subject*, *Artifact Index*. Eight failures remain and they
+are all one bug, in the blob upload path and unrelated to this work — see
+**A sha512 blob cannot be pushed without the algorithm hint** below.
 
 **Not built**: purge, conformance harness, analytics writers, Phases 3–6, and
 the rest of the discovery surface (blob fan-in, untagged set, tag history, pull
@@ -196,9 +211,10 @@ exit criterion (conformance push + pull pass) can be attempted. It will need:
 
 Two things R1 moved *into* this phase: **blob range serving is a correctness
 requirement**, not a Phase 3 optimisation; and **write `F` edges from Phase 1**
-even though `/referrers/` stays 404 until Phase 6, because retrofitting them
-costs a full manifest rescan plus a spec-mandated ingest of the fallback tag
-schema.
+even though `/referrers/` was 404 at the time, because retrofitting them costs
+a full manifest rescan plus a spec-mandated ingest of the fallback tag schema.
+That call paid off: enabling the endpoint later cost a page and a switch, with
+no rescan. See **The referrers API**.
 
 **There are two `Content-Range` grammars.** Chunked *upload* uses a bare
 `0-1023` (`^[0-9]+-[0-9]+$`, no `bytes ` prefix, no `/total`) and the `202`
@@ -268,7 +284,53 @@ actually does**.
 ### Phases 4–6
 
 **4** offline purge exploiting `R` and `G`. **5** storage driver abstraction +
-S3, chunked upload → multipart. **6** referrers, auth, full conformance.
+S3, chunked upload → multipart. **6** auth and full conformance — **referrers
+landed early**, because the `F` edges had been written since Phase 1 and what
+was left was a page and a switch.
+
+## The referrers API
+
+Served, on by default, and passing conformance. Four things decided here that
+the next change to this endpoint must not undo:
+
+- **`Link` is driven by the cursor, never by the page being full.** The
+  `?artifactType=` filter is applied *inside* the scan and the cursor advances
+  over the edges scanned, so a page can come back short — even empty — with
+  matches still ahead. Emitting `Link` only on a full page would end the walk on
+  the first sparse page and report that a rare artifact type has no referrers.
+  The alternative, refilling until the page is full, makes one request scan an
+  unbounded number of edges, which is the one shape this design forbids.
+- **The `Link` carries `artifactType` through.** A link that drops the filter
+  points at a different query, and the reply arrives without
+  `OCI-Filters-Applied` — so it looks authoritative while being a page of
+  something else.
+- **`OCI-Subject` is gated on the endpoint being served.** The header means
+  "this registry processed your subject", which is only true for a registry that
+  will list it. Sending it while `/referrers/` answers `404` tells a client both
+  that the tag-schema fallback is unnecessary and, one request later, that it is
+  required.
+- **`artifactType` is resolved on the push path, not the read path.** An image
+  manifest with no `artifactType` reports its *config descriptor's* `mediaType`;
+  an index with none reports nothing at all. `ManifestParse.referrer_artifact_type`
+  holds the effective value and it lands on the `F` edge, which is what keeps
+  the endpoint a pure ordered scan rather than a scan plus a manifest re-parse
+  per referrer.
+
+**Not implemented, deliberately: ingest of the referrers tag schema.** The spec
+asks a registry enabling the API to pick up manifests recorded in an index
+tagged `<alg>-<hex>` (§Enabling the Referrers API). That exists for registries
+that accepted subject-bearing manifests while not indexing them; summ has
+written `F` edges since the first push, so the window never existed. A repo
+copied in from a fallback-tag registry arrives as manifests carrying real
+`subject` fields, and those write their edges on the way in — the fallback index
+is a redundant tagged copy. The only content this would recover is a fallback
+index naming a manifest that has no `subject` of its own. Nothing in the
+conformance suite covers it.
+
+Legacy cosign tags are the backward-compatibility case that *does* matter in the
+wild, and they are handled: `sha256-<hex>.sig|.sbom|.att` synthesises its `F`
+edge at tag time and retracts it when the tag moves (`summ-registry/src/cosign.rs`).
+That is a purge fix as much as a discovery one — see the module docs.
 
 ## Work packages (parallelisable)
 
@@ -542,12 +604,17 @@ implementation has since turned up, is below.
   `spawn_blocking` round trip (~5 µs, measured in R2) would cost more than the
   lookup it protects. That bet is unmeasured, and a cold read on a
   ten-million-repo store is exactly where it would be wrong. Phase 3.
-- **`referrers` scans a fixed 1000 edges and does not page.** The endpoint has
-  no pagination in the spec, so the bound had to come from somewhere and an
-  unbounded scan is the one shape this design forbids. `Registry::referrers`
-  underneath is properly cursor-paged; the seam is what flattens it. Revisit
-  with the endpoint in Phase 6 — a subject with more than 1000 referrers is
-  silently truncated today.
+- **A sha512 blob cannot be pushed without the algorithm hint.** An upload
+  session picks its algorithm at `POST` time from `?digest-algorithm=` and
+  defaults to sha256, so a client that opens a plain session and closes it with
+  `?digest=sha512:…` gets `400 DIGEST_INVALID` — the content hashed fine, under
+  the other algorithm. This is all eight remaining conformance failures (*Blobs
+  sha512*, and the *Blob chunked* / *mount* / *post put* / *streaming* API rows
+  that push through it); `?digest-algorithm=sha512` works, which is why *Digest
+  Algorithm sha512* passes and the failure hid. The fix is to defer the choice:
+  hash under both, or rehash on commit when the closing digest names an
+  algorithm the session is not using. Found by the first conformance run, not
+  yet fixed.
 - **Anonymous cross-repo mount is served from `L` alone.** `?mount=<digest>`
   with no `from=` grants membership on the strength of "the content exists
   somewhere", which is what the spec's anonymous mount means and what makes it

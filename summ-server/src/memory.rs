@@ -643,11 +643,24 @@ impl Registry for MemoryRegistry {
         Ok(())
     }
 
+    /// The `F` scan, over a `BTreeMap` instead of a key range.
+    ///
+    /// `Digest`'s derived ordering is the same as its encoded key ordering -
+    /// sha256 before sha512, then raw bytes - so iterating the map visits
+    /// referrers in exactly the order the real engine's prefix scan does, and
+    /// a cursor means the same thing on both sides of the seam.
+    ///
+    /// `limit` bounds the edges *scanned*, and the `artifactType` filter is
+    /// applied after that bound rather than before it. Filtering first would be
+    /// the easier code and the wrong contract: it would let one request walk
+    /// every edge in the repository whenever the requested type is rare.
     async fn referrers(
         &self,
         name: &str,
         subject: &Digest,
         artifact_type: Option<&str>,
+        last: Option<&Digest>,
+        limit: usize,
     ) -> OpsResult<Referrers> {
         let state = self.lock();
         // An unknown repository is an empty list, not an error: the endpoint
@@ -656,12 +669,29 @@ impl Registry for MemoryRegistry {
             return Ok(Referrers {
                 manifests: Vec::new(),
                 filter_applied: artifact_type.is_some(),
+                next: None,
             });
         };
-        let manifests = repo
+
+        let mut scanned = repo
             .manifests
             .iter()
-            .filter(|(_, m)| m.subject.as_ref() == Some(subject))
+            .filter(|(digest, m)| m.subject.as_ref() == Some(subject) && Some(*digest) > last)
+            .take(limit + 1);
+
+        let mut page: Vec<(&Digest, &StoredManifest)> = Vec::new();
+        let mut next = None;
+        for entry in scanned.by_ref().take(limit) {
+            page.push(entry);
+        }
+        // Peeking one past the limit is what makes `next` mean "there is more"
+        // rather than "the page was full".
+        if scanned.next().is_some() {
+            next = page.last().map(|(digest, _)| **digest);
+        }
+
+        let manifests = page
+            .into_iter()
             .filter(|(_, m)| match artifact_type {
                 Some(wanted) => m.artifact_type.as_deref() == Some(wanted),
                 None => true,
@@ -677,6 +707,7 @@ impl Registry for MemoryRegistry {
         Ok(Referrers {
             manifests,
             filter_applied: artifact_type.is_some(),
+            next,
         })
     }
 

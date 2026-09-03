@@ -44,11 +44,18 @@ pub struct ServerConfig {
     pub chunk_min_length: Option<u64>,
     /// Whether `/v2/<name>/referrers/<digest>` is served.
     ///
-    /// Off until Phase 6, per PLAN.md. The route is wired either way and the
-    /// handler is complete; this flag is the switch. Note the spec's rule that
-    /// once the API is on it MUST NOT `404` for an unknown subject - the
-    /// handler honours that, so turning this on is safe as soon as the `F`
-    /// edges are being written.
+    /// **On.** The `F` edges have been written since the first push, so the
+    /// switch was only ever hiding a working endpoint. It stays a switch
+    /// because turning the API off is not the same as never having had it: a
+    /// client that gets a `404` here MUST fall back to the referrers tag
+    /// schema, and that fallback is the only thing an operator can reach for
+    /// if the edges ever need rebuilding.
+    ///
+    /// It also gates `OCI-Subject` on a manifest `PUT`. The spec ties the two
+    /// together - the header means "this registry processed your subject", and
+    /// a registry that sends it while answering `404` on `/referrers/` has told
+    /// the client both that the fallback is unnecessary and that it is
+    /// required.
     pub referrers_enabled: bool,
 }
 
@@ -61,7 +68,7 @@ impl Default for ServerConfig {
             max_page_size: 1000,
             max_tag_params: 32,
             chunk_min_length: None,
-            referrers_enabled: false,
+            referrers_enabled: true,
         }
     }
 }
@@ -139,9 +146,13 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 1000, env = "SUMM_MAX_PAGE_SIZE")]
     pub max_page_size: usize,
 
-    /// Serve `/v2/<name>/referrers/<digest>` instead of answering `404`.
-    #[arg(long, env = "SUMM_REFERRERS")]
-    pub referrers: bool,
+    /// Answer `404` on `/v2/<name>/referrers/<digest>` instead of serving it.
+    ///
+    /// The endpoint is on by default. This turns it off, which also drops
+    /// `OCI-Subject` from manifest `PUT` responses - a client must not be told
+    /// its subject was processed by a registry that will not list it.
+    #[arg(long, env = "SUMM_NO_REFERRERS")]
+    pub no_referrers: bool,
 }
 
 impl ServeArgs {
@@ -163,7 +174,7 @@ impl ServeArgs {
             max_manifest_bytes: self.max_manifest_bytes,
             default_page_size: self.default_page_size,
             max_page_size: self.max_page_size,
-            referrers_enabled: self.referrers,
+            referrers_enabled: !self.no_referrers,
             ..ServerConfig::default()
         }
     }

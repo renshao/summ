@@ -117,6 +117,16 @@ pub struct Referrers {
     /// `OCI-Filters-Applied`, which must be sent only when the filter is exact
     /// - the suite then verifies no descriptor of another type is present.
     pub filter_applied: bool,
+    /// Referrer digest to resume after, or `None` when the scan is exhausted.
+    ///
+    /// This is deliberately not a [`Page`]: `more` there is "another item
+    /// exists", and here the cursor advances over the *scanned* edges rather
+    /// than the returned ones, because the `artifactType` filter is applied
+    /// inside the scan. So `manifests` can be short - even empty - with `next`
+    /// still set, and the `Link` header is driven by this field alone. Never
+    /// by whether the page came back full: that would end the walk on the
+    /// first page whose matches happened not to fill it.
+    pub next: Option<Digest>,
 }
 
 /// A blob body arriving on a push.
@@ -439,11 +449,19 @@ pub trait Registry: Send + Sync + 'static {
     /// MUST NOT return `404`, so this returns an empty list. A subject that
     /// does not resolve to a stored manifest is normal - the spec requires a
     /// manifest with a dangling `subject` to be accepted and listed.
+    ///
+    /// `last` is a referrer digest to resume strictly after, and `limit` bounds
+    /// the edges *scanned*, not the descriptors returned. The endpoint has no
+    /// pagination in the spec, only the rule that `Link` MUST be sent when the
+    /// list does not fit in one response, so the page is bounded here and the
+    /// handler turns [`Referrers::next`] into that header.
     async fn referrers(
         &self,
         name: &str,
         subject: &Digest,
         artifact_type: Option<&str>,
+        last: Option<&Digest>,
+        limit: usize,
     ) -> OpsResult<Referrers>;
 
     // ---- discovery beyond the spec ---------------------------------------

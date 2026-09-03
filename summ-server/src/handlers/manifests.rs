@@ -158,9 +158,14 @@ async fn put(ctx: &Ctx, name: &str, reference: &Reference, body: Body) -> Handle
     ];
     // MUST be sent whenever a pushed manifest carries a `subject` and the
     // referrers API is implemented; it is how the client learns the registry
-    // processed the subject rather than ignoring it.
+    // processed the subject rather than ignoring it. Conditioned on the
+    // endpoint actually being served, because that is what the header claims:
+    // sending it while `/referrers/` answers `404` tells a client the fallback
+    // tag schema is unnecessary and, one request later, that it is mandatory.
     if let Some(subject) = result.subject {
-        headers.push((OCI_SUBJECT, digest_header(&subject)));
+        if ctx.config().referrers_enabled {
+            headers.push((OCI_SUBJECT, digest_header(&subject)));
+        }
     }
     // One header per accepted tag. The suite accepts either repeated headers or
     // one comma-separated header; repeated is the less ambiguous form.

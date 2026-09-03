@@ -1075,3 +1075,175 @@ async fn a_single_post_pushes_a_whole_blob_in_one_request() {
     let pulled = h.get(&format!("/v2/acme/oneshot/blobs/{digest}")).await;
     assert_eq!(pulled.body, Bytes::from(body));
 }
+
+// -------------------------------------------------------------- referrers --
+
+/// An artifact manifest attached to `subject`, distinguished by `n` so each one
+/// hashes differently.
+fn referring_manifest(subject: &str, artifact_type: &str, n: usize) -> Vec<u8> {
+    format!(
+        r#"{{"schemaVersion":2,"mediaType":"{IMAGE_MANIFEST}","artifactType":"{artifact_type}","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{}","size":{}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{}","size":{}}}],"subject":{{"mediaType":"{IMAGE_MANIFEST}","digest":"{subject}","size":{n}}},"annotations":{{"org.example.n":"{n}"}}}}"#,
+        sha256_hex(CONFIG),
+        CONFIG.len(),
+        sha256_hex(LAYER),
+        LAYER.len(),
+    )
+    .into_bytes()
+}
+
+/// Follow a `Link` to its target, or `None` on the last page.
+fn next_page(reply: &Reply) -> Option<String> {
+    let link = reply.header(header::LINK)?;
+    Some(
+        link.trim_start_matches('<')
+            .split('>')
+            .next()
+            .expect("a bracketed URL")
+            .to_owned(),
+    )
+}
+
+#[tokio::test]
+async fn referrers_page_over_real_edges_and_survive_a_restart() {
+    let dir = TempDir::new().expect("tempdir");
+    let subject = {
+        let h = Harness::rocks(dir.path());
+        let subject = push_image(&h, "acme/signed", "v1").await;
+
+        for n in 0..5 {
+            let body = referring_manifest(&subject, "application/vnd.example.sig", n);
+            let reply = h
+                .push_manifest("acme/signed", &sha256_hex(&body), &body)
+                .await;
+            assert_eq!(reply.status, StatusCode::CREATED);
+            assert_eq!(
+                reply.header("oci-subject"),
+                Some(subject.as_str()),
+                "the registry serves the referrers API, so it must acknowledge the subject",
+            );
+        }
+        subject
+    };
+
+    // Reopened: the `F` edges are metadata, and metadata that does not survive
+    // a restart is the failure no in-memory test can see.
+    let h = Harness::with_config(
+        dir.path(),
+        ServerConfig {
+            default_page_size: 2,
+            max_page_size: 2,
+            ..ServerConfig::default()
+        },
+    );
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut url = format!("/v2/acme/signed/referrers/{subject}");
+    let mut pages = 0;
+    loop {
+        let reply = h.get(&url).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(
+            reply.header(header::CONTENT_TYPE),
+            Some("application/vnd.oci.image.index.v1+json")
+        );
+        let body = reply.json();
+        assert_eq!(body["schemaVersion"], 2);
+        let manifests = body["manifests"].as_array().cloned().expect("an array");
+        assert!(manifests.len() <= 2, "a page may never exceed the limit");
+        for entry in manifests {
+            // Resolved at push time, and for a manifest that declares one it is
+            // the declared value rather than the config's media type.
+            assert_eq!(entry["artifactType"], "application/vnd.example.sig");
+            assert!(
+                entry["annotations"]["org.example.n"].is_string(),
+                "the response cannot be built without the annotations on the edge",
+            );
+            seen.push(entry["digest"].as_str().expect("a digest").to_owned());
+        }
+        pages += 1;
+        assert!(pages < 10, "paging did not terminate");
+        match next_page(&reply) {
+            Some(next) => url = next,
+            None => break,
+        }
+    }
+
+    let mut expected = seen.clone();
+    expected.sort();
+    expected.dedup();
+    assert_eq!(expected.len(), 5, "every referrer, exactly once");
+    assert_eq!(seen, expected, "digest order, across page boundaries");
+    assert_eq!(pages, 3, "5 at 2 a page, with no wasted final page");
+}
+
+#[tokio::test]
+async fn a_referrers_filter_is_exact_and_the_link_carries_it() {
+    let dir = TempDir::new().expect("tempdir");
+    let h = Harness::with_config(
+        dir.path(),
+        ServerConfig {
+            default_page_size: 1,
+            max_page_size: 1,
+            ..ServerConfig::default()
+        },
+    );
+    let subject = push_image(&h, "acme/mixed", "v1").await;
+
+    let mut sboms = Vec::new();
+    for n in 0..6 {
+        // One in three is an SBOM, so most pages hold no match at all.
+        let artifact_type = if n % 3 == 0 {
+            "application/vnd.example.sbom"
+        } else {
+            "application/vnd.example.sig"
+        };
+        let body = referring_manifest(&subject, artifact_type, n);
+        let digest = sha256_hex(&body);
+        assert_eq!(
+            h.push_manifest("acme/mixed", &digest, &body).await.status,
+            StatusCode::CREATED
+        );
+        if n % 3 == 0 {
+            sboms.push(digest);
+        }
+    }
+    sboms.sort();
+
+    let mut seen = Vec::new();
+    let mut url =
+        format!("/v2/acme/mixed/referrers/{subject}?artifactType=application/vnd.example.sbom");
+    for _ in 0..20 {
+        let reply = h.get(&url).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(
+            reply.header("oci-filters-applied"),
+            Some("artifactType"),
+            "the filter is exact on every page, so it is claimed on every page",
+        );
+        for entry in reply.json()["manifests"].as_array().expect("an array") {
+            assert_eq!(
+                entry["artifactType"], "application/vnd.example.sbom",
+                "claiming the filter means no descriptor of another type may appear",
+            );
+            seen.push(entry["digest"].as_str().expect("a digest").to_owned());
+        }
+        match next_page(&reply) {
+            Some(next) => {
+                assert!(
+                    next.contains("artifactType=application%2Fvnd.example.sbom"),
+                    "a link that drops the filter is a link to a different query: {next}",
+                );
+                url = next;
+            }
+            None => break,
+        }
+    }
+
+    // The point of the exercise: a page of one, filtered to a third, walks to
+    // the end anyway. A `Link` driven by page fullness stops on page one and
+    // reports a single SBOM.
+    assert_eq!(
+        seen, sboms,
+        "every match, across pages that were mostly empty"
+    );
+}
