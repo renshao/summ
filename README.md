@@ -13,9 +13,10 @@ Summ is currently a research and engineering project. I want to create an OCI/do
 ## Download
 
 Prebuilt Linux x86_64 binaries are published on the
-[releases page](https://github.com/renshao/summ/releases). RocksDB, its C++
-runtime and libgcc are linked in statically, so the only shared library left is
-glibc — the build floor is 2.35 (Ubuntu 22.04, Debian 12, RHEL 9 and newer).
+[releases page](https://github.com/renshao/summ/releases). RocksDB and its C++
+runtime are linked in statically, so the only shared libraries left are the
+ones every glibc system already has — `libc`, `libm` and `libgcc_s`. The build
+floor is glibc 2.35: Ubuntu 22.04, Debian 12, RHEL 9 and newer.
 
 ```sh
 curl -fsSL https://github.com/renshao/summ/releases/latest/download/summ-x86_64-unknown-linux-gnu.tar.gz \

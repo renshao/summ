@@ -37,19 +37,26 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y clang lld
 
-      # librocksdb-sys already links RocksDB's own C++ in statically, which
-      # leaves libstdc++ and libgcc as the only shared libraries that are not
-      # part of the OS's floor — and libstdc++ is the one that breaks, because
-      # a binary built against a newer GLIBCXX cannot run on an older machine.
+      # librocksdb-sys already links RocksDB's own C++ in statically, but the
+      # binary still needs libstdc++ itself — and that is the one that breaks
+      # portability, because a binary built against a newer GLIBCXX cannot run
+      # on an older machine, and a slim image does not carry it at all.
       #
-      # `-static-libstdc++` does not achieve that here, and fails silently.
-      # It governs only the libstdc++ the *g++ driver* adds implicitly, while
+      # `-static-libstdc++` does not achieve this, and fails silently: it
+      # governs only the libstdc++ the *g++ driver* adds implicitly, while
       # librocksdb-sys emits `cargo:rustc-link-lib=dylib=stdc++` — an explicit
-      # `-lstdc++` that the flag has no opinion about. What does work is
-      # resolution order: `-L` directories are searched before the system ones,
-      # so a directory holding `libstdc++.a` and no `.so` makes that explicit
-      # `-lstdc++` find the archive. libgcc needs no such help, because there
-      # the driver is the one adding it.
+      # `-lstdc++` the flag has no opinion about. Resolution order is what
+      # settles it: `-L` directories are searched before the system ones, so a
+      # directory holding `libstdc++.a` and no `.so` makes that `-lstdc++` find
+      # the archive.
+      #
+      # libgcc_s is deliberately left alone. `-static-libgcc` is a no-op for
+      # the same reason — std's unwind crate emits its own `-lgcc_s` unless the
+      # target is crt-static (`library/unwind/src/lib.rs`) — and shimming that
+      # too would mean overriding the unwinder std chose for itself, to remove
+      # a library that is Priority: required on Debian and present on every
+      # glibc system. libc, libm and libgcc_s are the OS's ABI, not summ's
+      # dependencies.
       #
       # Deliberately *not* a fully static musl build: musl's allocator is
       # markedly slower under the multi-threaded allocation churn RocksDB
@@ -64,7 +71,7 @@ jobs:
           fi
           mkdir -p "$RUNNER_TEMP/staticlibs"
           ln -sf "$archive" "$RUNNER_TEMP/staticlibs/libstdc++.a"
-          echo "RUSTFLAGS=-L native=$RUNNER_TEMP/staticlibs -C link-arg=-static-libgcc -C strip=symbols" >> "$GITHUB_ENV"
+          echo "RUSTFLAGS=-L native=$RUNNER_TEMP/staticlibs -C strip=symbols" >> "$GITHUB_ENV"
 
       # After RUSTFLAGS is set: the cache key covers it, so a change to the
       # link flags must invalidate the cache rather than reuse artefacts built
@@ -80,12 +87,18 @@ jobs:
       - name: Check the binary's dynamic dependencies
         run: |
           ldd target/release/summ
-          for lib in libstdc++ libgcc_s; do
-            if ldd target/release/summ | grep -q "$lib"; then
-              echo "::error::$lib is dynamically linked; it was meant to be linked in"
-              exit 1
-            fi
-          done
+          # An allowlist rather than a denylist: this fails on libstdc++
+          # creeping back, and equally on a new dependency arriving with a
+          # crate — an OpenSSL, say — which is the failure nobody would think
+          # to write a check for.
+          expected='^(linux-vdso\.so\.1|libgcc_s\.so\.1|libm\.so\.6|libc\.so\.6|ld-linux-x86-64\.so\.2)$'
+          unexpected=$(ldd target/release/summ \
+            | sed -E 's/^[[:space:]]*//; s/ .*//; s#.*/##' \
+            | grep -vE "$expected" || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::binary needs shared libraries beyond the OS's own: $unexpected"
+            exit 1
+          fi
           echo "glibc floor: $(objdump -T target/release/summ \
             | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
 
