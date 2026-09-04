@@ -137,6 +137,21 @@ with reference validation on, and it read back byte-exact.
 **Both directions stream.** Pushing a 200 MB blob moved release-binary RSS from
 15.6 MB to 15.8 MB; serving it back took it to 20 MB.
 
+**A real large image goes through end to end, and there is a script for it.**
+`scripts/large-image-e2e.sh` builds the release binary, starts it on a scratch
+data directory, pushes an image, then pulls every byte back from N clients at
+once with each blob's digest verified — plus the two range shapes containerd
+sends, the discovery API, and a restart. Measured on
+`pytorch/pytorch:2.9.0-cuda12.8-cudnn9-runtime`, whose single largest layer is
+**7.42 GiB**: push 7.8 s (~1.0 GB/s), four concurrent verified pulls of 7.52 GiB
+each in 28.5 s (~1.1 GB/s aggregate, and shasum-bound rather than
+registry-bound), zero mismatches, manifest byte-exact across the restart. That
+layer is what the 1 GiB ceiling used to reject, so the script is also the
+regression test for it. Image bytes come from the local docker daemon
+(`docker save` writes an OCI layout that `oras cp` pushes straight from) or from
+the upstream registry; nothing goes through `docker push`, because on Docker
+Desktop `127.0.0.1` inside the VM is not the host.
+
 **The per-request upload ceiling is 32 GiB, and it is a guard rather than a
 wall** — `--max-upload-bytes` (`SUMM_MAX_UPLOAD_BYTES`), `0` to remove it. It
 was 1 GiB and unreachable from the command line, left from the skeleton that
