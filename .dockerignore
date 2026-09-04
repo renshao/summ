@@ -1,0 +1,26 @@
+# The build context is copied into the daemon before anything runs, so keeping
+# it small is the difference between a one-second and a one-minute upload.
+
+# Build output. Enormous, and useless in the image: the builder stage compiles
+# for linux/glibc, which a host target/ directory is unlikely to hold.
+target/
+
+# A registry left behind by `summ serve` in the repo root. Baking someone's
+# local blobs and RocksDB into an image would be both huge and wrong.
+/data/
+
+.git/
+.github/
+.gitignore
+.claude/
+
+# Prose. Nothing is `include_str!`d outside summ-server/ui/, so none of this is
+# needed to compile, and touching a document should not invalidate the build.
+*.md
+LICENSE
+NOTICE
+design/
+research/
+
+Dockerfile
+.dockerignore
