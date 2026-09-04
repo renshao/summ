@@ -323,20 +323,29 @@ fn storage_error(e: SummError) -> OpsError {
 /// Write a request body through to the staging file, frame by frame.
 ///
 /// This is the reason [`UploadBody`] exists. Buffering a layer to append it
-/// would make a push cost as much memory as the blob is large, and the default
-/// ceiling is 1 GiB - so a few concurrent pushes of a big image would be an
+/// would make a push cost as much memory as the blob is large - and a layer is
+/// routinely gigabytes - so a few concurrent pushes of a big image would be an
 /// out-of-memory kill rather than a slow registry. Here the cost is one frame,
 /// whatever the size of the blob.
 ///
-/// Both limits are checked as the bytes arrive, because neither can be checked
-/// before. The ceiling is enforced *before* the offending frame is written, so
-/// an over-long body cannot fill a disk on its way to being rejected.
+/// Both limits are checked as the bytes arrive, because in general neither can
+/// be checked before. The ceiling is enforced *before* the offending frame is
+/// written, so an over-long body cannot fill a disk on its way to being
+/// rejected - and a client that *declares* a length above the ceiling is
+/// refused before the first frame, because a doomed push should not first write
+/// the ceiling's worth of bytes to the staging file.
 async fn drain_into(upload: &mut summ_storage::Upload, body: UploadBody) -> OpsResult<u64> {
     let UploadBody {
         body,
         declared,
         limit,
     } = body;
+    if let (Some(declared), Some(limit)) = (declared, limit) {
+        if declared > limit {
+            return Err(OpsError::BodyTooLarge { limit });
+        }
+    }
+
     let mut stream = body.into_data_stream();
     let mut written = 0u64;
 
@@ -346,8 +355,10 @@ async fn drain_into(upload: &mut summ_storage::Upload, body: UploadBody) -> OpsR
             continue;
         }
         written = written.saturating_add(chunk.len() as u64);
-        if written > limit {
-            return Err(OpsError::BodyTooLarge { limit });
+        if let Some(limit) = limit {
+            if written > limit {
+                return Err(OpsError::BodyTooLarge { limit });
+            }
         }
         // Each frame lands at wherever the previous one ended. The caller has
         // already checked the *session's* offset against the client's claim;

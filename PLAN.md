@@ -137,6 +137,17 @@ with reference validation on, and it read back byte-exact.
 **Both directions stream.** Pushing a 200 MB blob moved release-binary RSS from
 15.6 MB to 15.8 MB; serving it back took it to 20 MB.
 
+**The per-request upload ceiling is 32 GiB, and it is a guard rather than a
+wall** — `--max-upload-bytes` (`SUMM_MAX_UPLOAD_BYTES`), `0` to remove it. It
+was 1 GiB and unreachable from the command line, left from the skeleton that
+buffered a chunk in memory. **No client chunks a layer** — docker, crane and
+oras all send one monolithic body — so that number was not a per-request bound
+at all, it was the largest layer the registry accepted, and a `pytorch/pytorch`
+push died on it with `413 SIZE_INVALID` that no retry could fix. The body
+streams to the staging file, so the ceiling now costs disk rather than memory,
+and a declared `Content-Length` above it is refused before the first frame
+instead of after a ceiling's worth of bytes has been written.
+
 **Every manifest is also in the blob store**, under its own digest, written and
 fsynced before the push's batch commits. `B` is still the read path; the copy
 exists so a disk of blobs is self-describing rather than unidentifiable content.

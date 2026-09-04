@@ -316,7 +316,7 @@ fn upload_body(ctx: &Ctx, body: Body, declared: Option<u64>) -> UploadBody {
     UploadBody {
         body,
         declared,
-        limit: ctx.config().max_upload_chunk_bytes as u64,
+        limit: ctx.config().max_upload_bytes,
     }
 }
 

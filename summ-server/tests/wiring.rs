@@ -1026,7 +1026,7 @@ async fn a_body_over_the_ceiling_is_refused_before_it_is_all_written() {
     let h = Harness::with_config(
         dir.path(),
         ServerConfig {
-            max_upload_chunk_bytes: 4096,
+            max_upload_bytes: Some(4096),
             ..ServerConfig::default()
         },
     );
@@ -1058,6 +1058,69 @@ async fn a_body_over_the_ceiling_is_refused_before_it_is_all_written() {
         Some("0-0"),
         "an over-long body advances nothing",
     );
+}
+
+#[tokio::test]
+async fn a_declared_length_over_the_ceiling_is_refused_before_a_byte_is_written() {
+    // The ceiling is a guard against filling a disk, so a client that says up
+    // front that it will exceed it must be turned away up front - not after
+    // the guard's worth of bytes has been streamed into the staging file.
+    let dir = TempDir::new().expect("tempdir");
+    let h = Harness::with_config(
+        dir.path(),
+        ServerConfig {
+            max_upload_bytes: Some(4096),
+            ..ServerConfig::default()
+        },
+    );
+    let opened = h
+        .request(
+            Method::POST,
+            "/v2/acme/huge/blobs/uploads/",
+            Vec::new(),
+            Body::empty(),
+        )
+        .await;
+    let location = opened
+        .header(header::LOCATION)
+        .expect("Location")
+        .to_owned();
+
+    let reply = h
+        .request(
+            Method::PATCH,
+            &location,
+            vec![(header::CONTENT_LENGTH.as_str(), "8192".to_owned())],
+            Body::from(vec![b'x'; 8192]),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(reply.error_code(), "SIZE_INVALID");
+    assert_eq!(
+        h.get(&location).await.header(header::RANGE),
+        Some("0-0"),
+        "nothing was appended",
+    );
+}
+
+#[tokio::test]
+async fn no_ceiling_accepts_a_body_that_would_otherwise_be_refused() {
+    // `--max-upload-bytes 0`. No client chunks a layer, so the ceiling is the
+    // largest layer the registry accepts, and an operator must be able to
+    // remove it rather than guess a number above the largest image they hold.
+    let dir = TempDir::new().expect("tempdir");
+    let h = Harness::with_config(
+        dir.path(),
+        ServerConfig {
+            max_upload_bytes: None,
+            ..ServerConfig::default()
+        },
+    );
+    let blob = vec![b'z'; 64 * 1024];
+    let digest = h.push_blob("acme/huge", &blob).await;
+    let fetched = h.get(&format!("/v2/acme/huge/blobs/{digest}")).await;
+    assert_eq!(fetched.status, StatusCode::OK);
+    assert_eq!(fetched.body.len(), blob.len());
 }
 
 #[tokio::test]

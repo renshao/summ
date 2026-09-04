@@ -8,6 +8,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 use crate::auth::{AuthPolicy, Generated};
 use crate::backend::Engine;
 
+/// Default ceiling on one upload request body, in bytes.
+///
+/// 32 GiB: comfortably above the largest layer anyone actually pushes - the
+/// CUDA layers in `pytorch/pytorch` are the usual worst case, at a few
+/// gigabytes - while still bounding what one request can write to the disk.
+/// `0` on the command line removes it entirely.
+pub const DEFAULT_MAX_UPLOAD_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+
 /// Limits and switches the handlers consult. Separate from [`Cli`] so tests can
 /// construct one directly and so a future config file has somewhere to land.
 #[derive(Debug, Clone)]
@@ -19,13 +27,20 @@ pub struct ServerConfig {
     /// uncomfortably close to a 4 MiB cap. 8 MiB costs nothing - the body is
     /// compressed at rest - and moves the margin from 2 % to 100 %.
     pub max_manifest_bytes: usize,
-    /// Largest single request body accepted on an upload `POST`/`PATCH`/`PUT`.
+    /// Largest single request body accepted on an upload `POST`/`PATCH`/`PUT`,
+    /// or `None` for no ceiling at all.
     ///
-    /// This is a per-request bound, not a blob-size bound: a larger blob is
-    /// pushed in chunks. It exists because the skeleton buffers a chunk in
-    /// memory; when `summ-storage` lands the body streams and this becomes a
-    /// guard rather than a wall.
-    pub max_upload_chunk_bytes: usize,
+    /// In principle a per-request bound rather than a blob-size bound, since a
+    /// larger blob may be pushed in chunks. In practice **no client chunks** -
+    /// docker, crane and oras all send a layer as one monolithic body - so this
+    /// is the largest layer the registry accepts, and a low value rejects
+    /// exactly the multi-gigabyte ML images a registry gets pushed.
+    ///
+    /// It was 1 GiB while the skeleton buffered a chunk in memory. The body
+    /// streams into the staging file now and costs one frame whatever the blob,
+    /// so what is left is a guard against a runaway or malicious client filling
+    /// a disk - which wants a number far above any real layer, not one near it.
+    pub max_upload_bytes: Option<u64>,
     /// Page size used when `?n=` is absent.
     pub default_page_size: usize,
     /// Ceiling for `?n=`. An oversized `n` is **clamped, not rejected**: the
@@ -70,7 +85,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
             max_manifest_bytes: 8 * 1024 * 1024,
-            max_upload_chunk_bytes: 1024 * 1024 * 1024,
+            max_upload_bytes: Some(DEFAULT_MAX_UPLOAD_BYTES),
             default_page_size: 1000,
             max_page_size: 1000,
             max_tag_params: 32,
@@ -156,6 +171,20 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 8 * 1024 * 1024, env = "SUMM_MAX_MANIFEST_BYTES")]
     pub max_manifest_bytes: usize,
 
+    /// Maximum bytes in one upload request body; `0` removes the limit.
+    ///
+    /// No client chunks a layer, so this is effectively the largest layer the
+    /// registry will accept: below a layer's size, a push fails with `413` and
+    /// `SIZE_INVALID` however many times it is retried. The body streams
+    /// straight to the staging file, so raising it costs disk rather than
+    /// memory.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_UPLOAD_BYTES,
+        env = "SUMM_MAX_UPLOAD_BYTES"
+    )]
+    pub max_upload_bytes: u64,
+
     /// Default number of results for a list endpoint with no `?n=`.
     #[arg(long, default_value_t = 1000, env = "SUMM_DEFAULT_PAGE_SIZE")]
     pub default_page_size: usize,
@@ -239,6 +268,10 @@ impl ServeArgs {
         };
         let config = ServerConfig {
             max_manifest_bytes: self.max_manifest_bytes,
+            // Zero is "no ceiling" rather than "accept nothing": a limit flag
+            // is set to zero by someone turning the limit off, and the other
+            // reading makes every push fail.
+            max_upload_bytes: (self.max_upload_bytes > 0).then_some(self.max_upload_bytes),
             default_page_size: self.default_page_size,
             max_page_size: self.max_page_size,
             referrers_enabled: !self.no_referrers,
@@ -312,6 +345,32 @@ mod tests {
     fn an_empty_key_is_rejected_rather_than_matching_an_empty_credential() {
         let args = args(&["--auth", "apikey", "--read-apikey", " "]).expect("parses");
         assert!(args.server_config().is_err());
+    }
+
+    #[test]
+    fn the_upload_ceiling_defaults_high_and_can_be_removed() {
+        // The failure this guards against is silent in the worst way: a limit
+        // below a real layer turns every push of a big image into a `413` that
+        // no retry can fix, and the client's message names a byte count rather
+        // than the flag that produced it.
+        let ceiling = |extra: &[&str]| {
+            let (config, _) = args(extra).expect("parses").server_config().expect("valid");
+            config.max_upload_bytes
+        };
+
+        assert_eq!(ceiling(&[]), Some(DEFAULT_MAX_UPLOAD_BYTES));
+        const {
+            assert!(
+                DEFAULT_MAX_UPLOAD_BYTES > 8 * 1024 * 1024 * 1024,
+                "the default must clear the largest layers people actually push",
+            )
+        };
+        assert_eq!(
+            ceiling(&["--max-upload-bytes", "0"]),
+            None,
+            "zero removes the ceiling rather than rejecting every body",
+        );
+        assert_eq!(ceiling(&["--max-upload-bytes", "4096"]), Some(4096));
     }
 
     #[test]

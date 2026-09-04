@@ -132,21 +132,24 @@ pub struct Referrers {
 /// A blob body arriving on a push.
 ///
 /// Carried as a stream rather than as `Bytes` because the alternative is a
-/// buffer the size of a layer: the default per-request ceiling is 1 GiB, and a
-/// handful of concurrent pushes at that size is an out-of-memory kill rather
-/// than a slow registry. The implementation writes frames through as they
-/// arrive, so a push costs one frame of memory regardless of the blob.
+/// buffer the size of a layer: a layer is routinely gigabytes, and a handful of
+/// concurrent pushes at that size is an out-of-memory kill rather than a slow
+/// registry. The implementation writes frames through as they arrive, so a push
+/// costs one frame of memory regardless of the blob.
 ///
 /// The two limits travel with the body because only the consumer can enforce
 /// them: `declared` is not known to be wrong until the last frame has arrived,
-/// and `limit` is not known to be exceeded until it is.
+/// and `limit` is not known to be exceeded until it is - except in the one case
+/// where the client declares a length above it, which is a `413` before a byte
+/// is written.
 pub struct UploadBody {
     pub body: Body,
     /// The client's `Content-Length`, when it sent one. `None` is a streamed
     /// upload with no declared length, which the spec permits.
     pub declared: Option<u64>,
-    /// Hard ceiling on the bytes this one request may carry.
-    pub limit: u64,
+    /// Hard ceiling on the bytes this one request may carry, or `None` for
+    /// none. See [`ServerConfig::max_upload_bytes`](crate::ServerConfig).
+    pub limit: Option<u64>,
 }
 
 impl UploadBody {
@@ -156,10 +159,16 @@ impl UploadBody {
     /// implementation must not use this - the point of the type is that it need
     /// not.
     pub async fn collect(self) -> OpsResult<Bytes> {
-        let limit = usize::try_from(self.limit).unwrap_or(usize::MAX);
-        let bytes = axum::body::to_bytes(self.body, limit)
+        let limit = self.limit.unwrap_or(u64::MAX);
+        if let Some(declared) = self.declared {
+            if declared > limit {
+                return Err(OpsError::BodyTooLarge { limit });
+            }
+        }
+        let ceiling = usize::try_from(limit).unwrap_or(usize::MAX);
+        let bytes = axum::body::to_bytes(self.body, ceiling)
             .await
-            .map_err(|_| OpsError::BodyTooLarge { limit: self.limit })?;
+            .map_err(|_| OpsError::BodyTooLarge { limit })?;
         if let Some(declared) = self.declared {
             if declared != bytes.len() as u64 {
                 return Err(OpsError::SizeMismatch {
