@@ -19,16 +19,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # librocksdb-sys already links RocksDB's C++ in statically, which leaves
-  # libstdc++ and libgcc as the only shared libraries that are not part of the
-  # OS's own floor — and libstdc++ is the one that actually breaks, because a
-  # binary built against a newer GLIBCXX cannot run on an older machine. Taking
-  # both in leaves glibc as the single compatibility axis.
-  #
-  # Deliberately *not* a fully static musl build: musl's allocator is markedly
-  # slower under the multi-threaded allocation churn RocksDB generates, and
-  # this binary exists to be benchmarked. A musl summ would measure musl.
-  RUSTFLAGS: -C link-arg=-static-libstdc++ -C link-arg=-static-libgcc -C strip=symbols
 
 jobs:
   linux-amd64:
@@ -47,6 +37,38 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y clang lld
 
+      # librocksdb-sys already links RocksDB's own C++ in statically, which
+      # leaves libstdc++ and libgcc as the only shared libraries that are not
+      # part of the OS's floor — and libstdc++ is the one that breaks, because
+      # a binary built against a newer GLIBCXX cannot run on an older machine.
+      #
+      # `-static-libstdc++` does not achieve that here, and fails silently.
+      # It governs only the libstdc++ the *g++ driver* adds implicitly, while
+      # librocksdb-sys emits `cargo:rustc-link-lib=dylib=stdc++` — an explicit
+      # `-lstdc++` that the flag has no opinion about. What does work is
+      # resolution order: `-L` directories are searched before the system ones,
+      # so a directory holding `libstdc++.a` and no `.so` makes that explicit
+      # `-lstdc++` find the archive. libgcc needs no such help, because there
+      # the driver is the one adding it.
+      #
+      # Deliberately *not* a fully static musl build: musl's allocator is
+      # markedly slower under the multi-threaded allocation churn RocksDB
+      # generates, and this binary exists to be benchmarked. A musl summ would
+      # measure musl.
+      - name: Point the linker at a static libstdc++
+        run: |
+          archive=$(g++ -print-file-name=libstdc++.a)
+          if [ ! -f "$archive" ]; then
+            echo "::error::no static libstdc++ on this runner"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/staticlibs"
+          ln -sf "$archive" "$RUNNER_TEMP/staticlibs/libstdc++.a"
+          echo "RUSTFLAGS=-L native=$RUNNER_TEMP/staticlibs -C link-arg=-static-libgcc -C strip=symbols" >> "$GITHUB_ENV"
+
+      # After RUSTFLAGS is set: the cache key covers it, so a change to the
+      # link flags must invalidate the cache rather than reuse artefacts built
+      # under the old ones.
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
@@ -58,10 +80,12 @@ jobs:
       - name: Check the binary's dynamic dependencies
         run: |
           ldd target/release/summ
-          if ldd target/release/summ | grep -q 'libstdc++'; then
-            echo "::error::libstdc++ is dynamically linked; -static-libstdc++ did not apply"
-            exit 1
-          fi
+          for lib in libstdc++ libgcc_s; do
+            if ldd target/release/summ | grep -q "$lib"; then
+              echo "::error::$lib is dynamically linked; it was meant to be linked in"
+              exit 1
+            fi
+          done
           echo "glibc floor: $(objdump -T target/release/summ \
             | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
 
