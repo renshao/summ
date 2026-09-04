@@ -859,3 +859,43 @@ async fn rehashing_reads_back_more_than_one_chunk() {
         .expect("commit");
     assert_eq!(read_all(&store, &expected).await, body);
 }
+
+/// Concurrent commits into a fresh store.
+///
+/// This is the shape a real client produces and the one that used to fail:
+/// `oras push` uploads an artifact's blobs in parallel, so several commits
+/// reach a store whose `blobs/sha256` directory does not exist yet, and all of
+/// them try to create it. One won and the rest surfaced `EEXIST` as a `500` on
+/// an otherwise ordinary push - with the layer already uploaded, so the client
+/// saw a half-pushed artifact.
+///
+/// Every blob here is distinct, so nothing about the outcome depends on the
+/// content: what is shared is the path prefix, which is the whole point.
+#[tokio::test]
+async fn blobs_pushed_concurrently_into_a_fresh_store_all_commit() {
+    const BLOBS: usize = 24;
+
+    let (_dir, store) = store();
+    let store = std::sync::Arc::new(store);
+
+    let mut tasks = Vec::new();
+    for i in 0..BLOBS {
+        let store = std::sync::Arc::clone(&store);
+        tasks.push(tokio::spawn(async move {
+            let body = format!("concurrent blob {i}").into_bytes();
+            let digest = put(
+                &store,
+                &format!("concurrent-{i}"),
+                DigestAlgorithm::Sha256,
+                &body,
+            )
+            .await;
+            (digest, body)
+        }));
+    }
+
+    for task in tasks {
+        let (digest, body) = task.await.expect("commit task");
+        assert_eq!(read_all(&store, &digest).await, body);
+    }
+}

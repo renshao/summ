@@ -119,7 +119,7 @@ Two traps worth stating explicitly:
 
 ## Status
 
-`cargo test` — **363 passing**. Every crate in CLAUDE.md's Layout is built, and
+`cargo test` — **366 passing**. Every crate in CLAUDE.md's Layout is built, and
 **the wiring has landed** (package K, `summ-server/src/backend.rs`): `summ
 serve` runs on `summ-registry` over `summ-meta` with `summ-storage` holding the
 bytes. `tests/wiring.rs` drives the same router as `tests/api.rs` against a real
@@ -601,6 +601,19 @@ One ordering rule, and it is not negotiable: **blob bytes land and are fsynced
 first; the metadata batch is the commit point.** A blob with no metadata is
 harmless garbage that purge reclaims. Metadata referencing a missing blob is
 corruption that surfaces as a failed pull. Never the reverse.
+
+**Creating a fan-out directory races, and a level another writer created first
+is a success.** Every check in `create_dir_durable` is a check-then-create, and
+any two blobs share at least `blobs/<algo>`, so two commits into a fresh store
+both find it missing and both create it. That is not a rare interleaving: `oras
+push` uploads an artifact's blobs in parallel, so it is what an ordinary push
+does, and taking `EEXIST` out to the caller made it a `500` with the layer
+already uploaded. `AlreadyExists` is absorbed — **and the fsync still runs on
+that path**, because the winner has not synchronised with us and "it is
+presumably about to sync the same parent" is not a durability argument. A
+non-directory holding the name is *not* absorbed: a level is two hex characters
+and a blob file is the full hex, so it can only mean a corrupted store, and it
+must surface here rather than as a baffling `ENOTDIR` from the rename.
 
 ## Replication and the WAL
 

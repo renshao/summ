@@ -68,6 +68,32 @@ pub(crate) fn fsync_dir(path: &Path) -> io::Result<()> {
 /// entirely when the leaf already exists, which is the common case once a bucket
 /// has been used - a bucket holds about six blobs at 10^8, so this runs roughly
 /// once per six commits at full scale and never after that.
+///
+/// # Concurrency
+///
+/// **A level another writer created first is a success, not a failure.** Every
+/// check here is a check-then-create, so it races by construction: two commits
+/// into a fresh store both find `blobs/<algo>` missing and both try to create
+/// it, and any two blobs at all share at least that much of their path. This is
+/// not a rare interleaving - `oras push` uploads an artifact's blobs in
+/// parallel, so it is what an ordinary push does. Taking `EEXIST` out to the
+/// caller turned that into a `500` with the layer already uploaded.
+///
+/// So `AlreadyExists` is absorbed, and the fsync still runs on that path. The
+/// winner is presumably about to sync the same parent, but "presumably" is not
+/// a durability argument and the two calls have not synchronised on anything:
+/// this function must not return until *its* caller may rename into the leaf
+/// and rely on the entry surviving a crash. An extra fsync of a directory that
+/// is already durable costs nothing worth measuring at once per six commits.
+///
+/// What is *not* absorbed is a non-directory holding the name. That cannot
+/// happen from our own writes - a level is two hex characters and a blob file
+/// is the full hex - so it means a corrupted or hand-edited store, and it must
+/// surface here rather than as a baffling `ENOTDIR` from the rename.
+///
+/// Errors name the level that actually failed, which is not usually `dir`: the
+/// caller knows which blob it was committing, and the thing it cannot work out
+/// is which of the four levels above it went wrong.
 pub(crate) fn create_dir_durable(dir: &Path, stop: &Path) -> io::Result<()> {
     if dir.try_exists()? {
         return Ok(());
@@ -87,10 +113,21 @@ pub(crate) fn create_dir_durable(dir: &Path, stop: &Path) -> io::Result<()> {
         }
     }
 
+    let at =
+        |level: &Path, e: io::Error| io::Error::new(e.kind(), format!("{}: {e}", level.display()));
     for level in missing.iter().rev() {
-        std::fs::create_dir(level)?;
+        match std::fs::create_dir(level) {
+            Ok(()) => {}
+            // Lost the race. Fine, so long as what won is a directory.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                if !level.is_dir() {
+                    return Err(at(level, e));
+                }
+            }
+            Err(e) => return Err(at(level, e)),
+        }
         if let Some(parent) = level.parent() {
-            fsync_dir(parent)?;
+            fsync_dir(parent).map_err(|e| at(parent, e))?;
         }
     }
     Ok(())
@@ -110,6 +147,57 @@ mod tests {
         assert_eq!(file, dir.join("ab".repeat(32)));
         // Not distribution's `.../<full-hex>/data`: the leaf *is* the blob.
         assert_ne!(file.file_name().and_then(|n| n.to_str()), Some("data"));
+    }
+
+    /// The bug this guards: two commits into a fresh store both walk up to the
+    /// blobs root, both find `blobs/<algo>` missing, and both create it. One
+    /// wins and the loser used to take `EEXIST` all the way out as a `500` on
+    /// an ordinary concurrent push.
+    ///
+    /// Sixteen threads on a barrier, sharing the algorithm directory and
+    /// pairwise sharing a whole leaf, so the collision is exercised at an
+    /// ancestor *and* at the leaf itself.
+    #[test]
+    fn levels_created_concurrently_do_not_fight_over_a_shared_ancestor() {
+        use std::sync::{Arc, Barrier};
+
+        const THREADS: usize = 16;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let blobs = root.path().join(BLOBS_DIR);
+        std::fs::create_dir(&blobs).expect("blobs root");
+
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|i| {
+                let barrier = Arc::clone(&barrier);
+                let blobs = blobs.clone();
+                std::thread::spawn(move || {
+                    let leaf = blobs.join(format!("sha256/{:02x}/00/ff", i / 2));
+                    barrier.wait();
+                    create_dir_durable(&leaf, &blobs).map(|()| leaf)
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            let leaf = handle
+                .join()
+                .expect("thread")
+                .expect("a level another thread created first is not a failure");
+            assert!(leaf.is_dir());
+        }
+    }
+
+    #[test]
+    fn a_file_where_a_level_should_be_is_still_an_error() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let blobs = root.path().join(BLOBS_DIR);
+        std::fs::create_dir(&blobs).expect("blobs root");
+        // Tolerating `AlreadyExists` must not tolerate a *file* squatting on a
+        // level, which is a broken store rather than a lost race.
+        std::fs::write(blobs.join("sha256"), b"not a directory").expect("write");
+        assert!(create_dir_durable(&blobs.join("sha256/ab/cd/ef"), &blobs).is_err());
     }
 
     #[test]
