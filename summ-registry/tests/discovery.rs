@@ -72,7 +72,7 @@ fn a_blob_is_servable_only_where_p_or_r_says_so() {
     assert!(!reg.blob_is_servable("never/heard/of", &shared.0).unwrap());
 
     // A mount is exactly a `P` edge under the target name.
-    reg.commit_blob("other/app", &shared.0, shared.1, 400)
+    reg.commit_blob("other/app", &shared.0, shared.1, at(400))
         .unwrap();
     assert!(reg.blob_is_servable("other/app", &shared.0).unwrap());
     assert_eq!(
@@ -198,7 +198,7 @@ fn a_shared_layer_lists_every_manifest_that_references_it() {
     let (_dir, reg) = fixture();
     let bytes = "a widely shared base layer";
     let shared = upload(&reg, "demo/app", bytes);
-    reg.commit_blob("other/app", &shared.0, shared.1, 100)
+    reg.commit_blob("other/app", &shared.0, shared.1, at(100))
         .unwrap();
 
     let mut expected = Vec::new();

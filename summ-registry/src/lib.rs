@@ -17,7 +17,7 @@
 //!   caller can compose several operations - a multi-tag push, say - into one
 //!   batch rather than several.
 //! - **Nothing non-deterministic goes into a batch.** Every builder takes
-//!   `now: u64` from the caller; none of them reads the clock. A batch
+//!   `now: Timestamp` from the caller; none of them reads the clock. A batch
 //!   therefore means the same thing wherever it is replayed.
 //! - **No unbounded list.** Every query here takes a cursor and a limit,
 //!   including the ones that look like aggregates. See [`Registry::repo_usage`]
@@ -38,6 +38,7 @@ pub mod uploads;
 
 mod delete;
 mod discovery;
+mod history;
 mod referrers;
 mod suffix;
 mod tags;
@@ -54,6 +55,7 @@ pub use discovery::{
     BlobReference, BlobReferenceList, DigestList, ManifestCountPage, ManifestList, RepoList,
     RepoUsagePage, TagCountPage,
 };
+pub use history::{HistoryCursor, TagEventEntry, TagHistory};
 pub use referrers::{ReferrerEntry, ReferrerList};
 pub use tags::{TagList, TagSet};
 pub use uploads::UploadKey;

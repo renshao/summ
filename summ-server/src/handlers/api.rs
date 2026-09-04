@@ -43,7 +43,7 @@ use serde::Serialize;
 use super::{build, method_not_allowed, ops_error, Ctx, Handled};
 use crate::error::{ApiError, ErrorCode};
 use crate::reference::{parse_digest, valid_tag, Reference};
-use crate::seam::{ManifestInfo, RepoDetail, RepoSummary, TagInfo, Tally};
+use crate::seam::{ManifestInfo, RepoDetail, RepoSummary, TagEventInfo, TagInfo, Tally};
 
 /// Rows per page when `?n=` is absent.
 pub const DEFAULT_PAGE: usize = 25;
@@ -67,6 +67,10 @@ pub enum ApiEndpoint {
     Manifests { name: String },
     /// `GET /api/v1/manifests/<name>@<reference>`
     Manifest { name: String, reference: String },
+    /// `GET /api/v1/tag-history/<name>@<reference>`, where `<reference>` is a
+    /// tag or a digest and the two ask different questions - see
+    /// [`crate::seam::Registry::tag_history`].
+    TagHistory { name: String, reference: String },
 }
 
 // ---- wire shapes ---------------------------------------------------------
@@ -150,6 +154,52 @@ struct ManifestsBody {
     next: Option<String>,
 }
 
+/// One tag event.
+///
+/// `at` is unix **milliseconds**, unlike `tagged_at` and `pushed_at` next door,
+/// which are seconds. Tag events are ordered by this value and a second is not
+/// fine enough: two events on one tag inside a second collide.
+#[derive(Serialize)]
+struct TagEventBody {
+    at: u64,
+    tag: String,
+    digest: String,
+    event: &'static str,
+    /// The manifest's media type and size *at the time of the event*, kept in
+    /// the event itself so a row still renders after the manifest is gone.
+    media_type: String,
+    size: u64,
+}
+
+/// Both halves of the resume position, because events can share an instant.
+#[derive(Serialize)]
+struct HistoryCursorBody {
+    before: u64,
+    last: String,
+}
+
+#[derive(Serialize)]
+struct TagHistoryBody {
+    events: Vec<TagEventBody>,
+    next: Option<HistoryCursorBody>,
+}
+
+impl From<TagEventInfo> for TagEventBody {
+    fn from(event: TagEventInfo) -> Self {
+        TagEventBody {
+            at: event.at,
+            tag: event.tag,
+            digest: event.digest.to_string(),
+            // The vocabulary distribution-spec#606 proposes for the same two
+            // events, so a future `_oci/tag-history` response is a rename of
+            // the envelope rather than of the rows.
+            event: if event.deleted { "deleted" } else { "created" },
+            media_type: event.media_type,
+            size: event.size,
+        }
+    }
+}
+
 impl From<ManifestInfo> for ManifestBody {
     fn from(info: ManifestInfo) -> Self {
         ManifestBody {
@@ -218,6 +268,7 @@ pub async fn handle(ctx: &Ctx, endpoint: ApiEndpoint) -> Handled {
         ApiEndpoint::Tags { name } => tags(ctx, &name).await,
         ApiEndpoint::Manifests { name } => manifests(ctx, &name).await,
         ApiEndpoint::Manifest { name, reference } => manifest(ctx, &name, &reference).await,
+        ApiEndpoint::TagHistory { name, reference } => tag_history(ctx, &name, &reference).await,
     }
 }
 
@@ -319,6 +370,43 @@ async fn manifest(ctx: &Ctx, name: &str, reference: &str) -> Handled {
         .await
         .map_err(ops_error)?;
     json(ctx, &ManifestBody::from(info))
+}
+
+/// Tag history, newest first.
+///
+/// `?before=` is a filter in its own right - "what did this look like last
+/// Tuesday" - and `?before=` plus `?last=` is the exact resume a `next` cursor
+/// hands back. Both are needed because two events can share a millisecond, so a
+/// page can end inside one instant and an instant-only cursor would skip the
+/// rest of it.
+async fn tag_history(ctx: &Ctx, name: &str, reference: &str) -> Handled {
+    let (limit, last) = page_params(ctx)?;
+    let reference = parse_reference(reference)?;
+    let before = match ctx.param("before") {
+        Some(raw) => Some(raw.parse::<u64>().map_err(|_| {
+            ApiError::new(ErrorCode::PaginationNumberInvalid)
+                .with_message("invalid before")
+                .with_detail(format!("before={raw}"))
+        })?),
+        None => None,
+    };
+
+    let (events, next) = ctx
+        .registry()
+        .tag_history(name, &reference, before, last.as_deref(), limit)
+        .await
+        .map_err(ops_error)?;
+
+    json(
+        ctx,
+        &TagHistoryBody {
+            events: events.into_iter().map(TagEventBody::from).collect(),
+            next: next.map(|c| HistoryCursorBody {
+                before: c.before,
+                last: c.last,
+            }),
+        },
+    )
 }
 
 // ---- helpers -------------------------------------------------------------

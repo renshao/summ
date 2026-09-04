@@ -288,6 +288,42 @@ pub struct TagInfo {
     pub manifest: Option<ManifestInfo>,
 }
 
+/// One row of a tag's history.
+///
+/// The event log is not a list of what a tag pointed to. A repoint writes one
+/// `Created` for the new digest and no `Deleted` for the displaced one, so "what
+/// did this tag point to at time T" is a fold: the newest `Created` at or before
+/// T, unless a `Deleted` is newer. And the event is written unconditionally, so
+/// re-pushing a tag at the digest it already has is a second row - it records
+/// pushes, not changes.
+///
+/// `media_type` and `size` are the manifest's *as of that event*, denormalised
+/// so a row still renders after the manifest is gone. Every `Deleted` row
+/// describes a state that may no longer exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagEventInfo {
+    /// Unix milliseconds. A second is not fine enough to order tag events - two
+    /// of them in one second on the same tag encode to the same key.
+    pub at: u64,
+    pub tag: String,
+    pub digest: Digest,
+    pub deleted: bool,
+    pub media_type: String,
+    pub size: u64,
+}
+
+/// Where the next page of history resumes.
+///
+/// Both halves, because events can share a millisecond and a page can end
+/// inside one. Resuming from the instant alone would skip the rest of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryCursor {
+    pub before: u64,
+    /// The digest of the last tag-addressed row, the tag of the last
+    /// digest-addressed one.
+    pub last: String,
+}
+
 /// Failures the layers below can report, in the vocabulary of the spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpsError {
@@ -513,4 +549,25 @@ pub trait Registry: Send + Sync + 'static {
 
     /// One manifest, or [`OpsError::ManifestUnknown`].
     async fn manifest_detail(&self, name: &str, reference: &Reference) -> OpsResult<ManifestInfo>;
+
+    /// Tag history, newest first.
+    ///
+    /// `reference` is a tag or a digest, and the two are different questions:
+    /// a tag asks "what has this name pointed at", a digest asks "what has this
+    /// manifest been called". They are served by the `H` and `J` ranges
+    /// respectively, which hold the same events indexed both ways.
+    ///
+    /// `before` alone filters to events strictly before that instant; with
+    /// `last` it is an exact resume. An unknown repository, tag or manifest is
+    /// an empty page rather than an error - history outlives what it describes,
+    /// so a deleted tag must still answer, and by then nothing distinguishes
+    /// "never existed" from "gone".
+    async fn tag_history(
+        &self,
+        name: &str,
+        reference: &Reference,
+        before: Option<u64>,
+        last: Option<&str>,
+        limit: usize,
+    ) -> OpsResult<(Vec<TagEventInfo>, Option<HistoryCursor>)>;
 }

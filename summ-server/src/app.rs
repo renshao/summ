@@ -247,6 +247,17 @@ pub fn api_route(path: &str) -> Result<ApiEndpoint, RouteError> {
                 name: name_of(remainder)?,
             }),
         },
+        // A reference is mandatory here, unlike `manifests`: there is no
+        // whole-repository history collection. `H` and `J` are both scoped to
+        // one tag or one manifest, and a repo-wide scan across every tag's
+        // events is exactly the unbounded read this API does not offer.
+        "tag-history" => match remainder.rsplit_once('@') {
+            Some((name, reference)) => Ok(ApiEndpoint::TagHistory {
+                name: name_of(name)?,
+                reference: query::path_decode(reference),
+            }),
+            None => Err(RouteError::NoMatch),
+        },
         _ => Err(RouteError::NoMatch),
     }
 }
@@ -388,6 +399,34 @@ mod tests {
             name: name.to_owned(),
             reference: reference.to_owned(),
         })
+    }
+
+    /// The `@` split is what makes a name containing `/` safe here: a
+    /// repository named `demo/app` and a tag are one path, unambiguously,
+    /// because `@` is in neither the name grammar nor the tag grammar.
+    #[test]
+    fn tag_history_splits_the_reference_off_the_end() {
+        assert_eq!(
+            api_route("/api/v1/tag-history/demo/app@latest"),
+            Ok(ApiEndpoint::TagHistory {
+                name: "demo/app".to_owned(),
+                reference: "latest".to_owned(),
+            })
+        );
+        assert_eq!(
+            api_route("/api/v1/tag-history/demo/app@sha256:abcd"),
+            Ok(ApiEndpoint::TagHistory {
+                name: "demo/app".to_owned(),
+                reference: "sha256:abcd".to_owned(),
+            })
+        );
+        // No whole-repository history collection: `H` and `J` are both scoped
+        // to one tag or one manifest, so a bare name has nothing to answer.
+        assert_eq!(
+            api_route("/api/v1/tag-history/demo/app"),
+            Err(RouteError::NoMatch)
+        );
+        assert_eq!(api_route("/api/v1/tag-history"), Err(RouteError::NoMatch));
     }
 
     #[test]

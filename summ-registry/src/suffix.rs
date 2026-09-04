@@ -5,6 +5,11 @@
 //! engine cursor is a whole key, and every list here hands back a token the
 //! caller can put in a URL - a tag name, a digest - rather than an opaque blob.
 //! These mirror the encoders in `keys.rs` and would sit better next to them.
+//!
+//! The two history ranges are the exception and decode in `keys.rs` already:
+//! `H` and `J` store their timestamp complemented, and a decoder that did not
+//! sit beside the encoder would be a second copy of that convention to keep in
+//! step. See `keys::tag_history_suffix`.
 
 use summ_core::{Digest, RepoId};
 

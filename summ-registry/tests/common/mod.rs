@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use sha2::Digest as _;
-use summ_core::Digest;
+use summ_core::{Digest, Timestamp};
 use summ_meta::RedbEngine;
 use summ_registry::{ManifestPut, Reference, Registry, RegistryOptions};
 use tempfile::TempDir;
@@ -40,9 +40,17 @@ pub fn sha256(bytes: &[u8]) -> Digest {
 pub fn upload(reg: &Registry, repo: &str, content: &str) -> (Digest, u64) {
     let bytes = content.as_bytes();
     let digest = sha256(bytes);
-    reg.commit_blob(repo, &digest, bytes.len() as u64, 1_000)
+    reg.commit_blob(repo, &digest, bytes.len() as u64, at(1_000))
         .unwrap();
     (digest, bytes.len() as u64)
+}
+
+/// Tests spell timestamps as bare integers; the store wants a [`Timestamp`].
+///
+/// Milliseconds, matching what the server reads off the clock - a second is not
+/// fine enough to order two tag events on one tag.
+pub fn at(millis: u64) -> Timestamp {
+    Timestamp::from_millis(millis)
 }
 
 pub fn descriptor(media_type: &str, digest: &Digest, size: u64) -> serde_json::Value {
@@ -144,7 +152,7 @@ pub fn push(
         reference: &reference,
         body,
         content_type: Some(OCI_MANIFEST),
-        now,
+        now: at(now),
     })
     .map(|o| o.digest)
 }

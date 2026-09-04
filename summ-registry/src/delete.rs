@@ -10,7 +10,7 @@
 //! purge's business, and because a blob is only servable when `R` or `P` says
 //! so, bytes lingering after the edges are gone are invisible.
 
-use summ_core::{keys, Digest};
+use summ_core::{keys, Digest, Timestamp};
 use summ_meta::WriteBatch;
 
 use crate::error::{RegistryError, Result};
@@ -46,7 +46,7 @@ impl Registry {
         &self,
         repo: &str,
         digest: &Digest,
-        now: u64,
+        now: Timestamp,
     ) -> Result<ManifestDeleted> {
         let planned = self.plan_manifest_delete(repo, digest, now)?;
         self.engine().apply(&planned.batch)?;
@@ -74,7 +74,7 @@ impl Registry {
         &self,
         repo: &str,
         digest: &Digest,
-        now: u64,
+        now: Timestamp,
     ) -> Result<Planned<ManifestDeleted>> {
         let repo_id = self.require_repo(repo)?;
         let record = self.manifest_record(repo_id, digest)?.ok_or_else(|| {

@@ -75,12 +75,30 @@ function shortDigest(d) {
 
 function when(unix) {
   if (!unix) return null;
-  const then = new Date(unix * 1000);
+  return relative(new Date(unix * 1000));
+}
+
+/*
+ * Tag events are milliseconds, unlike `pushed_at` and `tagged_at` next door.
+ * A second is not fine enough to order two events on one tag, so the store
+ * keeps more precision here and the UI has to know which it is holding.
+ */
+function whenMs(millis) {
+  if (!millis) return null;
+  return relative(new Date(millis));
+}
+
+function relative(then) {
   const days = Math.floor((Date.now() - then.getTime()) / 86400000);
   if (days < 1) return 'today';
   if (days === 1) return 'yesterday';
   if (days < 30) return `${days} days ago`;
   return then.toISOString().slice(0, 10);
+}
+
+/** The exact instant, for a timeline where ordering is the whole point. */
+function exact(millis) {
+  return new Date(millis).toISOString().replace('T', ' ').replace('Z', ' UTC');
 }
 
 // ---- data ----------------------------------------------------------------
@@ -118,6 +136,8 @@ const apiTags = (name) => '/api/v1/tags/' + escapeName(name);
 const apiManifests = (name) => '/api/v1/manifests/' + escapeName(name);
 const apiManifest = (name, ref) =>
   '/api/v1/manifests/' + escapeName(name) + '@' + encodeURIComponent(ref);
+const apiTagHistory = (name, ref) =>
+  '/api/v1/tag-history/' + escapeName(name) + '@' + encodeURIComponent(ref);
 
 // ---- shared pieces -------------------------------------------------------
 
@@ -416,7 +436,12 @@ async function manifestPage(name, reference) {
   if (m.subject) rows.push(['Subject', el('span', { class: 'mono', text: m.subject })]);
   if (m.pushed_at) rows.push(['Pushed', when(m.pushed_at)]);
   if (m.tags.length) {
-    rows.push(['Tags', el('span', { class: 'chips' }, m.tags.map((t) => el('span', { class: 'chip tag', text: t })))]);
+    // Each tag links to its own history - the other direction of the same
+    // events, indexed by name instead of by digest.
+    rows.push(['Tags', el('span', { class: 'chips' }, m.tags.map((t) => el('a', {
+      class: 'chip tag',
+      href: `/r/${name}?history=${encodeURIComponent(t)}`,
+    }, [t])))]);
   }
   for (const [key, value] of Object.entries(m.annotations || {})) {
     rows.push([key, el('span', { class: 'mono', text: value })]);
@@ -439,6 +464,80 @@ async function manifestPage(name, reference) {
       el('span', { class: 'mono', text: `${location.host}/${name}@${m.digest}` }),
     ]),
     el('div', { class: 'list' }, [kv]),
+    el('h2', { class: 'section', text: 'Tag history' }),
+    el('p', { class: 'subtitle', text: 'Every name this manifest has been given, newest first.' }),
+    historyList(name, m.digest, 'tag'),
+  );
+}
+
+// ---- tag history ---------------------------------------------------------
+
+/*
+ * The event log, newest first. A row is one push or one delete, not one state:
+ * a tag re-pushed at the digest it already had is genuinely two rows, because
+ * the store records pushes rather than changes.
+ *
+ * Paged like every other list here, except that its cursor is a pair - the
+ * instant plus the tiebreaker - because two events can share a millisecond and
+ * an instant alone would skip the rest of one.
+ */
+function historyList(name, reference, showing) {
+  return pagedList(
+    (cursor) => api(apiTagHistory(name, reference), {
+      n: PAGE,
+      before: cursor && cursor.before,
+      last: cursor && cursor.last,
+    }).then((b) => ({ items: b.events, next: b.next })),
+    (event) => historyRow(name, event, showing),
+    empty('No tag events recorded.', 'History is kept from the first push onwards.'),
+  );
+}
+
+/**
+ * `showing` picks the half of the event the caller did *not* ask about: a tag's
+ * history is a list of digests, a manifest's is a list of names.
+ */
+function historyRow(name, event, showing) {
+  const created = event.event !== 'deleted';
+  const title = showing === 'tag'
+    ? el('span', { class: 'chip tag', text: event.tag })
+    : el('span', { class: 'digest', text: shortDigest(event.digest) });
+
+  const sub = [el('span', { title: exact(event.at), text: whenMs(event.at) })];
+  if (event.media_type) sub.push(el('span', { text: event.media_type }));
+  if (event.size) {
+    const [size, unit] = bytes(event.size);
+    sub.push(el('span', { text: `${size} ${unit}` }));
+  }
+
+  // A deleted event names a manifest that may no longer be here - the
+  // descriptor is denormalised into the event precisely so this row still
+  // renders - so only a created one is a link.
+  const attrs = { class: 'row event' + (created ? '' : ' gone') };
+  if (created) attrs.href = `/r/${name}?manifest=${encodeURIComponent(event.digest)}`;
+
+  return el(created ? 'a' : 'div', attrs, [
+    el('div', { class: 'row-main' }, [
+      el('div', { class: 'row-title' }, [
+        el('span', { class: 'chip ' + (created ? 'created' : 'deleted'), text: created ? 'created' : 'deleted' }),
+        title,
+      ]),
+      el('div', { class: 'row-sub' }, sub),
+    ]),
+  ]);
+}
+
+/** One tag's history: what this name has pointed at, newest first. */
+function tagHistoryPage(name, tag) {
+  render(
+    crumbs([
+      { text: 'Repositories', href: '/' },
+      { text: name, href: '/r/' + name },
+      { text: tag },
+    ]),
+    el('h1', {}, [el('span', { class: 'chip tag', text: tag })]),
+    el('p', { class: 'subtitle', text: 'Every push and delete of this tag, newest first.' }),
+    historyList(name, tag, 'digest'),
   );
 }
 
@@ -461,6 +560,8 @@ function route() {
     if (!name) return repositoriesPage(query);
     document.title = `${name} · Summ`;
     const manifest = query.get('manifest');
+    const history = query.get('history');
+    if (history) return tagHistoryPage(name, history);
     return manifest ? manifestPage(name, manifest) : repositoryPage(name, query);
   }
 

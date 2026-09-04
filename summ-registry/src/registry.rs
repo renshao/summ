@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use sha2::{Digest as _, Sha256, Sha512};
-use summ_core::{keys, BlobRecord, Digest, ManifestRecord, ReferrerRecord, RepoBlobRecord, RepoId};
+use summ_core::{
+    keys, BlobRecord, Digest, ManifestRecord, ReferrerRecord, RepoBlobRecord, RepoId, Timestamp,
+};
 use summ_meta::{MetaEngine, RepoInterner, WriteBatch};
 
 use crate::codec::{compress_body, decode, decompress_body, encode};
@@ -91,7 +93,7 @@ pub struct ManifestPut<'a> {
     /// `Content-Type` of the push, with any parameters already stripped.
     pub content_type: Option<&'a str>,
     /// Unix seconds, supplied by the caller so the batch carries no clock read.
-    pub now: u64,
+    pub now: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,7 +216,13 @@ impl Registry {
     /// adding a `P` edge under the target name, once the caller has checked
     /// with [`Registry::blob_is_servable`] that the *source* repo was entitled
     /// to the blob in the first place.
-    pub fn commit_blob(&self, repo: &str, digest: &Digest, size: u64, now: u64) -> Result<()> {
+    pub fn commit_blob(
+        &self,
+        repo: &str,
+        digest: &Digest,
+        size: u64,
+        now: Timestamp,
+    ) -> Result<()> {
         let planned = self.plan_blob_commit(repo, digest, size, now)?;
         self.engine.apply(&planned.batch)?;
         Ok(())
@@ -225,7 +233,7 @@ impl Registry {
         repo: &str,
         digest: &Digest,
         size: u64,
-        now: u64,
+        now: Timestamp,
     ) -> Result<Planned<()>> {
         let repo_id = self.intern_repo(repo)?;
         let mut batch = WriteBatch::new();
@@ -241,7 +249,7 @@ impl Registry {
                 keys::repo_blob(repo_id, digest),
                 encode(&RepoBlobRecord {
                     size,
-                    added_at: now,
+                    added_at: now.secs(),
                 })?,
             );
         }
@@ -436,7 +444,7 @@ impl Registry {
             subject: parsed.subject,
             artifact_type: parsed.artifact_type.clone(),
             annotations: parsed.annotations.clone(),
-            pushed_at: req.now,
+            pushed_at: req.now.secs(),
         };
         batch.put(keys::manifest(repo_id, &digest), encode(&record)?);
         batch.put(
@@ -511,7 +519,7 @@ impl Registry {
         repo: RepoId,
         manifest_digest: &Digest,
         parsed: &ParsedManifest,
-        now: u64,
+        now: Timestamp,
     ) -> Result<()> {
         for desc in &parsed.blobs {
             let known = self.blob_record(&desc.digest)?;
@@ -554,7 +562,7 @@ impl Registry {
                     keys::repo_blob(repo, &desc.digest),
                     encode(&RepoBlobRecord {
                         size,
-                        added_at: now,
+                        added_at: now.secs(),
                     })?,
                 );
             }

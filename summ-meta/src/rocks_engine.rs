@@ -373,7 +373,7 @@ impl MetaEngine for RocksEngine {
 #[cfg(test)]
 mod tests {
     use super::{prefix_successor, summ_in_domain, summ_prefix_len, summ_transform};
-    use summ_core::{keys, Digest};
+    use summ_core::{keys, Digest, Timestamp};
 
     fn sha256(b: u8) -> Digest {
         Digest::Sha256([b; 32])
@@ -499,11 +499,11 @@ mod tests {
         let d = sha256(7);
         for (key, group) in [
             (
-                keys::tag_history(7, "latest", 1_000, &d),
+                keys::tag_history(7, "latest", Timestamp::from_millis(1_000), &d),
                 keys::manifests_in_repo(7),
             ),
             (
-                keys::manifest_tag_history(7, &d, 1_000, "latest"),
+                keys::manifest_tag_history(7, &d, Timestamp::from_millis(1_000), "latest"),
                 keys::manifests_in_repo(7),
             ),
         ] {
@@ -542,13 +542,19 @@ mod tests {
                     }
                 }
                 for ts in [1_000u64, 2_000] {
-                    corpus.push(keys::manifest_tag_history(repo, &d, ts, "latest"));
+                    let at = Timestamp::from_millis(ts);
+                    corpus.push(keys::manifest_tag_history(repo, &d, at, "latest"));
                 }
             }
             for tag in ["a", "latest", "v1"] {
                 corpus.push(keys::tag(repo, tag));
                 corpus.push(keys::counter_tag(repo, tag, 20_000, 0));
-                corpus.push(keys::tag_history(repo, tag, 1_000, &sha256(1)));
+                corpus.push(keys::tag_history(
+                    repo,
+                    tag,
+                    Timestamp::from_millis(1_000),
+                    &sha256(1),
+                ));
             }
             corpus.push(keys::counter_repo(repo, 20_000, 0));
         }

@@ -208,7 +208,7 @@ fn a_cosign_tag_set_after_the_push_synthesises_the_same_edge() {
     let sig = put(&reg, "demo/app", &sha256(&body).to_string(), &body, 300);
 
     let tag = format!("sha256-{}.sig", hex_of(&subject.0));
-    reg.set_tag("demo/app", &tag, &sig, 400).unwrap();
+    reg.set_tag("demo/app", &tag, &sig, at(400)).unwrap();
 
     let list = reg
         .referrers("demo/app", &subject.0, None, None, 10)
@@ -235,8 +235,8 @@ fn moving_a_cosign_tag_retracts_the_edge_it_used_to_imply() {
             300,
         ));
     }
-    reg.set_tag("demo/app", &tag, &sigs[0], 400).unwrap();
-    reg.set_tag("demo/app", &tag, &sigs[1], 500).unwrap();
+    reg.set_tag("demo/app", &tag, &sigs[0], at(400)).unwrap();
+    reg.set_tag("demo/app", &tag, &sigs[1], at(500)).unwrap();
 
     let list = reg
         .referrers("demo/app", &subject.0, None, None, 10)
@@ -249,7 +249,7 @@ fn moving_a_cosign_tag_retracts_the_edge_it_used_to_imply() {
 
     // And deleting the tag removes the last one, which is what lets purge
     // reclaim the signature once its subject is gone.
-    reg.delete_tag("demo/app", &tag, 600).unwrap();
+    reg.delete_tag("demo/app", &tag, at(600)).unwrap();
     let repo = reg.lookup_repo("demo/app").unwrap().unwrap();
     assert!(!reg
         .engine()

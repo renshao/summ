@@ -38,6 +38,7 @@ const READABLE: &[&str] = &[
     "/v2/lib/nginx/manifests/v1",
     "/api/v1/repositories",
     "/api/v1/tags/lib/nginx",
+    "/api/v1/tag-history/lib/nginx@v1",
     "/app.css",
     "/app.js",
     "/logo.svg",

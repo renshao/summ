@@ -18,6 +18,7 @@
 //! and removes read-modify-write from the write path entirely.
 
 use crate::digest::Digest;
+use crate::time::Timestamp;
 use crate::types::RepoId;
 
 pub const PREFIX_MANIFEST: u8 = b'M';
@@ -244,8 +245,14 @@ pub fn uploads() -> Vec<u8> {
 /// The consequence for callers is that a `before`/`since` cursor is just a
 /// `start_after` seek to the complement of the boundary instant, so there is no
 /// pagination token to invent.
-fn push_desc_time(k: &mut Vec<u8>, unix_seconds: u64) {
-    k.extend_from_slice(&(!unix_seconds).to_be_bytes());
+fn push_desc_time(k: &mut Vec<u8>, at: Timestamp) {
+    k.extend_from_slice(&(!at.millis()).to_be_bytes());
+}
+
+/// Read a complemented timestamp back out of a history key.
+fn read_desc_time(bytes: &[u8]) -> Option<Timestamp> {
+    let raw: [u8; 8] = bytes.get(..8)?.try_into().ok()?;
+    Some(Timestamp::from_millis(!u64::from_be_bytes(raw)))
 }
 
 /// `H <repo> <tag> 0 <!ts> <digest>` -> `TagEvent`, newest first.
@@ -253,7 +260,7 @@ fn push_desc_time(k: &mut Vec<u8>, unix_seconds: u64) {
 /// The digest is in the key rather than only in the value because it is the
 /// collision breaker: two events on one tag at the same instant with the same
 /// digest are the same event.
-pub fn tag_history(repo: RepoId, tag: &str, unix_seconds: u64, digest: &Digest) -> Vec<u8> {
+pub fn tag_history(repo: RepoId, tag: &str, at: Timestamp, digest: &Digest) -> Vec<u8> {
     let mut k = start_repo(
         PREFIX_TAG_HISTORY,
         repo,
@@ -261,7 +268,7 @@ pub fn tag_history(repo: RepoId, tag: &str, unix_seconds: u64, digest: &Digest) 
     );
     k.extend_from_slice(tag.as_bytes());
     k.push(TAG_END);
-    push_desc_time(&mut k, unix_seconds);
+    push_desc_time(&mut k, at);
     digest.encode_into(&mut k);
     k
 }
@@ -276,27 +283,48 @@ pub fn tag_history_of(repo: RepoId, tag: &str) -> Vec<u8> {
 
 /// Seek key for "events strictly before this instant", given the descending
 /// order. Pass as `start_after`.
-pub fn tag_history_before(repo: RepoId, tag: &str, unix_seconds: u64) -> Vec<u8> {
+///
+/// Seeking to `!at` would be *inclusive*: an event at exactly `at` encodes to
+/// `<prefix> !at <digest>`, which is longer than the cursor and therefore sorts
+/// after it, so `start_after` would return it. Backing the cursor up by one
+/// millisecond excludes the whole instant and nothing else.
+pub fn tag_history_before(repo: RepoId, tag: &str, at: Timestamp) -> Vec<u8> {
     let mut k = tag_history_of(repo, tag);
-    push_desc_time(&mut k, unix_seconds);
+    push_desc_time(
+        &mut k,
+        Timestamp::from_millis(at.millis().saturating_sub(1)),
+    );
     k
+}
+
+/// Split `H <repo> <tag> 0 <!ts> <digest>` after the tag separator.
+///
+/// The timestamp lives only in the key - `TagEvent` deliberately does not
+/// repeat it - so a reader has to decode it to render a row.
+pub fn tag_history_suffix(key: &[u8], scan_prefix: &[u8]) -> Option<(Timestamp, Digest)> {
+    let rest = key.strip_prefix(scan_prefix)?;
+    let at = read_desc_time(rest)?;
+    let (digest, _) = Digest::decode(rest.get(8..)?)?;
+    Some((at, digest))
+}
+
+/// Split `J <repo> <digest> <!ts> <tag>` after the digest.
+pub fn manifest_tag_history_suffix(key: &[u8], scan_prefix: &[u8]) -> Option<(Timestamp, String)> {
+    let rest = key.strip_prefix(scan_prefix)?;
+    let at = read_desc_time(rest)?;
+    Some((at, String::from_utf8(rest.get(8..)?.to_vec()).ok()?))
 }
 
 /// `J <repo> <digest> <!ts> <tag>` -> `TagEvent`. The digest-addressed form of
 /// the same history: what was this manifest ever tagged, and when.
-pub fn manifest_tag_history(
-    repo: RepoId,
-    digest: &Digest,
-    unix_seconds: u64,
-    tag: &str,
-) -> Vec<u8> {
+pub fn manifest_tag_history(repo: RepoId, digest: &Digest, at: Timestamp, tag: &str) -> Vec<u8> {
     let mut k = start_repo(
         PREFIX_MANIFEST_TAG_HISTORY,
         repo,
         digest.encoded_len() + 8 + tag.len(),
     );
     digest.encode_into(&mut k);
-    push_desc_time(&mut k, unix_seconds);
+    push_desc_time(&mut k, at);
     k.extend_from_slice(tag.as_bytes());
     k
 }
@@ -304,6 +332,17 @@ pub fn manifest_tag_history(
 pub fn manifest_tag_history_of(repo: RepoId, digest: &Digest) -> Vec<u8> {
     let mut k = start_repo(PREFIX_MANIFEST_TAG_HISTORY, repo, digest.encoded_len());
     digest.encode_into(&mut k);
+    k
+}
+
+/// The `J` counterpart of [`tag_history_before`], with the same
+/// strictly-before semantics.
+pub fn manifest_tag_history_before(repo: RepoId, digest: &Digest, at: Timestamp) -> Vec<u8> {
+    let mut k = manifest_tag_history_of(repo, digest);
+    push_desc_time(
+        &mut k,
+        Timestamp::from_millis(at.millis().saturating_sub(1)),
+    );
     k
 }
 
@@ -517,35 +556,94 @@ mod tests {
         assert_eq!(parse_repo_id(&k[1..]), Some(9_000_000));
     }
 
+    fn ms(millis: u64) -> Timestamp {
+        Timestamp::from_millis(millis)
+    }
+
     #[test]
     fn tag_history_is_newest_first_and_cannot_reach_a_prefix_neighbour() {
         // Later timestamp must sort earlier, since the endpoint returns
         // descending order and the engines only scan forward.
-        let old = tag_history(1, "latest", 1_000, &d(1));
-        let new = tag_history(1, "latest", 2_000, &d(1));
+        let old = tag_history(1, "latest", ms(1_000), &d(1));
+        let new = tag_history(1, "latest", ms(2_000), &d(1));
         assert!(new < old);
 
         // `foo` must not sweep up `foobar`: that is what the NUL is for.
-        assert!(!tag_history(1, "foobar", 1_000, &d(1)).starts_with(&tag_history_of(1, "foo")));
-        assert!(tag_history(1, "foo", 1_000, &d(1)).starts_with(&tag_history_of(1, "foo")));
+        assert!(!tag_history(1, "foobar", ms(1_000), &d(1)).starts_with(&tag_history_of(1, "foo")));
+        assert!(tag_history(1, "foo", ms(1_000), &d(1)).starts_with(&tag_history_of(1, "foo")));
+    }
+
+    /// Milliseconds are what stop a create and a delete of the same tag at the
+    /// same digest, inside one second, from encoding to the same key - which
+    /// would drop the earlier event entirely.
+    #[test]
+    fn two_events_a_millisecond_apart_are_two_keys() {
+        let create = tag_history(1, "latest", ms(1_700_000_000_001), &d(1));
+        let delete = tag_history(1, "latest", ms(1_700_000_000_002), &d(1));
+        assert_ne!(create, delete);
+        assert!(delete < create, "the later event sorts first");
     }
 
     #[test]
-    fn a_history_before_cursor_seeks_past_newer_events() {
-        // `before = 2_000` should skip the 3_000 event and land on the 1_000 one.
-        let cursor = tag_history_before(1, "latest", 2_000);
-        let newer = tag_history(1, "latest", 3_000, &d(1));
-        let older = tag_history(1, "latest", 1_000, &d(1));
-        assert!(newer < cursor, "a newer event must sort before the cursor");
-        assert!(older > cursor, "an older event must sort after the cursor");
+    fn a_history_before_cursor_excludes_its_own_instant() {
+        // `before = 2_000` is strictly-before: the 2_000 event is excluded
+        // along with the newer one, and the 1_999 event is the first row.
+        let cursor = tag_history_before(1, "latest", ms(2_000));
+        for newer in [3_000, 2_000] {
+            assert!(
+                tag_history(1, "latest", ms(newer), &d(1)) < cursor,
+                "an event at {newer} must sort before a cursor of 2000"
+            );
+        }
+        for older in [1_999, 1_000] {
+            assert!(
+                tag_history(1, "latest", ms(older), &d(1)) > cursor,
+                "an event at {older} must sort after a cursor of 2000"
+            );
+        }
+    }
+
+    #[test]
+    fn history_suffixes_decode_what_the_encoders_wrote() {
+        let scan = tag_history_of(1, "latest");
+        let key = tag_history(1, "latest", ms(1_700_000_000_123), &d(1));
+        assert_eq!(
+            tag_history_suffix(&key, &scan),
+            Some((ms(1_700_000_000_123), d(1)))
+        );
+
+        let scan = manifest_tag_history_of(1, &d(1));
+        let key = manifest_tag_history(1, &d(1), ms(1_700_000_000_123), "latest");
+        assert_eq!(
+            manifest_tag_history_suffix(&key, &scan),
+            Some((ms(1_700_000_000_123), "latest".to_string()))
+        );
+
+        // A sha512 digest shifts the tail; the scan prefix carries its own
+        // length, so nothing has to know which algorithm it was.
+        let big = Digest::Sha512([7; 64]);
+        let scan = manifest_tag_history_of(1, &big);
+        let key = manifest_tag_history(1, &big, ms(42), "v1");
+        assert_eq!(
+            manifest_tag_history_suffix(&key, &scan),
+            Some((ms(42), "v1".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_truncated_history_key_decodes_to_nothing_rather_than_panicking() {
+        let scan = tag_history_of(1, "latest");
+        assert_eq!(tag_history_suffix(&scan, &scan), None);
+        assert_eq!(tag_history_suffix(b"H", &scan), None);
+        let scan = manifest_tag_history_of(1, &d(1));
+        assert_eq!(manifest_tag_history_suffix(&scan, &scan), None);
     }
 
     #[test]
     fn manifest_tag_history_scans_within_one_manifest() {
-        assert!(
-            manifest_tag_history(1, &d(1), 5, "v1").starts_with(&manifest_tag_history_of(1, &d(1)))
-        );
-        assert!(!manifest_tag_history(1, &d(2), 5, "v1")
+        assert!(manifest_tag_history(1, &d(1), ms(5), "v1")
+            .starts_with(&manifest_tag_history_of(1, &d(1))));
+        assert!(!manifest_tag_history(1, &d(2), ms(5), "v1")
             .starts_with(&manifest_tag_history_of(1, &d(1))));
     }
 

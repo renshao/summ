@@ -543,3 +543,205 @@ async fn the_ui_loads_nothing_from_the_network() {
         }
     }
 }
+
+// ---- tag history ---------------------------------------------------------
+
+#[tokio::test]
+async fn tag_history_returns_events_newest_first() {
+    let h = Harness::new();
+    let first = seed_image(&h, "demo/app", "latest", "one");
+    let second = seed_image(&h, "demo/app", "latest", "two");
+
+    let body = h.get("/api/v1/tag-history/demo/app@latest").await;
+    let events = body["events"].as_array().expect("an array");
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["digest"].as_str(), Some(second.as_str()));
+    assert_eq!(events[1]["digest"].as_str(), Some(first.as_str()));
+    for event in events {
+        assert_eq!(event["tag"].as_str(), Some("latest"));
+        assert_eq!(event["event"].as_str(), Some("created"));
+        assert!(event["at"].as_u64().expect("a timestamp") > 0);
+        // The descriptor is denormalised so a row renders without the manifest.
+        assert_eq!(event["media_type"].as_str(), Some(OCI_MANIFEST));
+        assert!(event["size"].as_u64().unwrap() > 0);
+    }
+    assert!(
+        body["next"].is_null(),
+        "an exhausted scan carries no cursor"
+    );
+    // Newest first, strictly: the two events must not share an instant.
+    assert!(events[0]["at"].as_u64() > events[1]["at"].as_u64());
+}
+
+#[tokio::test]
+async fn deleting_a_tag_appends_a_deleted_event_naming_what_it_displaced() {
+    let h = Harness::new();
+    let digest = seed_image(&h, "demo/app", "latest", "one");
+
+    let (status, _, _) = h
+        .send(Method::DELETE, "/v2/demo/app/manifests/latest")
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let body = h.get("/api/v1/tag-history/demo/app@latest").await;
+    let events = body["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["event"].as_str(), Some("deleted"));
+    assert_eq!(
+        events[0]["digest"].as_str(),
+        Some(digest.as_str()),
+        "the delete has to name the digest it displaced"
+    );
+    assert_eq!(events[1]["event"].as_str(), Some("created"));
+}
+
+/// History outlives the tag: the endpoint still answers after the tag is gone,
+/// which is why an unknown tag cannot be a 404 either.
+#[tokio::test]
+async fn history_answers_after_the_tag_is_deleted() {
+    let h = Harness::new();
+    seed_image(&h, "demo/app", "latest", "one");
+    h.send(Method::DELETE, "/v2/demo/app/manifests/latest")
+        .await;
+
+    assert_eq!(
+        h.status("/v2/demo/app/manifests/latest").await,
+        StatusCode::NOT_FOUND
+    );
+    let body = h.get("/api/v1/tag-history/demo/app@latest").await;
+    assert_eq!(body["events"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn an_unknown_repo_or_tag_is_an_empty_page() {
+    let h = Harness::new();
+    seed_image(&h, "demo/app", "latest", "one");
+
+    for uri in [
+        "/api/v1/tag-history/no/such@latest",
+        "/api/v1/tag-history/demo/app@never",
+    ] {
+        let body = h.get(uri).await;
+        assert!(body["events"].as_array().unwrap().is_empty(), "{uri}");
+        assert!(body["next"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn digest_addressed_history_asks_a_different_question() {
+    let h = Harness::new();
+    // The same seed is the same body, so this is one manifest wearing two
+    // names - which is exactly what the digest-addressed range answers.
+    let digest = seed_image(&h, "demo/app", "latest", "one");
+    assert_eq!(seed_image(&h, "demo/app", "v1", "one"), digest);
+    let other = seed_image(&h, "demo/app", "edge", "two");
+
+    let body = h
+        .get(&format!("/api/v1/tag-history/demo/app@{digest}"))
+        .await;
+    let tags: Vec<&str> = body["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["tag"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        tags,
+        vec!["v1", "latest"],
+        "newest first, and only this one"
+    );
+
+    // The neighbouring manifest's history is its own.
+    let body = h
+        .get(&format!("/api/v1/tag-history/demo/app@{other}"))
+        .await;
+    let events = body["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["tag"].as_str(), Some("edge"));
+}
+
+#[tokio::test]
+async fn history_pages_with_the_cursor_it_hands_back() {
+    let h = Harness::new();
+    for seed in ["a", "b", "c", "d", "e"] {
+        seed_image(&h, "demo/app", "latest", seed);
+    }
+
+    let mut seen: Vec<u64> = Vec::new();
+    let mut uri = "/api/v1/tag-history/demo/app@latest?n=2".to_string();
+    loop {
+        let body = h.get(&uri).await;
+        let events = body["events"].as_array().unwrap();
+        assert!(events.len() <= 2, "a page never exceeds its limit");
+        seen.extend(events.iter().map(|e| e["at"].as_u64().unwrap()));
+        let Some(next) = body["next"].as_object() else {
+            break;
+        };
+        uri = format!(
+            "/api/v1/tag-history/demo/app@latest?n=2&before={}&last={}",
+            next["before"].as_u64().unwrap(),
+            next["last"].as_str().unwrap()
+        );
+    }
+
+    assert_eq!(seen.len(), 5, "every event is seen exactly once");
+    let mut descending = seen.clone();
+    descending.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(
+        seen, descending,
+        "pages stay newest-first across the cursor"
+    );
+}
+
+/// `?before=` on its own is a filter rather than a resume, and it is
+/// strictly-before.
+#[tokio::test]
+async fn before_on_its_own_filters_and_excludes_its_own_instant() {
+    let h = Harness::new();
+    for seed in ["a", "b", "c"] {
+        seed_image(&h, "demo/app", "latest", seed);
+    }
+    let all = h.get("/api/v1/tag-history/demo/app@latest").await;
+    let stamps: Vec<u64> = all["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["at"].as_u64().unwrap())
+        .collect();
+
+    let body = h
+        .get(&format!(
+            "/api/v1/tag-history/demo/app@latest?before={}",
+            stamps[1]
+        ))
+        .await;
+    let seen: Vec<u64> = body["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["at"].as_u64().unwrap())
+        .collect();
+    assert_eq!(seen, vec![stamps[2]], "the boundary event is excluded");
+}
+
+#[tokio::test]
+async fn a_malformed_history_query_is_rejected_rather_than_ignored() {
+    let h = Harness::new();
+    seed_image(&h, "demo/app", "latest", "one");
+
+    assert_eq!(
+        h.status("/api/v1/tag-history/demo/app@latest?before=yesterday")
+            .await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        h.status("/api/v1/tag-history/demo/app@latest?n=lots").await,
+        StatusCode::BAD_REQUEST
+    );
+    // A reference is mandatory: there is no whole-repository history
+    // collection, because that would be an unbounded scan.
+    assert_eq!(
+        h.status("/api/v1/tag-history/demo/app").await,
+        StatusCode::NOT_FOUND
+    );
+}

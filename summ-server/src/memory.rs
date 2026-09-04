@@ -33,8 +33,9 @@ use summ_core::Digest;
 use crate::range::ByteRange;
 use crate::reference::Reference;
 use crate::seam::{
-    BlobRead, Descriptor, ManifestInfo, ManifestPut, ManifestStat, OpsError, OpsResult, Page,
-    Referrers, Registry, RepoDetail, RepoSummary, TagInfo, Tally, UploadBody, TAGS_PER_MANIFEST,
+    BlobRead, Descriptor, HistoryCursor, ManifestInfo, ManifestPut, ManifestStat, OpsError,
+    OpsResult, Page, Referrers, Registry, RepoDetail, RepoSummary, TagEventInfo, TagInfo, Tally,
+    UploadBody, TAGS_PER_MANIFEST,
 };
 
 #[derive(Debug, Clone)]
@@ -51,6 +52,14 @@ struct Repo {
     tags: BTreeMap<String, Digest>,
     manifests: BTreeMap<Digest, StoredManifest>,
     blobs: BTreeMap<Digest, Vec<u8>>,
+    /// Tag events, oldest first, appended on every tag mutation.
+    ///
+    /// The real store indexes the same events twice (`H` by tag, `J` by
+    /// digest) and pages each with a seek. Here it is one vector filtered on
+    /// read, which is the usual bargain in this module: semantically
+    /// identical, structurally nothing like it. Reversed on read, because the
+    /// API is newest first.
+    history: Vec<TagEventInfo>,
 }
 
 #[derive(Debug)]
@@ -63,6 +72,38 @@ struct Upload {
 struct State {
     repos: BTreeMap<String, Repo>,
     uploads: BTreeMap<String, Upload>,
+    /// Stands in for the clock. Tests need a total order over events they
+    /// create in the same instant, and a counter gives one without making them
+    /// sleep. It is unix milliseconds in the real implementation.
+    clock: u64,
+}
+
+/// Hand out the next instant.
+///
+/// Taken as `&mut u64` rather than as a method on [`State`] so it can be held
+/// alongside a `&mut Repo`: the two are disjoint fields, which the borrow
+/// checker only sees once the guard has been reborrowed as a `&mut State`.
+fn tick(clock: &mut u64) -> u64 {
+    *clock += 1;
+    *clock
+}
+
+/// Append a `Created` or `Deleted` event, mirroring what `stage_set_tag` and
+/// `stage_delete_tag` write into one `WriteBatch` with the mutation itself.
+fn record_event(repo: &mut Repo, at: u64, tag: &str, digest: Digest, deleted: bool) {
+    let (media_type, size) = repo
+        .manifests
+        .get(&digest)
+        .map(|m| (m.media_type.clone(), m.body.len() as u64))
+        .unwrap_or_default();
+    repo.history.push(TagEventInfo {
+        at,
+        tag: tag.to_owned(),
+        digest,
+        deleted,
+        media_type,
+        size,
+    });
 }
 
 #[derive(Debug, Default)]
@@ -99,6 +140,8 @@ impl MemoryRegistry {
     ) -> Digest {
         let digest = sha256(body);
         let mut state = self.lock();
+        let state = &mut *state;
+        let clock = &mut state.clock;
         let entry = state.repos.entry(repo.to_owned()).or_default();
         entry.manifests.insert(
             digest,
@@ -112,6 +155,8 @@ impl MemoryRegistry {
         );
         if let Some(tag) = tag {
             entry.tags.insert(tag.to_owned(), digest);
+            let at = tick(clock);
+            record_event(entry, at, tag, digest, false);
         }
         digest
     }
@@ -431,6 +476,8 @@ impl Registry for MemoryRegistry {
             .unwrap_or_default();
 
         let mut state = self.lock();
+        let state = &mut *state;
+        let clock = &mut state.clock;
         let repo = state.repos.entry(name.to_owned()).or_default();
         repo.manifests.insert(
             digest,
@@ -442,11 +489,15 @@ impl Registry for MemoryRegistry {
                 annotations,
             },
         );
+        let mut written: Vec<&String> = Vec::new();
         if let Reference::Tag(tag) = reference {
-            repo.tags.insert(tag.clone(), digest);
+            written.push(tag);
         }
-        for tag in tags {
+        written.extend(tags);
+        for tag in written {
             repo.tags.insert(tag.clone(), digest);
+            let at = tick(clock);
+            record_event(repo, at, tag, digest, false);
         }
 
         Ok(ManifestPut {
@@ -458,17 +509,35 @@ impl Registry for MemoryRegistry {
 
     async fn delete_manifest(&self, name: &str, reference: &Reference) -> OpsResult<()> {
         let mut state = self.lock();
+        let state = &mut *state;
+        let clock = &mut state.clock;
         let repo = state.repos.get_mut(name).ok_or(OpsError::RepoUnknown)?;
         match reference {
             // Deleting a tag leaves the manifest reachable by digest.
             Reference::Tag(tag) => {
-                repo.tags.remove(tag).ok_or(OpsError::ManifestUnknown)?;
+                let digest = repo.tags.remove(tag).ok_or(OpsError::ManifestUnknown)?;
+                let at = tick(clock);
+                record_event(repo, at, tag, digest, true);
             }
             // Deleting by digest cascades to every tag pointing at it.
             Reference::Digest(digest) => {
-                repo.manifests
-                    .remove(digest)
-                    .ok_or(OpsError::ManifestUnknown)?;
+                // The events are written before the manifest is dropped: they
+                // denormalise its media type and size, which is the whole
+                // reason history outlives it.
+                let dropped: Vec<String> = repo
+                    .tags
+                    .iter()
+                    .filter(|(_, target)| *target == digest)
+                    .map(|(tag, _)| tag.clone())
+                    .collect();
+                if !repo.manifests.contains_key(digest) {
+                    return Err(OpsError::ManifestUnknown);
+                }
+                for tag in &dropped {
+                    let at = tick(clock);
+                    record_event(repo, at, tag, *digest, true);
+                }
+                repo.manifests.remove(digest);
                 repo.tags.retain(|_, target| target != digest);
             }
         }
@@ -833,6 +902,68 @@ impl Registry for MemoryRegistry {
             .get(&digest)
             .ok_or(OpsError::ManifestUnknown)?;
         Ok(describe(repo, &digest, stored))
+    }
+
+    async fn tag_history(
+        &self,
+        name: &str,
+        reference: &Reference,
+        before: Option<u64>,
+        last: Option<&str>,
+        limit: usize,
+    ) -> OpsResult<(Vec<TagEventInfo>, Option<HistoryCursor>)> {
+        let state = self.lock();
+        // An unknown repository is an empty page, not an error: history outlives
+        // what it describes, so the real store cannot tell "never existed" from
+        // "gone" either.
+        let Some(repo) = state.repos.get(name) else {
+            return Ok((Vec::new(), None));
+        };
+
+        // Newest first, which the real implementation gets from a complemented
+        // timestamp in the key rather than from reversing.
+        let mut rows: Vec<TagEventInfo> = repo
+            .history
+            .iter()
+            .rev()
+            .filter(|e| match reference {
+                Reference::Tag(tag) => e.tag == *tag,
+                Reference::Digest(digest) => e.digest == *digest,
+            })
+            .filter(|e| match (before, last) {
+                // `before` alone is strictly-before. With `last` it resumes
+                // exactly, which matters when events share an instant.
+                //
+                // Ties break *ascending* on the other key component even though
+                // the instants descend, because that is the byte order of the
+                // real key: `<!ts> <digest>`. The clock here never repeats, so
+                // nothing observes it - it is written this way so the two
+                // implementations cannot disagree if that ever changes.
+                (Some(at), Some(last)) => {
+                    e.at < at || (e.at == at && key_of(reference, e).as_str() > last)
+                }
+                (Some(at), None) => e.at < at,
+                (None, _) => true,
+            })
+            .cloned()
+            .collect();
+
+        let more = rows.len() > limit;
+        rows.truncate(limit);
+        let next = more.then(|| rows.last()).flatten().map(|e| HistoryCursor {
+            before: e.at,
+            last: key_of(reference, e),
+        });
+        Ok((rows, next))
+    }
+}
+
+/// The tiebreaker within one instant: the other half of the key from whichever
+/// side the caller asked.
+fn key_of(reference: &Reference, event: &TagEventInfo) -> String {
+    match reference {
+        Reference::Tag(_) => event.digest.to_string(),
+        Reference::Digest(_) => event.tag.clone(),
     }
 }
 

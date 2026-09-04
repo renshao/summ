@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use summ_core::types::{CounterBucket, SCHEMA_VERSION};
-use summ_core::{keys, Digest};
+use summ_core::{keys, Digest, Timestamp};
 use summ_meta::{
     version, MetaEngine, Migrations, RedbEngine, RepoInterner, RocksEngine, WriteBatch,
 };
@@ -404,16 +404,17 @@ mod suite {
         let (m, other) = (digest(1), digest(2));
         let mut batch = WriteBatch::new();
         for ts in [1_000u64, 2_000, 3_000, 4_000, 5_000] {
-            batch.put(keys::tag_history(1, "latest", ts, &m), b"event".to_vec());
+            let at = Timestamp::from_millis(ts);
+            batch.put(keys::tag_history(1, "latest", at, &m), b"event".to_vec());
             batch.put(
-                keys::manifest_tag_history(1, &m, ts, "latest"),
+                keys::manifest_tag_history(1, &m, at, "latest"),
                 b"e".to_vec(),
             );
             // Neighbours: `foobar` must not answer a scan of `foo`, and another
             // manifest must not answer this one's.
-            batch.put(keys::tag_history(1, "foobar", ts, &m), b"event".to_vec());
+            batch.put(keys::tag_history(1, "foobar", at, &m), b"event".to_vec());
             batch.put(
-                keys::manifest_tag_history(1, &other, ts, "latest"),
+                keys::manifest_tag_history(1, &other, at, "latest"),
                 b"e".to_vec(),
             );
         }
@@ -566,9 +567,13 @@ mod suite {
     pub fn tag_history_pages_newest_first_without_a_reverse_iterator(db: &dyn MetaEngine) {
         let m = digest(7);
         let stamps = [1_000u64, 2_000, 3_000, 4_000];
+        let at = |ts: u64| Timestamp::from_millis(ts);
         let mut batch = WriteBatch::new();
         for ts in stamps {
-            batch.put(keys::tag_history(1, "latest", ts, &m), b"event".to_vec());
+            batch.put(
+                keys::tag_history(1, "latest", at(ts), &m),
+                b"event".to_vec(),
+            );
         }
         db.apply(&batch).unwrap();
 
@@ -576,27 +581,28 @@ mod suite {
         let expected: Vec<Vec<u8>> = stamps
             .iter()
             .rev()
-            .map(|ts| keys::tag_history(1, "latest", *ts, &m))
+            .map(|ts| keys::tag_history(1, "latest", at(*ts), &m))
             .collect();
         assert_eq!(keys_seen, expected);
 
         // `before = 3_000` is just a `start_after` seek - there is no cursor
-        // token to invent. Note the boundary is inclusive: the cursor stops at
-        // the complemented timestamp, and an event at exactly that instant
-        // sorts after it because its digest follows in the key.
+        // token to invent. It is strictly-before: the cursor backs up one
+        // millisecond, so the 3_000 event is excluded along with the newer one.
+        // Seeking to the instant itself would include it, because its digest
+        // follows in the key and therefore sorts after the bare cursor.
         let page = db
             .scan(
                 &keys::tag_history_of(1, "latest"),
-                Some(&keys::tag_history_before(1, "latest", 3_000)),
+                Some(&keys::tag_history_before(1, "latest", at(3_000))),
                 10,
             )
             .unwrap();
         let seen: Vec<Vec<u8>> = page.entries.into_iter().map(|(k, _)| k).collect();
         assert_eq!(
             seen,
-            [3_000u64, 2_000, 1_000]
+            [2_000u64, 1_000]
                 .iter()
-                .map(|ts| keys::tag_history(1, "latest", *ts, &m))
+                .map(|ts| keys::tag_history(1, "latest", at(*ts), &m))
                 .collect::<Vec<_>>()
         );
     }

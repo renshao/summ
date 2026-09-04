@@ -37,7 +37,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use axum::body::{Body, Bytes};
 use futures_util::StreamExt;
-use summ_core::{Digest, ManifestRecord, Platform, SummError};
+use summ_core::{Digest, ManifestRecord, Platform, SummError, TagEventKind, Timestamp};
 use summ_meta::{MetaEngine, RedbEngine, RocksEngine};
 use summ_registry::error::RegistryError;
 use summ_registry::{Reference as OpsReference, Registry as Ops, RegistryOptions, UploadKey};
@@ -46,9 +46,9 @@ use summ_storage::{BlobStore, DigestAlgorithm, UploadId};
 use crate::range::ByteRange;
 use crate::reference::Reference;
 use crate::seam::{
-    BlobRead, Descriptor, ManifestInfo, ManifestPut, ManifestStat, OpsError, OpsResult, Page,
-    Referrers, Registry, RepoDetail, RepoSummary, TagInfo, Tally, UploadBody, COUNT_CEILING,
-    TAGS_PER_MANIFEST,
+    BlobRead, Descriptor, HistoryCursor, ManifestInfo, ManifestPut, ManifestStat, OpsError,
+    OpsResult, Page, Referrers, Registry, RepoDetail, RepoSummary, TagEventInfo, TagInfo, Tally,
+    UploadBody, COUNT_CEILING, TAGS_PER_MANIFEST,
 };
 
 /// Which metadata engine `serve` opens.
@@ -225,17 +225,24 @@ impl Backend {
         })
     }
 
-    /// Unix seconds, read here and passed down.
+    /// The instant this request began, read here and passed down.
     ///
     /// The ops layer never reads a clock: a `WriteBatch` carrying an
     /// apply-time timestamp would mean something different on a replica than it
     /// did here, and the batch is the future WAL. So the clock is read exactly
     /// once per request, at the top, and the value travels with the operation.
-    fn now(&self) -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
+    ///
+    /// [`Timestamp`] carries milliseconds and hands out seconds on request,
+    /// because the store wants both: every stored record is a second's
+    /// resolution, and the tag-history keys are not, since two events on one tag
+    /// inside a second encode to the same key.
+    fn now(&self) -> Timestamp {
+        Timestamp::from_millis(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        )
     }
 
     /// Run a blocking metadata operation off the reactor.
@@ -719,7 +726,7 @@ impl Registry for Backend {
 
         let now = self.now();
         session.offset = upload.offset();
-        session.updated_at = now;
+        session.updated_at = now.secs();
         session.hasher_state = Some(upload.hasher_state().map_err(storage_error)?);
         let offset = session.offset;
 
@@ -1043,6 +1050,49 @@ impl Registry for Backend {
             }
         })
         .await
+    }
+
+    async fn tag_history(
+        &self,
+        name: &str,
+        reference: &Reference,
+        before: Option<u64>,
+        last: Option<&str>,
+        limit: usize,
+    ) -> OpsResult<(Vec<TagEventInfo>, Option<HistoryCursor>)> {
+        let name = name.to_string();
+        let reference = as_ops_reference(reference);
+        let last = last.map(str::to_string);
+        let before = before.map(Timestamp::from_millis);
+        self.scan(move |ops| {
+            let page = match &reference {
+                OpsReference::Tag(tag) => {
+                    ops.tag_history(&name, tag, before, last.as_deref(), limit)?
+                }
+                OpsReference::Digest(digest) => {
+                    ops.manifest_tag_history(&name, digest, before, last.as_deref(), limit)?
+                }
+            };
+            Ok((
+                page.events.into_iter().map(tag_event_info).collect(),
+                page.next.map(|c| HistoryCursor {
+                    before: c.before.millis(),
+                    last: c.last,
+                }),
+            ))
+        })
+        .await
+    }
+}
+
+fn tag_event_info(entry: summ_registry::TagEventEntry) -> TagEventInfo {
+    TagEventInfo {
+        at: entry.at.millis(),
+        tag: entry.tag,
+        digest: entry.digest,
+        deleted: entry.event.event == TagEventKind::Deleted,
+        media_type: entry.event.media_type,
+        size: entry.event.size,
     }
 }
 

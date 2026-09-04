@@ -2,6 +2,7 @@
 
 use summ_core::{
     keys, Digest, ManifestRecord, ReferrerRecord, RepoId, TagEvent, TagEventKind, TagRecord,
+    Timestamp,
 };
 use summ_meta::WriteBatch;
 
@@ -54,7 +55,13 @@ impl Registry {
         self.tag_record(repo_id, tag)
     }
 
-    pub fn set_tag(&self, repo: &str, tag: &str, digest: &Digest, now: u64) -> Result<TagSet> {
+    pub fn set_tag(
+        &self,
+        repo: &str,
+        tag: &str,
+        digest: &Digest,
+        now: Timestamp,
+    ) -> Result<TagSet> {
         let planned = self.plan_set_tag(repo, tag, digest, now)?;
         self.engine().apply(&planned.batch)?;
         Ok(planned.outcome)
@@ -69,7 +76,7 @@ impl Registry {
         repo: &str,
         tag: &str,
         digest: &Digest,
-        now: u64,
+        now: Timestamp,
     ) -> Result<Planned<TagSet>> {
         validate_tag(tag)?;
         let repo_id = self.require_repo(repo)?;
@@ -101,7 +108,7 @@ impl Registry {
         repo: RepoId,
         tag: &str,
         target: &TagTarget,
-        now: u64,
+        now: Timestamp,
     ) -> Result<Option<Digest>> {
         validate_tag(tag)?;
         let artifact_subject = cosign::subject_of_artifact_tag(tag);
@@ -121,7 +128,7 @@ impl Registry {
             keys::tag(repo, tag),
             encode(&TagRecord {
                 digest: target.digest,
-                tagged_at: now,
+                tagged_at: now.secs(),
             })?,
         );
         batch.set(keys::manifest_tag(repo, &target.digest, tag));
@@ -154,7 +161,7 @@ impl Registry {
         Ok(previous)
     }
 
-    pub fn delete_tag(&self, repo: &str, tag: &str, now: u64) -> Result<Digest> {
+    pub fn delete_tag(&self, repo: &str, tag: &str, now: Timestamp) -> Result<Digest> {
         let planned = self.plan_delete_tag(repo, tag, now)?;
         self.engine().apply(&planned.batch)?;
         Ok(planned.outcome)
@@ -164,7 +171,12 @@ impl Registry {
     ///
     /// The `Deleted` event carries the digest the tag was displaced from, which
     /// only `T` knows at this moment - after the batch commits, nothing does.
-    pub fn plan_delete_tag(&self, repo: &str, tag: &str, now: u64) -> Result<Planned<Digest>> {
+    pub fn plan_delete_tag(
+        &self,
+        repo: &str,
+        tag: &str,
+        now: Timestamp,
+    ) -> Result<Planned<Digest>> {
         let repo_id = self.require_repo(repo)?;
         let record =
             self.tag_record(repo_id, tag)?
@@ -196,7 +208,7 @@ impl Registry {
         tag: &str,
         digest: &Digest,
         manifest: Option<&ManifestRecord>,
-        now: u64,
+        now: Timestamp,
     ) -> Result<()> {
         batch.delete(keys::tag(repo, tag));
         batch.delete(keys::manifest_tag(repo, digest, tag));

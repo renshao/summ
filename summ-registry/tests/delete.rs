@@ -21,9 +21,9 @@ fn deleting_a_manifest_removes_every_edge_and_leaves_it_purgeable() {
 
     let body = Image::new(config).layer(layer).subject(subject).json();
     let digest = put(&reg, "demo/app", "v1", &body, 200);
-    reg.set_tag("demo/app", "also", &digest, 210).unwrap();
+    reg.set_tag("demo/app", "also", &digest, at(210)).unwrap();
 
-    let deleted = reg.delete_manifest("demo/app", &digest, 300).unwrap();
+    let deleted = reg.delete_manifest("demo/app", &digest, at(300)).unwrap();
     let mut tags = deleted.removed_tags.clone();
     tags.sort();
     assert_eq!(tags, ["also", "v1"]);
@@ -93,11 +93,11 @@ fn deleting_a_manifest_writes_a_history_event_for_every_tag_it_took_with_it() {
     let body = Image::new(config).json();
     let digest = put(&reg, "demo/app", "v1", &body, 200);
 
-    reg.delete_manifest("demo/app", &digest, 300).unwrap();
+    reg.delete_manifest("demo/app", &digest, at(300)).unwrap();
     let repo = reg.lookup_repo("demo/app").unwrap().unwrap();
     let event: summ_core::TagEvent = postcard::from_bytes(
         &reg.engine()
-            .get(&keys::tag_history(repo, "v1", 300, &digest))
+            .get(&keys::tag_history(repo, "v1", at(300), &digest))
             .unwrap()
             .expect("a cascaded tag removal is still an audited event"),
     )
@@ -121,7 +121,7 @@ fn deleting_an_index_child_clears_the_edge_in_both_directions() {
     let index = put(&reg, "demo/app", "multi", &index_body, 200);
 
     let repo = reg.lookup_repo("demo/app").unwrap().unwrap();
-    reg.delete_manifest("demo/app", &child, 300).unwrap();
+    reg.delete_manifest("demo/app", &child, at(300)).unwrap();
     assert!(
         !reg.engine()
             .exists_prefix(&keys::child_parent(repo, &child, &index))
@@ -131,7 +131,7 @@ fn deleting_an_index_child_clears_the_edge_in_both_directions() {
 
     // Deleting the index next must also work: nothing refuses a delete because
     // something references it, and the suite deletes in either order.
-    reg.delete_manifest("demo/app", &index, 400).unwrap();
+    reg.delete_manifest("demo/app", &index, at(400)).unwrap();
 }
 
 #[test]
@@ -161,7 +161,8 @@ fn a_referrer_survives_the_deletion_of_its_subject() {
         200,
     );
 
-    reg.delete_manifest("demo/app", &subject.0, 300).unwrap();
+    reg.delete_manifest("demo/app", &subject.0, at(300))
+        .unwrap();
 
     // The spec permits a subject to dangle, and the referrer is still a real
     // manifest, so its edge stays.
@@ -179,12 +180,12 @@ fn deleting_a_manifest_that_is_not_there_is_manifest_unknown() {
     let (_dir, reg) = fixture();
     let _ = upload(&reg, "demo/app", "config");
     let err = reg
-        .delete_manifest("demo/app", &sha256(b"nope"), 300)
+        .delete_manifest("demo/app", &sha256(b"nope"), at(300))
         .unwrap_err();
     assert_eq!(err.code(), "MANIFEST_UNKNOWN");
 
     let err = reg
-        .delete_manifest("no/such", &sha256(b"nope"), 300)
+        .delete_manifest("no/such", &sha256(b"nope"), at(300))
         .unwrap_err();
     assert_eq!(err.code(), "NAME_UNKNOWN");
 }

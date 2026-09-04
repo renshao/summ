@@ -94,13 +94,31 @@ Digests encode as one algorithm byte followed by raw hash bytes.
 | `n <name>` | repo id (BE u32) | Name-ordered. **`_catalog` pages over this** |
 | `i <id>` | name | Reverse. `i <u32::MAX>` reserved as the id counter |
 | `v` | schema version (BE u32) | Single key. Absent on a populated store ⇒ refuse to open |
-| `H <repo> <tag> 0 <!ts> <digest>` | `TagEvent` | Tag history, newest first. *Keys and values built; no writer yet* |
-| `J <repo> <digest> <!ts> <tag>` | `TagEvent` | Same, addressed by digest. *Ditto* |
-| `A <scope> <…> <day> <shard>` | `CounterBucket` | Daily pull counters. *Ditto* |
+| `H <repo> <tag> 0 <!ms> <digest>` | `TagEvent` | Tag history, newest first. **Served** |
+| `J <repo> <digest> <!ms> <tag>` | `TagEvent` | Same, addressed by digest. **Served** |
+| `A <scope> <…> <day> <shard>` | `CounterBucket` | Daily pull counters. *Keys and values built; no writer yet* |
 
-The last three now have key builders, value types and prefix-filter groups, so
-the schema will not have to move again when the feature is scheduled. Nothing
-writes to them yet — see **Analytics** below for what each component is doing.
+`H` and `J` are complete — written on every tag mutation since Phase 1, and now
+read by `/api/v1/tag-history/` and the UI. See **Tag history** below. `A` has
+key builders, value types and a prefix-filter group but nothing writing to it;
+see **Analytics**.
+
+**`H` and `J` timestamps are milliseconds; every stored record is seconds.**
+That asymmetry is deliberate and it is the one thing to know before touching
+either range. `TagRecord.tagged_at`, `ManifestRecord.pushed_at` and
+`RepoBlobRecord.added_at` are a second's resolution and always have been. Tag
+events cannot be: `H <repo> <tag> 0 <!ts> <digest>` puts the digest in the key
+as the collision breaker, so a create and a delete of one tag at one digest
+inside the same second encode to **the same key** and the later write silently
+replaces the earlier — a hole in an audit trail. Two distinct events in one
+second come back ordered by digest rather than by what happened. Deleting and
+re-pushing a tag from a script does exactly this. `summ_core::Timestamp` carries
+milliseconds and hands out seconds on request, so a caller has to say which it
+wants and the compiler asks. The two encodings are self-distinguishing — a
+seconds value now is ~1.7e9, a milliseconds value ~1.7e12, and they cannot
+overlap until 5138 — which is why the change cost a populated store nothing:
+old events read back correctly by magnitude, and because milliseconds are
+larger every new event still sorts as newer than every old one.
 
 Two traps worth stating explicitly:
 
@@ -119,7 +137,7 @@ Two traps worth stating explicitly:
 
 ## Status
 
-`cargo test` — **366 passing**. Every crate in CLAUDE.md's Layout is built, and
+`cargo test` — **392 passing**. Every crate in CLAUDE.md's Layout is built, and
 **the wiring has landed** (package K, `summ-server/src/backend.rs`): `summ
 serve` runs on `summ-registry` over `summ-meta` with `summ-storage` holding the
 bytes. `tests/wiring.rs` drives the same router as `tests/api.rs` against a real
@@ -233,6 +251,13 @@ both fixed:
   hold. One data row failing cascaded into six: *Non-distributable Layers* plus
   the *Manifest put/get/head by digest and by tag* rows and *Tag listing*, all of
   which use that data. See **Foreign layers**.
+
+**Tag history is served** (`/api/v1/tag-history/<name>@<reference>`, plus a
+timeline in the UI). The events needed no new writer: `H` and `J` have been
+written on every tag mutation since Phase 1, inside the same `WriteBatch` as
+the mutation, so this was a read path, an endpoint and a page. Two things did
+change on the way — the timestamps moved from seconds to milliseconds, and the
+`before` cursor became strictly-before, which it was not. See **Tag history**.
 
 **API-key authentication has landed** and is described under **Authentication**
 below: `--auth apikey` puts a read key and a write key in front of `/v2/`, the
@@ -351,8 +376,9 @@ The UI lives in `summ-server/ui/` and `summ-server/src/ui.rs`, not the
 nothing for a crate to own but four `include_str!`s; give it one when there is
 an asset pipeline to put in it.
 
-Still to build here: blob fan-in ("what shares this layer"), the untagged /
-reclaimable set, tag history and pull counts — the schema and the ops-layer
+**Tag history has since landed** — `/api/v1/tag-history/<name>@<reference>` and
+the UI over it. Still to build here: blob fan-in ("what shares this layer"), the
+untagged / reclaimable set, and pull counts — the schema and the ops-layer
 queries exist for all of them.
 
 ### Phase 3 — performance
@@ -425,6 +451,67 @@ Legacy cosign tags are the backward-compatibility case that *does* matter in the
 wild, and they are handled: `sha256-<hex>.sig|.sbom|.att` synthesises its `F`
 edge at tag time and retracts it when the tag moves (`summ-registry/src/cosign.rs`).
 That is a purge fix as much as a discovery one — see the module docs.
+
+## Tag history
+
+Served at `GET /api/v1/tag-history/<name>@<reference>`, newest first, with the
+UI showing a timeline on the manifest page and a per-tag page behind every tag
+chip. `<reference>` is a tag **or** a digest and the two are different
+questions — "what has this name pointed at" reads `H`, "what has this manifest
+been called" reads `J` — which is why one route serves both. Five decisions
+here, and each is a thing a change could quietly undo:
+
+- **It is an event log, not a list of what a tag pointed to.** A repoint writes
+  one `Created` for the new digest and *no* `Deleted` for the displaced one, so
+  "what did this tag point to at time T" is a fold: the newest `Created` at or
+  before T, unless a `Deleted` is newer. And the event is written
+  unconditionally — `previous` is consulted only to retract the old `G` edge —
+  so re-pushing a tag at the digest it already has is a second row. It records
+  **pushes, not changes**, which is right for an audit trail and is why a CI job
+  pushing hourly accumulates ~8,800 rows per tag per year with nothing trimming
+  them. Retention is the open item below.
+
+- **Timestamps are milliseconds, and that is not a detail.** At a second's
+  resolution a create and a delete of one tag at one digest inside the same
+  second encode to the same key, and the later `Put` silently replaces the
+  earlier. See the note under **Key schema** for the full argument and why the
+  migration was free.
+
+- **`before` is strictly-before, and the page cursor is a pair.** Seeking to
+  `!ts` is *inclusive*, because an event at exactly `ts` is longer than the
+  cursor and therefore sorts after it; the builder backs up one millisecond.
+  And a timestamp alone is not a sufficient cursor: the key's tiebreaker is the
+  digest (`H`) or the tag (`J`), so a page can end inside an instant and
+  resuming from the instant alone would skip the rest of it. `next` carries
+  `{before, last}`, both of them values off the last row — the house pagination
+  style, not an opaque token. `before` on its own remains a real filter, which
+  is what distribution-spec#606 means by it.
+
+- **History outlives what it describes, so nothing here 404s.** An unknown
+  repository, tag or manifest is an **empty page**. After a tag is deleted there
+  is nothing left to tell "never existed" from "gone", and the endpoint must
+  answer for the second case. The denormalised `media_type` and `size` in
+  `TagEvent` exist for the same reason: every `Deleted` row describes a manifest
+  `M` may no longer hold, and a row still has to render. The UI does not link a
+  deleted row anywhere.
+
+- **The manifest-delete cascade writes events too.** `delete.rs` routes through
+  `stage_delete_tag` for every tag it drops, and it does so *before* removing
+  the manifest, so the events still capture the descriptor.
+
+**Not built: the spec-shaped endpoint.** distribution-spec#606 proposes
+`GET /v2/<name>/_oci/tag-history/<reference>` returning an OCI image index whose
+entries carry `.tag.timestamp` and `.tag.event` annotations. It is unmerged and
+its data model is still argued over, so committing to that envelope now means
+owning a guess. The rows are already in its vocabulary (`created` / `deleted`),
+so if it merges the work is a response adapter over the same scan.
+
+**Open: retention.** `A`, `H` and `J` are the only ranges bounded by time rather
+than by current state, and nothing trims them. A window is a `DeletePrefix` over
+a bounded suffix of each range — the keys are ordered newest-first, so "older
+than X" is a contiguous tail — and it belongs to the purge sweep (package F),
+which already walks the store. #606 permits trimming history when the repo is
+deleted; a time window is our own policy and needs a flag.
 
 ## Authentication
 
@@ -682,11 +769,12 @@ non-deterministic content in a batch — are in CLAUDE.md.
 Blobs need no WAL: content-addressed and immutable, so replication is plain
 copy, or shared object storage.
 
-## Analytics — pull counts and tag history
+## Analytics — pull counts
 
-Wanted, later-phase (package J), **not designed yet**. The `A`, `H` and `J`
-ranges already have key builders, value types and prefix groups, so the schema
-will not move when the feature is scheduled; nothing writes to them.
+**Tag history has landed and left this section** — see **Tag history** below.
+What remains here is pull counts (package J), still **not designed**. The `A`
+range has key builders, value types and a prefix group, so the schema will not
+move when the feature is scheduled; nothing writes to it.
 
 The feasibility argument — why a counter works with no `merge` and no
 read-modify-write, the key shapes, and what it costs the engine — is in
@@ -695,8 +783,8 @@ that constrain other work:
 
 - **Pull counts are best-effort** (bounded in-process queue, dropped on
   overflow, absolute values flushed periodically). The API must say so.
-- **Tag history is not**, and skips that pipeline — its events are written in
-  the same `WriteBatch` as the tag mutation.
+- **Tag history is not**, and skips that pipeline entirely — its events are
+  written in the same `WriteBatch` as the tag mutation. That part is built.
 - **Nothing changes in `MetaEngine`.** No merge operator, no reverse scan, no new
   `MetaOp`. That is the test the design had to pass.
 
@@ -906,11 +994,6 @@ implementation has since turned up, is below.
   parsed body is in hand — but synthesising an edge for a cosign tag set after
   the fact forces a re-read and re-parse of `B`. A `config_media_type` field, or
   redefining `artifact_type` as the effective value, removes that read.
-- **`keys::tag_history_before(ts)` is inclusive of events at exactly `ts`.** The
-  cursor seeks to `H <repo> <tag> 0x00 !ts` as specified, but the digest follows
-  in the key, so an event at exactly `ts` sorts after the cursor and is
-  returned. #606's `before` most likely means strictly-before; closing the gap
-  means seeking to `!(ts - 1)` instead. Harmless until the endpoint exists.
 - **`summ_core::keys` has encoders but no decoders** for the digest-bearing
   suffixes (`M`, `P`, `F`, `S`, `R`). Every paged query needs them to turn an
   engine cursor into a URL-safe token. They currently live in
@@ -996,7 +1079,8 @@ query exists for every row here either way.
 | Which manifests reference this layer | `R <digest>` | ops layer only |
 | Untagged / reclaimable manifests | `M` minus `G` | ops layer only |
 | Pull counts by day, for a wall | `A m <repo> <digest>` | no writer yet |
-| Tag history, newest first | `H <repo> <tag>` | no writer yet |
+| Tag history, newest first | `H <repo> <tag>` | **built** |
+| What was this manifest ever tagged | `J <repo> <digest>` | **built** |
 
 summdb prototyped several of these (`/v1/repos/:repo/stats`,
 `/v1/layers/:digest/manifests`) along with the UI that consumes them; that code

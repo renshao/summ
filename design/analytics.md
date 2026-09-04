@@ -1,5 +1,13 @@
 # Analytics — pull counts and tag history (design sketch)
 
+> **Tag history is built.** The `H`/`J` half of this note has been implemented
+> and its decisions now live in `PLAN.md` under **Tag history**, which is the
+> current source of truth for them. Two things below were changed on the way in
+> and are wrong as written here: the timestamps are **milliseconds**, not
+> seconds, and `before` is **strictly**-before with a `{before, last}` page
+> cursor rather than a bare instant. What remains unbuilt, and what this note is
+> still the working for, is pull counts.
+
 Lifted out of PLAN.md, which is loaded into every session and should not carry
 the full working for an unbuilt feature. Nothing here is decided. It is the
 feasibility argument for one question — **can the key schema hold pull counts

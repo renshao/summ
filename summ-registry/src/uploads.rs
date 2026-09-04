@@ -25,7 +25,7 @@
 //!   recorded offset are garbage the resume truncates away, whereas a recorded
 //!   offset ahead of the bytes is corruption.
 
-use summ_core::{keys, RepoId, UploadSession};
+use summ_core::{keys, RepoId, Timestamp, UploadSession};
 use summ_meta::WriteBatch;
 
 use crate::codec::{decode, encode};
@@ -48,7 +48,7 @@ impl Registry {
         repo: &str,
         id: &UploadKey,
         algorithm: &str,
-        now: u64,
+        now: Timestamp,
     ) -> Result<UploadSession> {
         let planned = self.plan_create_upload(repo, id, algorithm, now)?;
         self.engine().apply(&planned.batch)?;
@@ -60,14 +60,14 @@ impl Registry {
         repo: &str,
         id: &UploadKey,
         algorithm: &str,
-        now: u64,
+        now: Timestamp,
     ) -> Result<Planned<UploadSession>> {
         let repo_id = self.intern_repo(repo)?;
         let session = UploadSession {
             repo: repo_id,
             offset: 0,
-            started_at: now,
-            updated_at: now,
+            started_at: now.secs(),
+            updated_at: now.secs(),
             algorithm: algorithm.to_string(),
             // No bytes have been hashed, so there is no state worth carrying:
             // a resume at offset 0 starts a fresh hasher either way.

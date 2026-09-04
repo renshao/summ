@@ -53,14 +53,14 @@ fn a_tagged_push_lands_every_key_range_at_once() {
     );
     assert!(
         engine
-            .get(&keys::tag_history(repo, "v1", 1_700, &digest))
+            .get(&keys::tag_history(repo, "v1", at(1_700), &digest))
             .unwrap()
             .is_some(),
         "H"
     );
     assert!(
         engine
-            .get(&keys::manifest_tag_history(repo, &digest, 1_700, "v1"))
+            .get(&keys::manifest_tag_history(repo, &digest, at(1_700), "v1"))
             .unwrap()
             .is_some(),
         "J"
@@ -248,7 +248,7 @@ fn a_plan_writes_nothing_until_it_is_applied() {
             reference: &reference,
             body: &body,
             content_type: Some(OCI_MANIFEST),
-            now: 1_700,
+            now: at(1_700),
         })
         .unwrap();
 
