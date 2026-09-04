@@ -181,18 +181,96 @@ pub struct TagEvent {
     pub size: u64,
 }
 
-/// `A <scope> <...> <day> <shard>` - one day's counters for one subject.
+/// Hours in a day, and therefore the width of every array in
+/// [`CounterBucket`].
+pub const HOURS_PER_DAY: usize = 24;
+
+/// `A <scope> <...> <day> <shard>` - one day's counters for one subject,
+/// broken down by hour.
 ///
-/// Absolute values, not deltas: the aggregation worker holds the running total
+/// Absolute values, not deltas: the aggregation worker accumulates increments
 /// in memory and writes the current value each flush, so the batch stays a
 /// plain `Put` with deterministic content and no read-modify-write appears on
 /// the write path.
 ///
-/// A struct rather than a bare `u64` because a second metric must not mean a
-/// second key range.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// **Per hour, UTC, and there is no stored day total.** The day figure is the
+/// sum of the array, which is 24 additions and cannot disagree with the parts;
+/// a cached total beside them would be a second source of truth for one number.
+/// The hours are what make the numbers honest for a reader who is not in UTC:
+/// the day bucket is fixed at write time and must never be re-bucketed, or the
+/// same wall changes shape depending on who is looking at it, but an hourly
+/// breakdown can be *re-summed* into any zone, and it answers "when in the day
+/// does this get pulled" as a fold over the same scan.
+///
+/// A struct rather than a bare array because a second metric must not mean a
+/// second key range. The arrays are fixed-width, so this is bounded fan-out and
+/// not a value that grows with the registry.
+///
+/// **The hours arrived after the scalars, and cost no schema bump.** Adding a
+/// field to a stored record is normally a migration gated on
+/// [`SCHEMA_VERSION`], because postcard is not self-describing and will not
+/// decode a record written before the change. This one was free: the `A` range
+/// had key builders, a value type and a prefix group but no writer in any
+/// build that ever shipped, so no store on disk can hold one of these. It was
+/// the last moment that was true - after the first `A` key exists, changing
+/// this shape is a migration like any other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CounterBucket {
-    pub manifest_pulls: u64,
-    pub blob_pulls: u64,
-    pub bytes_out: u64,
+    /// `GET /v2/<name>/manifests/<ref>` per hour. `HEAD` is not a pull.
+    pub manifest_pulls: [u32; HOURS_PER_DAY],
+    /// `GET /v2/<name>/blobs/<digest>` per hour, repo scope only.
+    pub blob_pulls: [u32; HOURS_PER_DAY],
+    /// Blob bytes actually written to the socket, per hour. A client that
+    /// aborts mid-stream contributes what it received, not what it asked for.
+    pub bytes_out: [u64; HOURS_PER_DAY],
+}
+
+impl Default for CounterBucket {
+    fn default() -> Self {
+        CounterBucket {
+            manifest_pulls: [0; HOURS_PER_DAY],
+            blob_pulls: [0; HOURS_PER_DAY],
+            bytes_out: [0; HOURS_PER_DAY],
+        }
+    }
+}
+
+impl CounterBucket {
+    /// Add one hour's increments, saturating.
+    ///
+    /// Saturating rather than wrapping because a counter that has run out of
+    /// range should stop being useful, not start being wrong. `hour` outside
+    /// `0..24` is ignored - it can only come from a caller that computed it
+    /// wrongly, and a panic on the flush path would take the worker down.
+    pub fn add(&mut self, hour: usize, manifest_pulls: u64, blob_pulls: u64, bytes_out: u64) {
+        if hour >= HOURS_PER_DAY {
+            return;
+        }
+        self.manifest_pulls[hour] =
+            self.manifest_pulls[hour].saturating_add(manifest_pulls.min(u32::MAX as u64) as u32);
+        self.blob_pulls[hour] =
+            self.blob_pulls[hour].saturating_add(blob_pulls.min(u32::MAX as u64) as u32);
+        self.bytes_out[hour] = self.bytes_out[hour].saturating_add(bytes_out);
+    }
+
+    /// The whole day, summed. There is no stored total; this is it.
+    pub fn manifest_pulls_total(&self) -> u64 {
+        self.manifest_pulls.iter().map(|&n| n as u64).sum()
+    }
+
+    pub fn blob_pulls_total(&self) -> u64 {
+        self.blob_pulls.iter().map(|&n| n as u64).sum()
+    }
+
+    pub fn bytes_out_total(&self) -> u64 {
+        self.bytes_out.iter().sum()
+    }
+
+    /// Whether anything at all was recorded. A bucket that folds to this is not
+    /// worth a row in a response.
+    pub fn is_empty(&self) -> bool {
+        self.manifest_pulls_total() == 0
+            && self.blob_pulls_total() == 0
+            && self.bytes_out_total() == 0
+    }
 }

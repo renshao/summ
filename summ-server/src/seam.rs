@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use axum::body::{Body, Bytes};
-use summ_core::Digest;
+use summ_core::{CounterBucket, Digest};
 
 use crate::range::ByteRange;
 use crate::reference::Reference;
@@ -324,6 +324,48 @@ pub struct HistoryCursor {
     pub last: String,
 }
 
+/// One day of pull counters, broken down by hour, UTC.
+///
+/// There is no stored day total - the day figure is the sum of the hours, which
+/// is 24 additions and cannot disagree with the parts. The hours are what make
+/// the numbers honest for a reader outside UTC: the day bucket is fixed at
+/// write time and must never be re-bucketed, or the same wall changes shape
+/// depending on who is looking at it, but hours can be re-summed into any zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PullCountDay {
+    /// Days since the Unix epoch, UTC. The weekday is `(day + 4) % 7` with
+    /// Sunday `0`, because 1970-01-01 was a Thursday - a contribution grid's
+    /// row index costs nothing stored.
+    pub day: u16,
+    pub bucket: CounterBucket,
+}
+
+/// Which counter series to read.
+///
+/// The three are separate walls maintained on write, not rollups of one
+/// another: summing per-manifest buckets into a repository total would be a
+/// scan across up to 10M manifests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PullCountScope {
+    /// Everything pulled under the repository, and the only scope carrying blob
+    /// traffic - attributing a shared layer's bytes to one manifest would be a
+    /// lie.
+    Repository,
+    Tag(String),
+    Manifest(Digest),
+}
+
+impl PullCountScope {
+    /// What the API calls this, for the `scope` field of a response.
+    pub fn label(&self) -> &'static str {
+        match self {
+            PullCountScope::Repository => "repository",
+            PullCountScope::Tag(_) => "tag",
+            PullCountScope::Manifest(_) => "manifest",
+        }
+    }
+}
+
 /// Failures the layers below can report, in the vocabulary of the spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpsError {
@@ -570,4 +612,29 @@ pub trait Registry: Send + Sync + 'static {
         last: Option<&str>,
         limit: usize,
     ) -> OpsResult<(Vec<TagEventInfo>, Option<HistoryCursor>)>;
+
+    /// Pull counters over a window of `days` days starting at `from_day`,
+    /// chronological, with the shards already summed.
+    ///
+    /// **Best-effort, and the API says so.** Increments are held in memory
+    /// between flushes, so a crash loses up to one interval and a saturated
+    /// accumulator drops the tail of a spike. They are a popularity signal for
+    /// an operator, not billing data.
+    ///
+    /// The window is the bound: there is no cursor, because 53 weeks is 371
+    /// keys and the whole visualisation is one ordered scan. Only days with
+    /// traffic come back - a wall zero-fills, a table does not, and the layer
+    /// that knows which is the one that decides.
+    ///
+    /// Nothing here 404s, for the same reason tag history does not: counts
+    /// outlive what they describe, and after a delete nothing distinguishes
+    /// "never pulled" from "gone". An unknown repository, tag or manifest is an
+    /// empty series.
+    async fn pull_counts(
+        &self,
+        name: &str,
+        scope: &PullCountScope,
+        from_day: u16,
+        days: u16,
+    ) -> OpsResult<Vec<PullCountDay>>;
 }

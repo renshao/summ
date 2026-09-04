@@ -91,7 +91,12 @@ async fn get(ctx: &Ctx, name: &str, digest: &summ_core::Digest) -> Handled {
             .header(header::CONTENT_LENGTH, read.total_size),
     };
 
-    Ok(build(builder, read.body))
+    // Metered rather than counted from `Content-Length`: containerd 2.1+ asks
+    // for `bytes=N-`, reads 8 MiB and tears the connection down, so counting
+    // the window it asked for would over-report a 900 MB layer about a hundred
+    // times. The wrapper reports what reached the socket, on drop.
+    let body = ctx.counters().meter_blob(name, read.body);
+    Ok(build(builder, body))
 }
 
 async fn head(ctx: &Ctx, name: &str, digest: &summ_core::Digest) -> Handled {

@@ -1,12 +1,28 @@
 # Analytics — pull counts and tag history (design sketch)
 
-> **Tag history is built.** The `H`/`J` half of this note has been implemented
-> and its decisions now live in `PLAN.md` under **Tag history**, which is the
-> current source of truth for them. Two things below were changed on the way in
-> and are wrong as written here: the timestamps are **milliseconds**, not
-> seconds, and `before` is **strictly**-before with a `{before, last}` page
-> cursor rather than a bare instant. What remains unbuilt, and what this note is
-> still the working for, is pull counts.
+> **Both halves are built, and this note is now history rather than plan.**
+> Tag history landed first; pull counts followed. `PLAN.md` is the current
+> source of truth for both — **Tag history** and **Pull counts**. Four things
+> below were decided differently on the way in and are wrong as written here:
+>
+> - Tag-history timestamps are **milliseconds**, not seconds, and `before` is
+>   **strictly**-before with a `{before, last}` page cursor rather than a bare
+>   instant.
+> - `CounterBucket` holds three **per-hour arrays**, not three scalars. The day
+>   total is their sum and is not stored. That makes a day's counts re-summable
+>   into a viewer's timezone, which the scalar version could not do.
+> - There is **no bounded queue and no worker holding running totals**. The pull
+>   path adds to a map under a mutex; the map holds *deltas since the last
+>   flush* and the flush drains it. A channel drops events under the burst you
+>   most want counted, and totals held forever are unbounded in the
+>   ten-million-repo direction. `PLAN.md` has the argument.
+> - Package J got **no crate of its own**. The aggregation is a `WriteBatch`
+>   builder and the worker is a tokio task, so they live in `summ-registry` and
+>   beside `backend.rs`; only the accumulator is its own module, above the seam.
+>
+> What survives intact is the feasibility argument the note was written for —
+> the key shapes, the three scopes, the day bucket, and the conclusion that none
+> of this needs a new `MetaEngine` primitive. All of that held.
 
 Lifted out of PLAN.md, which is loaded into every session and should not carry
 the full working for an unbuilt feature. Nothing here is decided. It is the

@@ -30,6 +30,15 @@
   --created-soft:  #e8f5ec;
   --deleted:       #9a3412;
   --deleted-soft:  #fbeee7;
+  /* The contribution wall. Five steps, level 0 being "nothing happened" -
+     which must read as an empty cell rather than as a faint count, or a quiet
+     week looks like a busy one. The four live steps are the accent at
+     increasing strength, so the wall follows the theme like everything else. */
+  --wall-0:        #ebedf0;
+  --wall-1:        #b9dde5;
+  --wall-2:        #7bc2cf;
+  --wall-3:        #3d9cae;
+  --wall-4:        #0b7285;
   --shadow:        0 1px 2px rgba(31, 35, 40, .06);
   --radius:        8px;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
@@ -50,6 +59,11 @@
     --text-faint:    #6e7681;
     --accent:        #56c8dd;
     --accent-soft:   #12303a;
+    --wall-0:        #1c232c;
+    --wall-1:        #16404b;
+    --wall-2:        #1d6274;
+    --wall-3:        #2f97ae;
+    --wall-4:        #56c8dd;
     --on-accent:     #0d1117;
     --created:       #4ac26b;
     --created-soft:  #12261a;
@@ -486,4 +500,114 @@ h2.section {
   .row-meta { gap: 18px; text-align: left; }
   .kv { grid-template-columns: 1fr; gap: 2px 0; }
   .kv dd { margin-bottom: 10px; }
+}
+
+/* ---- pull counts ------------------------------------------------------- */
+
+/*
+ * Two grids of the same cell: thirty days, then the last twenty-four hours.
+ * Both are the contribution-wall shape, because "is this pulled, and when" is
+ * a glance rather than a reading exercise, and because the data is literally
+ * that - one bucket per day, each holding a count per hour.
+ *
+ * The cells are a fixed size rather than stretched to the panel. A stretched
+ * grid makes a thirty-cell row of chunky buttons on a wide screen and stops
+ * looking like a wall at all; a fixed cell keeps the two grids the same size as
+ * each other, which is what lets one be read against the other.
+ */
+
+.wall-box {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+  box-shadow: var(--shadow);
+  padding: 16px;
+  margin-bottom: 24px;
+}
+
+.wall-sub {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* Not an error, and not a footnote either: it is a property of the number. */
+.wall-sub .approx {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+.wall-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  align-items: baseline;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--text-muted);
+  margin: 18px 0 8px;
+}
+
+/* Which clock the grid above is on. Stated because the two differ: a day
+   bucket is UTC and must stay UTC, while an hour names an instant and can
+   honestly be relabelled. */
+.wall-head .note {
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.wall {
+  display: grid;
+  gap: 3px;
+  /* `minmax(0, …)` rather than a bare width: a grid track's default minimum is
+     its content, so without it the strip refuses to shrink and pushes the page
+     sideways on a phone. */
+  grid-auto-rows: minmax(0, 15px);
+  justify-content: start;
+}
+
+.wall.days  { grid-template-columns: repeat(30, minmax(0, 15px)); }
+.wall.hours { grid-template-columns: repeat(24, minmax(0, 15px)); }
+
+.cell {
+  display: block;
+  aspect-ratio: 1;
+  border-radius: 2px;
+  background: var(--wall-0);
+  /* An outline rather than a border: a border on a 15px cell eats a seventh of
+     it, and at level 0 the cell still has to read against the panel it sits on
+     in both themes. */
+  outline: 1px solid rgba(27, 31, 36, .04);
+  outline-offset: -1px;
+}
+
+.cell[data-level="1"] { background: var(--wall-1); }
+.cell[data-level="2"] { background: var(--wall-2); }
+.cell[data-level="3"] { background: var(--wall-3); }
+.cell[data-level="4"] { background: var(--wall-4); }
+
+.wall-legend {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.wall-legend .cell {
+  width: 11px;
+  height: 11px;
+}
+
+.wall-legend span:first-child { margin-right: 3px; }
+.wall-legend span:last-child  { margin-left: 3px; }
+
+@media (max-width: 480px) {
+  .wall.days  { grid-template-columns: repeat(15, minmax(0, 15px)); }
 }

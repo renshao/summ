@@ -104,10 +104,13 @@ fn every_stored_record_roundtrips() {
         media_type: "m".into(),
         size: 9
     });
-    check!(CounterBucket {
-        manifest_pulls: 1,
-        blob_pulls: 2,
-        bytes_out: 3
-    });
+    let mut bucket = CounterBucket::default();
+    bucket.add(0, 1, 2, 3);
+    bucket.add(23, 4, 5, 6);
+    check!(bucket);
+    // The all-zero bucket too: postcard varints every element, so an empty
+    // day is 24 zero bytes per array rather than an absent field, and it has
+    // to decode back to a bucket rather than to nothing.
+    check!(CounterBucket::default());
     check!(ManifestRef { repo: 4, digest: d });
 }

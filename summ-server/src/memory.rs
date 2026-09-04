@@ -28,14 +28,15 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use axum::body::{Body, Bytes};
 use sha2::{Digest as _, Sha256, Sha512};
-use summ_core::Digest;
+use summ_core::{CounterBucket, Digest};
 
+use crate::counters::{Recorded, Subject};
 use crate::range::ByteRange;
 use crate::reference::Reference;
 use crate::seam::{
     BlobRead, Descriptor, HistoryCursor, ManifestInfo, ManifestPut, ManifestStat, OpsError,
-    OpsResult, Page, Referrers, Registry, RepoDetail, RepoSummary, TagEventInfo, TagInfo, Tally,
-    UploadBody, TAGS_PER_MANIFEST,
+    OpsResult, Page, PullCountDay, PullCountScope, Referrers, Registry, RepoDetail, RepoSummary,
+    TagEventInfo, TagInfo, Tally, UploadBody, TAGS_PER_MANIFEST,
 };
 
 #[derive(Debug, Clone)]
@@ -60,6 +61,24 @@ struct Repo {
     /// identical, structurally nothing like it. Reversed on read, because the
     /// API is newest first.
     history: Vec<TagEventInfo>,
+    /// `(scope, day) -> bucket`, standing in for the `A` range.
+    ///
+    /// Keyed and folded exactly as the real one is, because this is the half
+    /// of pull counting that has semantics worth a second implementation: the
+    /// three scopes are separate series maintained on write, a day is broken
+    /// down by hour, and a flush adds to what is there rather than replacing
+    /// it. What it is not is the accumulator - that lives above the seam in
+    /// `crate::counters` and is the same object whichever registry is behind
+    /// it.
+    counters: BTreeMap<(CounterScope, u16), CounterBucket>,
+}
+
+/// The memory store's spelling of `summ_registry::CountSubject`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum CounterScope {
+    Manifest(Digest),
+    Tag(String),
+    Repo,
 }
 
 #[derive(Debug)]
@@ -114,6 +133,35 @@ pub struct MemoryRegistry {
 impl MemoryRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Apply a drained accumulator, as the flush task does against the real
+    /// store.
+    ///
+    /// The memory registry has no flush task of its own - it is not what
+    /// `summ serve` runs - so this is the seam at which a test hands it an
+    /// interval's worth of counts.
+    pub fn apply_pull_counts(&self, drained: Vec<Recorded>) {
+        let mut state = self.lock();
+        for row in drained {
+            // A repository the store does not have is skipped, exactly as the
+            // real flush skips one it cannot resolve to an interned id: a
+            // counter must not resurrect a name in the catalog.
+            let Some(repo) = state.repos.get_mut(&row.repo) else {
+                continue;
+            };
+            let scope = match row.subject {
+                Subject::Manifest(digest) => CounterScope::Manifest(digest),
+                Subject::Tag(tag) => CounterScope::Tag(tag),
+                Subject::Repo => CounterScope::Repo,
+            };
+            repo.counters.entry((scope, row.day)).or_default().add(
+                row.hour,
+                row.manifest_pulls,
+                row.blob_pulls,
+                row.bytes_out,
+            );
+        }
     }
 
     /// Seed a blob without going through the upload flow, for tests that are
@@ -955,6 +1003,39 @@ impl Registry for MemoryRegistry {
             last: key_of(reference, e),
         });
         Ok((rows, next))
+    }
+
+    async fn pull_counts(
+        &self,
+        name: &str,
+        scope: &PullCountScope,
+        from_day: u16,
+        days: u16,
+    ) -> OpsResult<Vec<PullCountDay>> {
+        if days == 0 {
+            return Ok(Vec::new());
+        }
+        let state = self.lock();
+        // An unknown repository is an empty series, never an error - counts
+        // outlive what they describe.
+        let Some(repo) = state.repos.get(name) else {
+            return Ok(Vec::new());
+        };
+        let wanted = match scope {
+            PullCountScope::Repository => CounterScope::Repo,
+            PullCountScope::Tag(tag) => CounterScope::Tag(tag.clone()),
+            PullCountScope::Manifest(digest) => CounterScope::Manifest(*digest),
+        };
+        let last = from_day.saturating_add(days.saturating_sub(1));
+        Ok(repo
+            .counters
+            .iter()
+            .filter(|((scope, day), _)| *scope == wanted && *day >= from_day && *day <= last)
+            .map(|((_, day), bucket)| PullCountDay {
+                day: *day,
+                bucket: *bucket,
+            })
+            .collect())
     }
 }
 

@@ -16,6 +16,7 @@ use axum::http::{header, Method, Request, StatusCode};
 use axum::Router;
 use serde_json::Value;
 use summ_server::config::ServerConfig;
+use summ_server::counters::PullCounters;
 use summ_server::handlers::api::{DEFAULT_PAGE, MAX_PAGE};
 use summ_server::memory::MemoryRegistry;
 use summ_server::{router, AppState};
@@ -27,13 +28,31 @@ const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
 struct Harness {
     app: Router,
     registry: Arc<MemoryRegistry>,
+    counters: Arc<PullCounters>,
 }
 
 impl Harness {
     fn new() -> Self {
         let registry = Arc::new(MemoryRegistry::new());
-        let app = router(AppState::new(registry.clone(), ServerConfig::default()));
-        Harness { app, registry }
+        // Counting is on, as it is in `summ serve`. There is no flush task
+        // behind it here - `flush` below is the tick, taken by hand so a test
+        // does not have to wait five seconds to see a pull land.
+        let counters = Arc::new(PullCounters::new());
+        let app = router(AppState::with_counters(
+            registry.clone(),
+            ServerConfig::default(),
+            counters.clone(),
+        ));
+        Harness {
+            app,
+            registry,
+            counters,
+        }
+    }
+
+    /// One flush interval, on demand: drain the accumulator into the store.
+    fn flush(&self) {
+        self.registry.apply_pull_counts(self.counters.drain());
     }
 
     async fn send(&self, method: Method, uri: &str) -> (StatusCode, Option<String>, Bytes) {
@@ -743,5 +762,266 @@ async fn a_malformed_history_query_is_rejected_rather_than_ignored() {
     assert_eq!(
         h.status("/api/v1/tag-history/demo/app").await,
         StatusCode::NOT_FOUND
+    );
+}
+
+// ---------------------------------------------------------- pull counts --
+
+/// Pull an image through `/v2/`, then flush, so the counters see exactly what a
+/// real client would produce.
+async fn pull_manifest(h: &Harness, repo: &str, reference: &str) {
+    let (status, _, _) = h
+        .send(Method::GET, &format!("/v2/{repo}/manifests/{reference}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "GET {repo}:{reference}");
+}
+
+fn day_of(row: &Value) -> u16 {
+    row["day"].as_u64().expect("day") as u16
+}
+
+/// The window is always `days` long, ends today, and every day is present -
+/// the client is a grid, and a gap in a grid is a missing cell rather than a
+/// zero one.
+#[tokio::test]
+async fn a_pull_count_window_is_zero_filled_and_ends_today() {
+    let h = Harness::new();
+    seed_image(&h, "demo/app", "latest", "a");
+
+    let body = h.get("/api/v1/pull-counts/demo/app").await;
+    let days = body["days"].as_array().expect("days");
+    assert_eq!(days.len(), 30, "the default window");
+    assert_eq!(body["scope"], "repository");
+    assert_eq!(body["repository"], "demo/app");
+    assert!(body["reference"].is_null());
+    assert_eq!(body["approximate"], true);
+    assert_eq!(body["from"], days[0]["date"]);
+    assert_eq!(body["to"], days[29]["date"]);
+
+    // Contiguous, ascending, one per day, with the hour arrays present even
+    // where nothing happened.
+    for (i, row) in days.iter().enumerate() {
+        assert_eq!(day_of(row), day_of(&days[0]) + i as u16);
+        assert_eq!(row["manifest_pulls"], 0);
+        assert_eq!(row["hours"]["manifest_pulls"].as_array().unwrap().len(), 24);
+        assert_eq!(row["hours"]["blob_pulls"].as_array().unwrap().len(), 24);
+        assert_eq!(row["hours"]["bytes_out"].as_array().unwrap().len(), 24);
+    }
+
+    // The weekday is arithmetic on the bucket, so consecutive days advance it.
+    let first = days[0]["weekday"].as_u64().unwrap();
+    assert_eq!(days[1]["weekday"].as_u64().unwrap(), (first + 1) % 7);
+}
+
+/// One `GET` lands on all three scopes, and each is its own series rather than
+/// a view of the others.
+#[tokio::test]
+async fn a_manifest_pull_counts_against_manifest_tag_and_repository() {
+    let h = Harness::new();
+    let digest = seed_image(&h, "demo/app", "latest", "a");
+
+    pull_manifest(&h, "demo/app", "latest").await;
+    h.flush();
+
+    for (uri, scope) in [
+        ("/api/v1/pull-counts/demo/app", "repository"),
+        ("/api/v1/pull-counts/demo/app@latest", "tag"),
+        (
+            &format!("/api/v1/pull-counts/demo/app@{digest}") as &str,
+            "manifest",
+        ),
+    ] {
+        let body = h.get(uri).await;
+        assert_eq!(body["scope"], scope, "{uri}");
+        assert_eq!(body["totals"]["manifest_pulls"], 1, "{uri}");
+        let today = body["days"].as_array().unwrap().last().unwrap();
+        assert_eq!(today["manifest_pulls"], 1, "{uri}");
+        // The day is the sum of the hours, and there is no stored total.
+        let hours = today["hours"]["manifest_pulls"].as_array().unwrap();
+        assert_eq!(
+            hours.iter().map(|h| h.as_u64().unwrap()).sum::<u64>(),
+            1,
+            "{uri}"
+        );
+    }
+}
+
+/// containerd issues `HEAD` then `GET` on every cold pull, so counting both
+/// would double every number in the registry.
+#[tokio::test]
+async fn a_head_is_not_a_pull() {
+    let h = Harness::new();
+    seed_image(&h, "demo/app", "latest", "a");
+
+    let (status, _, _) = h.send(Method::HEAD, "/v2/demo/app/manifests/latest").await;
+    assert_eq!(status, StatusCode::OK);
+    h.flush();
+
+    let body = h.get("/api/v1/pull-counts/demo/app").await;
+    assert_eq!(body["totals"]["manifest_pulls"], 0);
+}
+
+/// A pull by digest has no tag to attribute and must not invent one - the tag
+/// series answers "how often is this name pulled", which is a different
+/// question from "how often is this content pulled".
+#[tokio::test]
+async fn a_pull_by_digest_leaves_the_tag_series_alone() {
+    let h = Harness::new();
+    let digest = seed_image(&h, "demo/app", "latest", "a");
+
+    pull_manifest(&h, "demo/app", &digest).await;
+    h.flush();
+
+    assert_eq!(
+        h.get(&format!("/api/v1/pull-counts/demo/app@{digest}"))
+            .await["totals"]["manifest_pulls"],
+        1
+    );
+    assert_eq!(
+        h.get("/api/v1/pull-counts/demo/app@latest").await["totals"]["manifest_pulls"],
+        0
+    );
+    // The repository scope still sees it: it counts pulls, not names.
+    assert_eq!(
+        h.get("/api/v1/pull-counts/demo/app").await["totals"]["manifest_pulls"],
+        1
+    );
+}
+
+/// Blob traffic is repository-scoped only. Attributing a shared layer's bytes
+/// to one manifest would be a lie, and doing it honestly needs the `R` fan-in.
+#[tokio::test]
+async fn blob_bytes_are_counted_against_the_repository_and_nowhere_else() {
+    let h = Harness::new();
+    let digest = seed_image(&h, "demo/app", "latest", "a");
+    let layer = h.registry.seed_blob("demo/app", b"0123456789");
+
+    let (status, _, body) = h
+        .send(Method::GET, &format!("/v2/demo/app/blobs/{layer}"))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.len(), 10);
+    h.flush();
+
+    let repo = h.get("/api/v1/pull-counts/demo/app").await;
+    assert_eq!(repo["totals"]["blob_pulls"], 1);
+    assert_eq!(repo["totals"]["bytes_out"], 10);
+    // A blob fetch is not a manifest pull.
+    assert_eq!(repo["totals"]["manifest_pulls"], 0);
+
+    let manifest = h
+        .get(&format!("/api/v1/pull-counts/demo/app@{digest}"))
+        .await;
+    assert_eq!(manifest["totals"]["blob_pulls"], 0);
+    assert_eq!(manifest["totals"]["bytes_out"], 0);
+}
+
+/// A ranged read counts the bytes it actually received. containerd 2.1+ asks
+/// for `bytes=N-` and reads a prefix of it, so counting the requested window
+/// would over-report a large layer many times over.
+#[tokio::test]
+async fn a_ranged_blob_read_counts_the_bytes_it_received() {
+    let h = Harness::new();
+    seed_image(&h, "demo/app", "latest", "a");
+    let layer = h.registry.seed_blob("demo/app", b"0123456789");
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/v2/demo/app/blobs/{layer}"))
+        .header(header::RANGE, "bytes=0-3")
+        .body(Body::empty())
+        .unwrap();
+    let response = h.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.len(), 4);
+    h.flush();
+
+    let repo = h.get("/api/v1/pull-counts/demo/app").await;
+    assert_eq!(repo["totals"]["bytes_out"], 4);
+    assert_eq!(repo["totals"]["blob_pulls"], 1);
+}
+
+/// Counts outlive what they describe: after a delete nothing distinguishes
+/// "never pulled" from "gone", and the second case still has to answer.
+#[tokio::test]
+async fn nothing_in_pull_counts_404s() {
+    let h = Harness::new();
+    for uri in [
+        "/api/v1/pull-counts/ghost/repo",
+        "/api/v1/pull-counts/ghost/repo@latest",
+        "/api/v1/pull-counts/ghost/repo@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    ] {
+        let body = h.get(uri).await;
+        assert_eq!(body["totals"]["manifest_pulls"], 0, "{uri}");
+        assert_eq!(body["days"].as_array().unwrap().len(), 30, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn the_pull_count_window_is_clamped_and_validated() {
+    let h = Harness::new();
+    seed_image(&h, "demo/app", "latest", "a");
+
+    assert_eq!(
+        h.get("/api/v1/pull-counts/demo/app?days=7").await["days"]
+            .as_array()
+            .unwrap()
+            .len(),
+        7
+    );
+    // Clamped rather than rejected, as everywhere else in this API.
+    assert_eq!(
+        h.get("/api/v1/pull-counts/demo/app?days=99999").await["days"]
+            .as_array()
+            .unwrap()
+            .len(),
+        400
+    );
+    assert_eq!(
+        h.get("/api/v1/pull-counts/demo/app?days=0").await["days"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    // A cursor that does not parse is a 400, not a silent default.
+    assert_eq!(
+        h.status("/api/v1/pull-counts/demo/app?days=lots").await,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+/// The route splits at the last `@`, which is what makes a flat table
+/// unambiguous for a repository name containing `/`.
+#[tokio::test]
+async fn the_pull_count_route_splits_the_reference_off_the_end() {
+    let h = Harness::new();
+    seed_image(&h, "demo/app", "latest", "a");
+
+    let body = h.get("/api/v1/pull-counts/demo/app@latest").await;
+    assert_eq!(body["repository"], "demo/app");
+    assert_eq!(body["reference"], "latest");
+    assert_eq!(body["scope"], "tag");
+
+    assert_eq!(h.status("/api/v1/pull-counts").await, StatusCode::NOT_FOUND);
+}
+
+/// Repeated pulls accumulate rather than replace, which is the property the
+/// whole flush scheme rests on.
+#[tokio::test]
+async fn pulls_accumulate_across_flushes() {
+    let h = Harness::new();
+    seed_image(&h, "demo/app", "latest", "a");
+
+    for _ in 0..3 {
+        pull_manifest(&h, "demo/app", "latest").await;
+        h.flush();
+    }
+    assert_eq!(
+        h.get("/api/v1/pull-counts/demo/app@latest").await["totals"]["manifest_pulls"],
+        3
     );
 }

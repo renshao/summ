@@ -43,12 +43,23 @@ use serde::Serialize;
 use super::{build, method_not_allowed, ops_error, Ctx, Handled};
 use crate::error::{ApiError, ErrorCode};
 use crate::reference::{parse_digest, valid_tag, Reference};
-use crate::seam::{ManifestInfo, RepoDetail, RepoSummary, TagEventInfo, TagInfo, Tally};
+use crate::seam::{
+    ManifestInfo, PullCountDay, PullCountScope, RepoDetail, RepoSummary, TagEventInfo, TagInfo,
+    Tally,
+};
 
 /// Rows per page when `?n=` is absent.
 pub const DEFAULT_PAGE: usize = 25;
 /// Ceiling for `?n=`. Clamped rather than rejected, as everywhere else.
 pub const MAX_PAGE: usize = 100;
+
+/// Days of pull counts when `?days=` is absent - what the UI's daily grid
+/// shows.
+pub const DEFAULT_PULL_COUNT_DAYS: u16 = 30;
+/// Ceiling for `?days=`. Fifty-three weeks is 371, so this is a year of wall
+/// plus slack, and it is what bounds the scan: there is no cursor here because
+/// the window is the limit.
+pub const MAX_PULL_COUNT_DAYS: u16 = 400;
 
 /// One `/api/v1/` operation, with the repository name already split out.
 ///
@@ -71,6 +82,16 @@ pub enum ApiEndpoint {
     /// tag or a digest and the two ask different questions - see
     /// [`crate::seam::Registry::tag_history`].
     TagHistory { name: String, reference: String },
+    /// `GET /api/v1/pull-counts/<name>` or `.../<name>@<reference>`.
+    ///
+    /// The reference is optional because the repository is itself a scope, and
+    /// the only one carrying blob traffic. A tag and a digest ask different
+    /// questions again - "how often is this name pulled" against "how often is
+    /// this content pulled" - and they are separate series, not views of one.
+    PullCounts {
+        name: String,
+        reference: Option<String>,
+    },
 }
 
 // ---- wire shapes ---------------------------------------------------------
@@ -252,6 +273,70 @@ impl From<TagInfo> for TagBody {
     }
 }
 
+/// One day of counters, zero-filled.
+///
+/// Every day in the window is present whether or not it saw traffic, because
+/// the client is a grid and a gap in a grid is a missing cell rather than a
+/// zero one. The store returns only days with counts; filling them in is this
+/// layer's job precisely because it is the layer that knows the shape.
+#[derive(Serialize)]
+struct PullCountDayBody {
+    /// Days since the Unix epoch, UTC - the stored bucket, unmodified.
+    day: u16,
+    /// The same day as `YYYY-MM-DD`, so a client does not have to agree with
+    /// the server about calendars to label a column.
+    date: String,
+    /// `0` is Sunday. A contribution grid's row index, and nothing is stored
+    /// for it: 1970-01-01 was a Thursday, so it is `(day + 4) % 7`.
+    weekday: u8,
+    /// The day, which is the sum of `hours`. There is no stored total.
+    manifest_pulls: u64,
+    blob_pulls: u64,
+    bytes_out: u64,
+    hours: PullCountHoursBody,
+}
+
+/// The day broken down by hour, UTC, index `0..24`.
+///
+/// This is what makes the numbers honest outside UTC. The day bucket is fixed
+/// at write time and must never be re-bucketed - the same wall would change
+/// shape depending on who was looking at it - but hours can be re-summed into
+/// any zone, and they answer "when in the day does this get pulled" from the
+/// same response.
+#[derive(Serialize)]
+struct PullCountHoursBody {
+    manifest_pulls: Vec<u32>,
+    blob_pulls: Vec<u32>,
+    bytes_out: Vec<u64>,
+}
+
+#[derive(Serialize)]
+struct PullCountTotalsBody {
+    manifest_pulls: u64,
+    blob_pulls: u64,
+    bytes_out: u64,
+}
+
+#[derive(Serialize)]
+struct PullCountsBody {
+    repository: String,
+    /// Absent for the repository scope.
+    reference: Option<String>,
+    /// `repository`, `tag` or `manifest`.
+    scope: &'static str,
+    /// **Always `true`.** Increments are held in memory between flushes, so a
+    /// crash loses up to one interval and a saturated accumulator drops the
+    /// tail of a spike. A field that never varies is still worth sending: it is
+    /// how a client learns these are a popularity signal and not billing data,
+    /// and the alternative is that nothing says so anywhere the client looks.
+    approximate: bool,
+    /// The window, inclusive at both ends.
+    from: String,
+    to: String,
+    totals: PullCountTotalsBody,
+    days: Vec<PullCountDayBody>,
+}
+
 // ---- dispatch ------------------------------------------------------------
 
 pub async fn handle(ctx: &Ctx, endpoint: ApiEndpoint) -> Handled {
@@ -269,6 +354,9 @@ pub async fn handle(ctx: &Ctx, endpoint: ApiEndpoint) -> Handled {
         ApiEndpoint::Manifests { name } => manifests(ctx, &name).await,
         ApiEndpoint::Manifest { name, reference } => manifest(ctx, &name, &reference).await,
         ApiEndpoint::TagHistory { name, reference } => tag_history(ctx, &name, &reference).await,
+        ApiEndpoint::PullCounts { name, reference } => {
+            pull_counts(ctx, &name, reference.as_deref()).await
+        }
     }
 }
 
@@ -409,7 +497,145 @@ async fn tag_history(ctx: &Ctx, name: &str, reference: &str) -> Handled {
     )
 }
 
+/// Pull counts over a day window, zero-filled, hour by hour.
+///
+/// There is no cursor and no `next`: the window *is* the bound, 53 weeks is 371
+/// keys, and the whole visualisation is one ordered scan. `?days=` moves the
+/// window's length; it always ends today, because a wall that does not end now
+/// is a wall nobody asked for.
+///
+/// Nothing here 404s. An unknown repository, tag or manifest is a window of
+/// zeroes - counts outlive what they describe, and after a delete nothing
+/// distinguishes "never pulled" from "gone", but the second case must still
+/// answer.
+async fn pull_counts(ctx: &Ctx, name: &str, reference: Option<&str>) -> Handled {
+    // Parsed wide and then clamped, not parsed as the target width: `?days=`
+    // is clamped rather than rejected like every other bound in this API, and
+    // parsing straight into a `u16` would turn an oversized-but-well-formed
+    // number into a `400` while a merely large one succeeded. Only something
+    // that is not a number at all is an error.
+    let days = match ctx.param("days") {
+        None => DEFAULT_PULL_COUNT_DAYS,
+        Some(raw) => raw
+            .parse::<u64>()
+            .map_err(|_| {
+                ApiError::new(ErrorCode::PaginationNumberInvalid)
+                    .with_message("invalid days")
+                    .with_detail(format!("days={raw}"))
+            })?
+            .clamp(1, MAX_PULL_COUNT_DAYS as u64) as u16,
+    };
+
+    let scope = match reference {
+        None => PullCountScope::Repository,
+        Some(raw) => match parse_reference(raw)? {
+            Reference::Tag(tag) => PullCountScope::Tag(tag),
+            Reference::Digest(digest) => PullCountScope::Manifest(digest),
+        },
+    };
+
+    // The window ends on today's bucket, in UTC, which is the same boundary the
+    // counters were written against. Deriving it from a viewer's zone here
+    // would silently shift every column by a day for half the world.
+    let today = summ_core::keys::day_bucket(unix_now());
+    let from = today.saturating_sub(days.saturating_sub(1));
+
+    let series = ctx
+        .registry()
+        .pull_counts(name, &scope, from, days)
+        .await
+        .map_err(ops_error)?;
+
+    json(
+        ctx,
+        &pull_counts_body(name, reference, &scope, from, days, series),
+    )
+}
+
+fn pull_counts_body(
+    name: &str,
+    reference: Option<&str>,
+    scope: &PullCountScope,
+    from: u16,
+    days: u16,
+    series: Vec<PullCountDay>,
+) -> PullCountsBody {
+    // The store returns only days with traffic, in order, so filling the window
+    // is a merge rather than a map: walk the window and take the next stored day
+    // whenever it matches.
+    let mut stored = series.into_iter().peekable();
+    let mut rows = Vec::with_capacity(days as usize);
+    let mut totals = PullCountTotalsBody {
+        manifest_pulls: 0,
+        blob_pulls: 0,
+        bytes_out: 0,
+    };
+
+    for offset in 0..days {
+        let day = from.saturating_add(offset);
+        let bucket = match stored.peek() {
+            Some(next) if next.day == day => stored.next().map(|d| d.bucket).unwrap_or_default(),
+            _ => summ_core::CounterBucket::default(),
+        };
+        totals.manifest_pulls += bucket.manifest_pulls_total();
+        totals.blob_pulls += bucket.blob_pulls_total();
+        totals.bytes_out += bucket.bytes_out_total();
+        rows.push(PullCountDayBody {
+            day,
+            date: iso_date(day),
+            weekday: summ_core::keys::weekday(day),
+            manifest_pulls: bucket.manifest_pulls_total(),
+            blob_pulls: bucket.blob_pulls_total(),
+            bytes_out: bucket.bytes_out_total(),
+            hours: PullCountHoursBody {
+                manifest_pulls: bucket.manifest_pulls.to_vec(),
+                blob_pulls: bucket.blob_pulls.to_vec(),
+                bytes_out: bucket.bytes_out.to_vec(),
+            },
+        });
+    }
+
+    PullCountsBody {
+        repository: name.to_string(),
+        reference: reference.map(str::to_owned),
+        scope: scope.label(),
+        approximate: true,
+        from: iso_date(from),
+        to: iso_date(from.saturating_add(days.saturating_sub(1))),
+        totals,
+        days: rows,
+    }
+}
+
 // ---- helpers -------------------------------------------------------------
+
+/// Seconds since the Unix epoch, or the epoch itself if the clock is before it.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `YYYY-MM-DD` for a day bucket, UTC.
+///
+/// Hinnant's civil-from-days, which is exact over the whole `u16` range and
+/// wants no dependency. The alternative was to send the bucket number alone and
+/// let each client do this; the bucket is sent too, but a label a UI can print
+/// without a calendar library belongs in the response.
+fn iso_date(day: u16) -> String {
+    let z = day as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
 
 /// `?n=` and `?last=`, with this API's own bounds.
 ///
@@ -465,4 +691,24 @@ fn json<T: Serialize>(ctx: &Ctx, body: &T) -> Handled {
         return Ok(build(builder, Body::empty()));
     }
     Ok(build(builder, Body::from(bytes)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::iso_date;
+
+    /// The one thing `iso_date` can get wrong is a leap year, and it gets it
+    /// wrong silently: every column of a wall shifts by a day.
+    #[test]
+    fn day_buckets_become_the_dates_they_name() {
+        assert_eq!(iso_date(0), "1970-01-01");
+        assert_eq!(iso_date(1), "1970-01-02");
+        // 2000 is a leap year, 1900 was not - the rule the naive version misses.
+        assert_eq!(iso_date(11_016), "2000-02-29");
+        assert_eq!(iso_date(11_017), "2000-03-01");
+        assert_eq!(iso_date(19_723), "2024-01-01");
+        assert_eq!(iso_date(19_782), "2024-02-29");
+        // The far end of the u16 range still decodes rather than wrapping.
+        assert_eq!(iso_date(u16::MAX), "2149-06-06");
+    }
 }

@@ -30,6 +30,7 @@
 
 pub mod codec;
 pub mod cosign;
+pub mod counters;
 pub mod error;
 pub mod manifest;
 pub mod reference;
@@ -50,6 +51,7 @@ pub use registry::{
     ManifestHead, ManifestPut, Planned, PushOutcome, Registry, RegistryOptions, StoredManifest,
 };
 
+pub use counters::{CountDay, CountDelta, CountSubject};
 pub use delete::{BlobRefDeleted, ManifestDeleted};
 pub use discovery::{
     BlobReference, BlobReferenceList, DigestList, ManifestCountPage, ManifestList, RepoList,

@@ -201,6 +201,19 @@ pub struct ServeArgs {
     #[arg(long, env = "SUMM_NO_REFERRERS")]
     pub no_referrers: bool,
 
+    /// Stop counting pulls.
+    ///
+    /// On by default, like the referrers endpoint and for the same reason: the
+    /// feature is cheap and the switch is for the operator who does not want
+    /// the writes at all. A pull adds to a map in memory; a background task
+    /// folds the map into the `A` range every few seconds, which is one point
+    /// lookup and one `Put` per bucket touched. This turns off both, and the
+    /// `/api/v1/pull-counts/` endpoint keeps answering with whatever was
+    /// recorded before - counts outlive what they describe, so an empty window
+    /// is a real answer rather than a `404`.
+    #[arg(long, env = "SUMM_NO_PULL_COUNTS")]
+    pub no_pull_counts: bool,
+
     /// Authentication mode.
     ///
     /// `anonymous`, the default, is an open read-write registry - which is the

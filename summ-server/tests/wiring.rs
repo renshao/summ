@@ -23,6 +23,7 @@ use summ_core::Digest;
 use summ_registry::RegistryOptions;
 use summ_server::backend::{Backend, Engine};
 use summ_server::config::ServerConfig;
+use summ_server::counters::PullCounters;
 use summ_server::{router, AppState};
 use summ_storage::BlobStore;
 use tempfile::TempDir;
@@ -32,6 +33,8 @@ use tower::ServiceExt;
 
 struct Harness {
     app: Router,
+    backend: Arc<Backend>,
+    counters: Arc<PullCounters>,
 }
 
 impl Harness {
@@ -39,10 +42,7 @@ impl Harness {
     /// persistence tests, which is the whole point of taking a path rather than
     /// making its own.
     fn open(dir: &Path, engine: Engine, options: RegistryOptions) -> Self {
-        let backend = Backend::open(dir, engine, options).expect("backend opens");
-        Harness {
-            app: router(AppState::new(Arc::new(backend), ServerConfig::default())),
-        }
+        Self::build(dir, engine, options, ServerConfig::default())
     }
 
     fn rocks(dir: &Path) -> Self {
@@ -50,11 +50,59 @@ impl Harness {
     }
 
     fn with_config(dir: &Path, config: ServerConfig) -> Self {
-        let backend =
-            Backend::open(dir, Engine::Rocks, RegistryOptions::default()).expect("backend opens");
+        Self::build(dir, Engine::Rocks, RegistryOptions::default(), config)
+    }
+
+    /// The `--no-pull-counts` server: the same wiring with a counter that
+    /// discards, which is what `spawn_pull_counters(false)` hands back.
+    fn without_pull_counts(dir: &Path) -> Self {
+        Self::build_with(
+            dir,
+            Engine::Rocks,
+            RegistryOptions::default(),
+            ServerConfig::default(),
+            false,
+        )
+    }
+
+    /// Pull counting is on, as it is in `summ serve`, but with no flush task
+    /// behind it: [`Harness::flush`] is the tick, taken by hand so a test does
+    /// not have to wait `FLUSH_INTERVAL` to see a pull land.
+    fn build(dir: &Path, engine: Engine, options: RegistryOptions, config: ServerConfig) -> Self {
+        Self::build_with(dir, engine, options, config, true)
+    }
+
+    fn build_with(
+        dir: &Path,
+        engine: Engine,
+        options: RegistryOptions,
+        config: ServerConfig,
+        counting: bool,
+    ) -> Self {
+        let backend = Arc::new(Backend::open(dir, engine, options).expect("backend opens"));
+        // `spawn_pull_counters` would start a flush task, which these tests
+        // replace with `flush`; what is exercised here is the disabled path it
+        // returns without spawning anything.
+        let counters = if counting {
+            Arc::new(PullCounters::new())
+        } else {
+            backend.spawn_pull_counters(false)
+        };
+        let app = router(AppState::with_counters(
+            backend.clone(),
+            config,
+            counters.clone(),
+        ));
         Harness {
-            app: router(AppState::new(Arc::new(backend), config)),
+            app,
+            backend,
+            counters,
         }
+    }
+
+    /// One flush interval, on demand.
+    async fn flush(&self) -> usize {
+        self.backend.flush_pull_counts(&self.counters).await
     }
 
     async fn send(&self, request: Request<Body>) -> Reply {
@@ -1726,4 +1774,171 @@ async fn a_push_that_cannot_write_the_copy_commits_no_metadata() {
         h.get("/v2/acme/app/tags/list").await.json()["tags"],
         serde_json::json!([]),
     );
+}
+
+// -------------------------------------------------------------- pull counts --
+
+/// The counters over the real store: the accumulator, the flush, and the `A`
+/// range behind them.
+///
+/// `discovery.rs` proves the endpoint's shape against `MemoryRegistry`. What
+/// only this file can prove is that a flush turns into keys `summ-registry`
+/// wrote and `summ-meta` kept - and, below, that they are still there after the
+/// process that counted them is gone.
+#[tokio::test]
+async fn pulls_are_counted_through_the_real_store() {
+    let dir = TempDir::new().expect("tempdir");
+    let h = Harness::rocks(dir.path());
+    let digest = push_image(&h, "demo/app", "v1").await;
+
+    // Nothing is written until the flush: the pull path only touches memory.
+    assert_eq!(
+        h.get("/v2/demo/app/manifests/v1").await.status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        h.get("/api/v1/pull-counts/demo/app").await.json()["totals"]["manifest_pulls"],
+        0,
+        "a pull must not reach the store before its flush"
+    );
+
+    // One `GET` by tag lands on all three scopes.
+    assert_eq!(h.flush().await, 3, "manifest, tag and repository");
+    for uri in [
+        "/api/v1/pull-counts/demo/app".to_string(),
+        "/api/v1/pull-counts/demo/app@v1".to_string(),
+        format!("/api/v1/pull-counts/demo/app@{digest}"),
+    ] {
+        let body = h.get(&uri).await.json();
+        assert_eq!(body["totals"]["manifest_pulls"], 1, "{uri}");
+    }
+
+    // A blob `GET` is repository-scoped, and the bytes are the ones served.
+    let layer = sha256_hex(LAYER);
+    assert_eq!(
+        h.get(&format!("/v2/demo/app/blobs/{layer}")).await.status,
+        StatusCode::OK
+    );
+    h.flush().await;
+    let repo = h.get("/api/v1/pull-counts/demo/app").await.json();
+    assert_eq!(repo["totals"]["blob_pulls"], 1);
+    assert_eq!(repo["totals"]["bytes_out"], LAYER.len());
+
+    // An empty accumulator writes nothing at all rather than a batch of zeroes.
+    assert_eq!(h.flush().await, 0);
+}
+
+/// A flush is a fold, not a replace - which is what makes losing an interval to
+/// a crash cost an interval rather than a day.
+#[tokio::test]
+async fn counts_accumulate_across_flushes_and_survive_a_restart() {
+    let dir = TempDir::new().expect("tempdir");
+    let digest = {
+        let h = Harness::rocks(dir.path());
+        let digest = push_image(&h, "demo/app", "v1").await;
+        for _ in 0..3 {
+            h.get("/v2/demo/app/manifests/v1").await;
+            h.flush().await;
+        }
+        assert_eq!(
+            h.get("/api/v1/pull-counts/demo/app@v1").await.json()["totals"]["manifest_pulls"],
+            3
+        );
+        digest
+    };
+
+    let h = Harness::rocks(dir.path());
+    let body = h
+        .get(&format!("/api/v1/pull-counts/demo/app@{digest}"))
+        .await
+        .json();
+    assert_eq!(
+        body["totals"]["manifest_pulls"], 3,
+        "counts outlive the process"
+    );
+
+    // And a pull after the restart adds to what is there rather than starting
+    // the day again.
+    h.get("/v2/demo/app/manifests/v1").await;
+    h.flush().await;
+    assert_eq!(
+        h.get(&format!("/api/v1/pull-counts/demo/app@{digest}"))
+            .await
+            .json()["totals"]["manifest_pulls"],
+        4
+    );
+}
+
+/// The hour is stamped when the pull is served, so a day's traffic lands in one
+/// hour of the array and the day total is its sum.
+#[tokio::test]
+async fn a_pull_lands_in_exactly_one_hour_of_the_day() {
+    let dir = TempDir::new().expect("tempdir");
+    let h = Harness::rocks(dir.path());
+    push_image(&h, "demo/app", "v1").await;
+    h.get("/v2/demo/app/manifests/v1").await;
+    h.flush().await;
+
+    let body = h.get("/api/v1/pull-counts/demo/app@v1").await.json();
+    let days = body["days"].as_array().expect("days");
+    let today = days.last().expect("today");
+    let hours: Vec<u64> = today["hours"]["manifest_pulls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h.as_u64().unwrap())
+        .collect();
+    assert_eq!(hours.len(), 24);
+    assert_eq!(hours.iter().sum::<u64>(), 1);
+    assert_eq!(
+        hours.iter().filter(|&&n| n > 0).count(),
+        1,
+        "one pull is one hour"
+    );
+    assert_eq!(
+        today["manifest_pulls"], 1,
+        "the day is the sum of the hours"
+    );
+}
+
+/// A pull counted for a repository that has since been deleted must not
+/// resurrect it: the flush resolves the name and skips what it cannot find.
+#[tokio::test]
+async fn a_flush_does_not_resurrect_a_deleted_repository() {
+    let dir = TempDir::new().expect("tempdir");
+    let h = Harness::rocks(dir.path());
+    push_image(&h, "demo/app", "v1").await;
+    h.get("/v2/demo/app/manifests/v1").await;
+    h.flush().await;
+
+    // The catalog is unchanged by counting, and a count for a name the store
+    // never had writes nothing.
+    let before = h.get("/api/v1/repositories").await.json();
+    assert_eq!(before["repositories"].as_array().unwrap().len(), 1);
+
+    assert_eq!(
+        h.get("/v2/ghost/manifests/v1").await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(h.flush().await, 0, "a 404 is not a pull");
+    let after = h.get("/api/v1/repositories").await.json();
+    assert_eq!(after["repositories"], before["repositories"]);
+}
+
+/// `--no-pull-counts` is the switch, and it turns off the recording rather than
+/// the endpoint: counts outlive what they describe, so the endpoint keeps
+/// answering with whatever was recorded before.
+#[tokio::test]
+async fn disabled_counters_record_nothing_and_still_answer() {
+    let dir = TempDir::new().expect("tempdir");
+    let h = Harness::without_pull_counts(dir.path());
+    assert!(!h.counters.is_enabled());
+
+    push_image(&h, "demo/app", "v1").await;
+    h.get("/v2/demo/app/manifests/v1").await;
+    assert_eq!(h.flush().await, 0);
+
+    let body = h.get("/api/v1/pull-counts/demo/app").await.json();
+    assert_eq!(body["totals"]["manifest_pulls"], 0);
+    assert_eq!(body["days"].as_array().unwrap().len(), 30);
 }

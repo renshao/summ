@@ -32,7 +32,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use axum::body::{Body, Bytes};
@@ -40,15 +40,19 @@ use futures_util::StreamExt;
 use summ_core::{Digest, ManifestRecord, Platform, SummError, TagEventKind, Timestamp};
 use summ_meta::{MetaEngine, RedbEngine, RocksEngine};
 use summ_registry::error::RegistryError;
-use summ_registry::{Reference as OpsReference, Registry as Ops, RegistryOptions, UploadKey};
+use summ_registry::{
+    CountDelta, CountSubject, Reference as OpsReference, Registry as Ops, RegistryOptions,
+    UploadKey,
+};
 use summ_storage::{BlobStore, DigestAlgorithm, UploadId};
 
+use crate::counters::{PullCounters, Recorded, Subject};
 use crate::range::ByteRange;
 use crate::reference::Reference;
 use crate::seam::{
     BlobRead, Descriptor, HistoryCursor, ManifestInfo, ManifestPut, ManifestStat, OpsError,
-    OpsResult, Page, Referrers, Registry, RepoDetail, RepoSummary, TagEventInfo, TagInfo, Tally,
-    UploadBody, COUNT_CEILING, TAGS_PER_MANIFEST,
+    OpsResult, Page, PullCountDay, PullCountScope, Referrers, Registry, RepoDetail, RepoSummary,
+    TagEventInfo, TagInfo, Tally, UploadBody, COUNT_CEILING, TAGS_PER_MANIFEST,
 };
 
 /// Which metadata engine `serve` opens.
@@ -1082,6 +1086,130 @@ impl Registry for Backend {
             ))
         })
         .await
+    }
+
+    async fn pull_counts(
+        &self,
+        name: &str,
+        scope: &PullCountScope,
+        from_day: u16,
+        days: u16,
+    ) -> OpsResult<Vec<PullCountDay>> {
+        let name = name.to_string();
+        let scope = scope.clone();
+        self.scan(move |ops| {
+            let series = match &scope {
+                PullCountScope::Repository => ops.repo_counts(&name, from_day, days)?,
+                PullCountScope::Tag(tag) => ops.tag_counts(&name, tag, from_day, days)?,
+                PullCountScope::Manifest(digest) => {
+                    ops.manifest_counts(&name, digest, from_day, days)?
+                }
+            };
+            Ok(series
+                .into_iter()
+                .map(|d| PullCountDay {
+                    day: d.day,
+                    bucket: d.bucket,
+                })
+                .collect())
+        })
+        .await
+    }
+}
+
+/// How often the accumulator is drained into the store.
+///
+/// A constant rather than a flag. It trades how much a crash loses against how
+/// many point lookups the flush does, and both ends of that trade are cheap
+/// enough that nobody has a reason to tune it: five seconds of counts is a
+/// rounding error on a best-effort popularity signal, and a flush is one `get`
+/// and one `Put` per bucket touched in those five seconds.
+pub const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+impl Backend {
+    /// Start counting pulls, and return the handle the HTTP layer records into.
+    ///
+    /// Disabled returns a counter that discards everything and spawns no task,
+    /// so `--no-pull-counts` costs a branch on the pull path rather than a
+    /// switch at every call site.
+    ///
+    /// The task is detached and never joined. There is no drain on shutdown by
+    /// design: what would be lost is under one interval of a signal that is
+    /// already declared approximate, and the alternative is a shutdown path
+    /// that can block on the metadata store while a client waits.
+    pub fn spawn_pull_counters(&self, enabled: bool) -> Arc<PullCounters> {
+        if !enabled {
+            return Arc::new(PullCounters::disabled());
+        }
+        let counters = Arc::new(PullCounters::new());
+        let ops = Arc::clone(&self.ops);
+        let handle = Arc::clone(&counters);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
+            // A flush that overran its tick must not then fire the backlog in a
+            // burst: the next one is simply due one interval later.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                flush_pull_counts(&ops, &handle).await;
+            }
+        });
+        counters
+    }
+
+    /// Drain and write immediately. The flush task's tick, on demand, so a test
+    /// does not have to wait [`FLUSH_INTERVAL`] to see a pull land.
+    pub async fn flush_pull_counts(&self, counters: &PullCounters) -> usize {
+        flush_pull_counts(&self.ops, counters).await
+    }
+}
+
+/// One flush: take what has accumulated, fold it into the store, and report.
+///
+/// A failure here loses the interval's counts and is logged, never propagated.
+/// The whole point of the accumulator is that a counter cannot fail a pull, and
+/// a flush that could take the server down would give that back at the far end.
+async fn flush_pull_counts(ops: &Arc<Ops>, counters: &PullCounters) -> usize {
+    let dropped = counters.take_dropped();
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            "pull-count accumulator saturated; increments discarded"
+        );
+    }
+
+    let drained = counters.drain();
+    if drained.is_empty() {
+        return 0;
+    }
+    let deltas: Vec<CountDelta> = drained.into_iter().map(count_delta).collect();
+    let ops = Arc::clone(ops);
+    match tokio::task::spawn_blocking(move || ops.add_pull_counts(&deltas)).await {
+        Ok(Ok(written)) => written,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "pull counts not flushed");
+            0
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "pull-count flush task failed");
+            0
+        }
+    }
+}
+
+fn count_delta(recorded: Recorded) -> CountDelta {
+    CountDelta {
+        repo: recorded.repo,
+        subject: match recorded.subject {
+            Subject::Manifest(digest) => CountSubject::Manifest(digest),
+            Subject::Tag(tag) => CountSubject::Tag(tag),
+            Subject::Repo => CountSubject::Repo,
+        },
+        day: recorded.day,
+        hour: recorded.hour,
+        manifest_pulls: recorded.manifest_pulls,
+        blob_pulls: recorded.blob_pulls,
+        bytes_out: recorded.bytes_out,
     }
 }
 

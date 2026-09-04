@@ -56,8 +56,12 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let backend = Backend::open(&args.data_dir, args.engine, args.registry_options())?;
+    // Started before the router, because the router needs the handle the pull
+    // path records into. Disabled hands back a counter that discards, so
+    // `--no-pull-counts` costs a branch rather than a second wiring.
+    let counters = backend.spawn_pull_counters(!args.no_pull_counts);
     let auth = config.auth.clone();
-    let state = AppState::new(Arc::new(backend), config);
+    let state = AppState::with_counters(Arc::new(backend), config, counters);
     let app = router(state);
 
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
@@ -80,6 +84,9 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("  engine        {:?}", args.engine);
     if args.allow_missing_references {
         println!("  references    unvalidated (--allow-missing-references)");
+    }
+    if args.no_pull_counts {
+        println!("  pull counts   off (--no-pull-counts)");
     }
     print_auth(&auth, generated);
 

@@ -515,11 +515,11 @@ mod suite {
         let mut batch = WriteBatch::new();
         for back in 0..400u16 {
             let day = today - back;
-            let bucket = CounterBucket {
-                manifest_pulls: u64::from(day),
-                blob_pulls: 1,
-                bytes_out: 2,
-            };
+            // The day's number as its own count, so the decoded bucket
+            // identifies which key it came out of. Hour 0 carries it: the day
+            // total is the sum of the hours and there is no stored total.
+            let mut bucket = CounterBucket::default();
+            bucket.add(0, u64::from(day), 1, 2);
             batch.put(
                 keys::counter_manifest(repo, &manifest, day, 0),
                 postcard::to_allocvec(&bucket).unwrap(),
@@ -559,7 +559,8 @@ mod suite {
         assert_eq!(got, expected, "buckets must arrive oldest-first, gap-free");
 
         let first: CounterBucket = postcard::from_bytes(&page.entries[0].1).unwrap();
-        assert_eq!(first.manifest_pulls, u64::from(cutoff));
+        assert_eq!(first.manifest_pulls_total(), u64::from(cutoff));
+        assert_eq!(first.manifest_pulls[0], u32::from(cutoff));
     }
 
     /// Complemented timestamps are what let a forward-only `scan` serve an

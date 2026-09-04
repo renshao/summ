@@ -138,6 +138,8 @@ const apiManifest = (name, ref) =>
   '/api/v1/manifests/' + escapeName(name) + '@' + encodeURIComponent(ref);
 const apiTagHistory = (name, ref) =>
   '/api/v1/tag-history/' + escapeName(name) + '@' + encodeURIComponent(ref);
+const apiPullCounts = (name, ref) =>
+  '/api/v1/pull-counts/' + escapeName(name) + (ref ? '@' + encodeURIComponent(ref) : '');
 
 // ---- shared pieces -------------------------------------------------------
 
@@ -321,6 +323,8 @@ async function repositoryPage(name, query) {
       stat('Blobs', tally(detail.blobs)),
       stat('Size', size, unit),
     ]),
+    el('h2', { class: 'section', text: 'Pulls' }),
+    pullCountsSection(name, null),
     tabs,
     body,
   );
@@ -464,6 +468,8 @@ async function manifestPage(name, reference) {
       el('span', { class: 'mono', text: `${location.host}/${name}@${m.digest}` }),
     ]),
     el('div', { class: 'list' }, [kv]),
+    el('h2', { class: 'section', text: 'Pulls' }),
+    pullCountsSection(name, m.digest),
     el('h2', { class: 'section', text: 'Tag history' }),
     el('p', { class: 'subtitle', text: 'Every name this manifest has been given, newest first.' }),
     historyList(name, m.digest, 'tag'),
@@ -537,8 +543,164 @@ function tagHistoryPage(name, tag) {
     ]),
     el('h1', {}, [el('span', { class: 'chip tag', text: tag })]),
     el('p', { class: 'subtitle', text: 'Every push and delete of this tag, newest first.' }),
+    el('h2', { class: 'section', text: 'Pulls' }),
+    // The tag's own series, which is a different question from the manifest's:
+    // this counts how often the *name* was asked for, and a pull by digest does
+    // not appear in it.
+    pullCountsSection(name, tag),
+    el('h2', { class: 'section', text: 'History' }),
     historyList(name, tag, 'digest'),
   );
+}
+
+// ---- pull counts ---------------------------------------------------------
+
+/*
+ * Two grids of shaded cells over the same response: thirty days, and the last
+ * twenty-four hours. Both are the contribution-wall shape because it is the
+ * right one for the question - "is this pulled, and when" is a glance, not a
+ * reading exercise - and because the data is literally that: one bucket per
+ * day, each holding a count per hour.
+ *
+ * Three things here that the endpoint's design decides, not this file:
+ *
+ * - **The day grid is UTC and stays UTC.** The bucket boundary is fixed when
+ *   the pull is counted, so re-bucketing a day into the viewer's zone would
+ *   make the same wall a different shape for each person looking at it. The
+ *   cells are labelled with the server's own date string for that reason.
+ * - **The hour strip is local, and that is not a contradiction.** An hour
+ *   bucket names an instant, and relabelling an instant is honest where
+ *   re-bucketing a day is not. So the strip walks back twenty-four real hours
+ *   from now and prints each in the viewer's zone.
+ * - **The numbers are approximate and say so.** Counts live in memory between
+ *   flushes, so the last few seconds are always missing.
+ */
+
+const WALL_LEVELS = 4;
+const HOURS = 24;
+
+/** Which shade a count gets: 0 for nothing, then four steps up to the peak. */
+function wallLevel(value, peak) {
+  if (!value) return 0;
+  if (peak <= 1) return WALL_LEVELS;
+  return Math.min(WALL_LEVELS, 1 + Math.floor(((value - 1) * WALL_LEVELS) / peak));
+}
+
+function wallCell(value, peak, label) {
+  return el('span', {
+    class: 'cell',
+    'data-level': String(wallLevel(value, peak)),
+    title: label,
+    role: 'img',
+    'aria-label': label,
+  });
+}
+
+/**
+ * The thirty-day grid. One cell per day, oldest first, with a weekday rule
+ * under it: the server sends the weekday because it is arithmetic on the
+ * bucket - 1970-01-01 was a Thursday - and nothing is stored for it.
+ */
+function dayWall(days) {
+  const peak = days.reduce((max, d) => Math.max(max, d.manifest_pulls), 0);
+  const cells = days.map((d) =>
+    wallCell(d.manifest_pulls, peak, `${d.date} · ${nf.format(d.manifest_pulls)} ${d.manifest_pulls === 1 ? 'pull' : 'pulls'}`));
+  return el('div', { class: 'wall days' }, cells);
+}
+
+/**
+ * The last twenty-four hours, in the viewer's own zone.
+ *
+ * Built by absolute hour rather than by walking the arrays, because "the last
+ * twenty-four hours" crosses midnight almost always and the two halves come
+ * out of two different day buckets.
+ */
+function hourWall(days) {
+  const counts = new Map();
+  for (const day of days) {
+    const hours = (day.hours && day.hours.manifest_pulls) || [];
+    for (let h = 0; h < HOURS; h++) {
+      if (hours[h]) counts.set(day.day * HOURS + h, hours[h]);
+    }
+  }
+
+  const nowHour = Math.floor(Date.now() / 3600000);
+  const window = [];
+  for (let i = HOURS - 1; i >= 0; i--) window.push(nowHour - i);
+
+  const peak = window.reduce((max, h) => Math.max(max, counts.get(h) || 0), 0);
+  const cells = window.map((h) => {
+    const value = counts.get(h) || 0;
+    const at = new Date(h * 3600000);
+    const label = `${at.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric' })} · ${nf.format(value)} ${value === 1 ? 'pull' : 'pulls'}`;
+    return wallCell(value, peak, label);
+  });
+
+  return el('div', { class: 'wall hours' }, cells);
+}
+
+/** A grid's caption: what it is on the left, how to read it on the right. */
+function wallHead(title, note) {
+  return el('div', { class: 'wall-head' }, [
+    el('span', { text: title }),
+    el('span', { class: 'note', text: note }),
+  ]);
+}
+
+/** The key, so a shade means something rather than merely differing. */
+function wallLegend() {
+  const swatches = [];
+  for (let l = 0; l <= WALL_LEVELS; l++) {
+    swatches.push(el('span', { class: 'cell', 'data-level': String(l) }));
+  }
+  return el('div', { class: 'wall-legend' }, [
+    el('span', { text: 'less' }),
+    ...swatches,
+    el('span', { text: 'more' }),
+  ]);
+}
+
+/**
+ * The section, fetched after the page has rendered.
+ *
+ * Deliberately not awaited by the caller: a manifest page must not wait on a
+ * counter, and a registry started with `--no-pull-counts` should show a page
+ * that is simply missing this rather than a page that failed. So a failure here
+ * removes the section and says nothing.
+ */
+function pullCountsSection(name, reference) {
+  const box = el('section', { class: 'wall-box' }, [
+    el('div', { class: 'loading', text: 'Loading…' }),
+  ]);
+
+  api(apiPullCounts(name, reference)).then((body) => {
+    const days = body.days || [];
+    const totals = body.totals || {};
+    const [size, unit] = bytes(totals.bytes_out || 0);
+
+    const summary = [
+      el('span', { text: `${nf.format(totals.manifest_pulls || 0)} pulls in ${days.length} days` }),
+    ];
+    // Blob traffic is repository-scoped only: attributing a shared layer's
+    // bytes to one manifest would be a lie, so those two figures appear on the
+    // repository page and nowhere else.
+    if (body.scope === 'repository') {
+      summary.push(el('span', { text: `${nf.format(totals.blob_pulls || 0)} blob reads` }));
+      summary.push(el('span', { text: `${size} ${unit} served` }));
+    }
+    summary.push(el('span', { class: 'approx', text: 'approximate' }));
+
+    box.replaceChildren(
+      el('div', { class: 'wall-sub' }, summary),
+      wallHead('Daily', `${body.from} – ${body.to} · UTC`),
+      dayWall(days),
+      wallLegend(),
+      wallHead('Last 24 hours', 'your local time'),
+      hourWall(days),
+    );
+  }).catch(() => box.remove());
+
+  return box;
 }
 
 // ---- routing -------------------------------------------------------------

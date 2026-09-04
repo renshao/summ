@@ -29,6 +29,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::config::ServerConfig;
+use crate::counters::PullCounters;
 use crate::error::{ApiError, ErrorCode};
 use crate::handlers;
 use crate::handlers::api::ApiEndpoint;
@@ -47,13 +48,34 @@ pub const API_VERSION_HEADER: HeaderName =
 pub struct AppState {
     pub registry: Arc<dyn Registry>,
     pub config: Arc<ServerConfig>,
+    /// Where a served pull is counted.
+    ///
+    /// Above the seam on purpose: what is counted is an HTTP fact - a `GET` and
+    /// not a `HEAD`, and the bytes that reached the socket rather than the ones
+    /// a range asked for - so the handlers are where it is known. Draining this
+    /// into the store is `backend.rs`'s job.
+    pub counters: Arc<PullCounters>,
 }
 
 impl AppState {
+    /// A registry that counts nothing.
+    ///
+    /// The default because every embedding that is not `summ serve` - the tests
+    /// above all - has no flush task behind it, and counters that accumulate
+    /// with nothing draining them are a leak rather than a feature.
     pub fn new(registry: Arc<dyn Registry>, config: ServerConfig) -> Self {
+        AppState::with_counters(registry, config, Arc::new(PullCounters::disabled()))
+    }
+
+    pub fn with_counters(
+        registry: Arc<dyn Registry>,
+        config: ServerConfig,
+        counters: Arc<PullCounters>,
+    ) -> Self {
         AppState {
             registry,
             config: Arc::new(config),
+            counters,
         }
     }
 }
@@ -257,6 +279,20 @@ pub fn api_route(path: &str) -> Result<ApiEndpoint, RouteError> {
                 reference: query::path_decode(reference),
             }),
             None => Err(RouteError::NoMatch),
+        },
+        // A reference is optional here, unlike `tag-history`: the repository is
+        // itself a counter scope, and the only one carrying blob traffic. The
+        // three scopes are separate series maintained on write, so this is not
+        // a rollup of the per-manifest ones - see `PLAN.md`.
+        "pull-counts" => match remainder.rsplit_once('@') {
+            Some((name, reference)) => Ok(ApiEndpoint::PullCounts {
+                name: name_of(name)?,
+                reference: Some(query::path_decode(reference)),
+            }),
+            None => Ok(ApiEndpoint::PullCounts {
+                name: name_of(remainder)?,
+                reference: None,
+            }),
         },
         _ => Err(RouteError::NoMatch),
     }

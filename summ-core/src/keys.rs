@@ -355,6 +355,25 @@ pub fn day_bucket(unix_seconds: u64) -> u16 {
     (unix_seconds / 86_400) as u16
 }
 
+/// The hour within [`day_bucket`]'s day, UTC, `0..24`.
+///
+/// Indexes the arrays in [`CounterBucket`](crate::types::CounterBucket). The
+/// pair `(day, hour)` is the whole time coordinate of a counter increment;
+/// nothing finer is stored, and nothing coarser is stored either, because a day
+/// total is the sum of the hours.
+pub fn hour_of_day(unix_seconds: u64) -> usize {
+    ((unix_seconds % 86_400) / 3_600) as usize
+}
+
+/// The weekday of a day bucket, `0` = Sunday.
+///
+/// Pure arithmetic on the key: 1970-01-01 was a Thursday, so day 0 is weekday
+/// 4. A contribution grid's row index and a "which day of the week do people
+/// pull on" fold both come out of this with nothing stored for them.
+pub fn weekday(day: u16) -> u8 {
+    ((day as u32 + 4) % 7) as u8
+}
+
 /// `<shard>` is the writing node's id, `0` on a single node. Two nodes each
 /// writing an absolute value for one bucket would be last-write-wins, which is
 /// silent undercounting; reserving the component now is free, adding a key
@@ -419,6 +438,32 @@ pub fn counters_of_repo(repo: RepoId) -> Vec<u8> {
 /// dropped. Not a scan target: the three scopes have different key shapes.
 pub fn counters_in_repo_scope(scope: u8, repo: RepoId) -> Vec<u8> {
     start_counter(scope, repo, 0)
+}
+
+/// Where a day-windowed scan resumes so that `day` itself is included.
+///
+/// `scan`'s `start_after` is exclusive, and a full counter key carries a shard
+/// after the day. `<prefix> <day>` is a proper prefix of every key in that day
+/// and therefore sorts strictly before all of them, so resuming after it yields
+/// the day rather than skipping it. Passing `<prefix> <day> <shard 0>` would
+/// silently drop shard 0, which on a single node is every key there is.
+pub fn counters_from_day(scan_prefix: &[u8], day: u16) -> Vec<u8> {
+    let mut k = Vec::with_capacity(scan_prefix.len() + 2);
+    k.extend_from_slice(scan_prefix);
+    k.extend_from_slice(&day.to_be_bytes());
+    k
+}
+
+/// `(day, shard)` off the end of a counter key.
+pub fn counter_suffix(key: &[u8], scan_prefix: &[u8]) -> Option<(u16, u16)> {
+    let rest = key.strip_prefix(scan_prefix)?;
+    if rest.len() != 4 {
+        return None;
+    }
+    Some((
+        u16::from_be_bytes([rest[0], rest[1]]),
+        u16::from_be_bytes([rest[2], rest[3]]),
+    ))
 }
 
 // --- repo interner -----------------------------------------------------
@@ -660,6 +705,59 @@ mod tests {
 
         // Tag counters need the same separator guarantee as tag history.
         assert!(!counter_tag(1, "foobar", 20_000, 0).starts_with(&counters_of_tag(1, "foo")));
+    }
+
+    /// 1970-01-01 was a Thursday, and every weekday claim in the UI rests on
+    /// that one fact.
+    #[test]
+    fn weekdays_are_arithmetic_on_the_day_bucket() {
+        assert_eq!(weekday(0), 4); // Thursday
+        assert_eq!(weekday(1), 5);
+        assert_eq!(weekday(3), 0); // Sunday
+        assert_eq!(weekday(7), 4);
+        // 2024-01-01 was a Monday: 19_723 days after the epoch.
+        assert_eq!(weekday(19_723), 1);
+    }
+
+    #[test]
+    fn the_day_and_hour_of_an_instant_are_its_whole_coordinate() {
+        let midnight = 19_723_u64 * 86_400;
+        assert_eq!(day_bucket(midnight), 19_723);
+        assert_eq!(hour_of_day(midnight), 0);
+        assert_eq!(hour_of_day(midnight + 3_599), 0);
+        assert_eq!(hour_of_day(midnight + 3_600), 1);
+        assert_eq!(hour_of_day(midnight + 86_399), 23);
+        assert_eq!(day_bucket(midnight + 86_400), 19_724);
+        assert_eq!(hour_of_day(midnight + 86_400), 0);
+    }
+
+    #[test]
+    fn a_day_window_starts_on_the_day_it_names() {
+        let prefix = counters_of_manifest(1, &d(1));
+        let from = counters_from_day(&prefix, 20_000);
+        // Strictly before every key in that day, so an exclusive `start_after`
+        // includes shard 0 rather than skipping it.
+        assert!(from < counter_manifest(1, &d(1), 20_000, 0));
+        assert!(from > counter_manifest(1, &d(1), 19_999, u16::MAX));
+    }
+
+    #[test]
+    fn counter_suffixes_decode_what_the_encoders_wrote() {
+        let prefix = counters_of_manifest(1, &d(1));
+        let key = counter_manifest(1, &d(1), 20_000, 3);
+        assert_eq!(counter_suffix(&key, &prefix), Some((20_000, 3)));
+
+        let tag_prefix = counters_of_tag(1, "latest");
+        let tag_key = counter_tag(1, "latest", 19_999, 0);
+        assert_eq!(counter_suffix(&tag_key, &tag_prefix), Some((19_999, 0)));
+
+        let repo_prefix = counters_of_repo(1);
+        assert_eq!(
+            counter_suffix(&counter_repo(1, 1, 1), &repo_prefix),
+            Some((1, 1))
+        );
+        // A key from another group is not silently reinterpreted.
+        assert_eq!(counter_suffix(&key, &repo_prefix), None);
     }
 
     #[test]

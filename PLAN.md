@@ -96,12 +96,12 @@ Digests encode as one algorithm byte followed by raw hash bytes.
 | `v` | schema version (BE u32) | Single key. Absent on a populated store ⇒ refuse to open |
 | `H <repo> <tag> 0 <!ms> <digest>` | `TagEvent` | Tag history, newest first. **Served** |
 | `J <repo> <digest> <!ms> <tag>` | `TagEvent` | Same, addressed by digest. **Served** |
-| `A <scope> <…> <day> <shard>` | `CounterBucket` | Daily pull counters. *Keys and values built; no writer yet* |
+| `A <scope> <…> <day> <shard>` | `CounterBucket` | Pull counters, per day and per hour. **Served** |
 
 `H` and `J` are complete — written on every tag mutation since Phase 1, and now
-read by `/api/v1/tag-history/` and the UI. See **Tag history** below. `A` has
-key builders, value types and a prefix-filter group but nothing writing to it;
-see **Analytics**.
+read by `/api/v1/tag-history/` and the UI. See **Tag history** below. `A` is
+complete too: written by the flush task, read by `/api/v1/pull-counts/` and the
+UI. See **Pull counts**.
 
 **`H` and `J` timestamps are milliseconds; every stored record is seconds.**
 That asymmetry is deliberate and it is the one thing to know before touching
@@ -137,7 +137,7 @@ Two traps worth stating explicitly:
 
 ## Status
 
-`cargo test` — **392 passing**. Every crate in CLAUDE.md's Layout is built, and
+`cargo test` — **428 passing**. Every crate in CLAUDE.md's Layout is built, and
 **the wiring has landed** (package K, `summ-server/src/backend.rs`): `summ
 serve` runs on `summ-registry` over `summ-meta` with `summ-storage` holding the
 bytes. `tests/wiring.rs` drives the same router as `tests/api.rs` against a real
@@ -259,6 +259,14 @@ the mutation, so this was a read path, an endpoint and a page. Two things did
 change on the way — the timestamps moved from seconds to milliseconds, and the
 `before` cursor became strictly-before, which it was not. See **Tag history**.
 
+**Pull counts are served** (`/api/v1/pull-counts/<name>[@<reference>]`, plus
+two contribution grids in the UI). This was package J, and it needed no new
+engine primitive: a pull adds to a map in memory and returns, and a background
+task folds the map into the `A` range every five seconds as plain `Put`s of
+absolute values. The `CounterBucket` value gained a per-hour breakdown on the
+way in, which cost nothing because nothing had ever written an `A` key. On by
+default; `--no-pull-counts` turns it off. See **Pull counts**.
+
 **API-key authentication has landed** and is described under **Authentication**
 below: `--auth apikey` puts a read key and a write key in front of `/v2/`, the
 discovery API and the UI at once. Off by default, so the conformance runs above
@@ -282,9 +290,9 @@ and removing it would mean overriding the unwinder std chose. Measured floor:
 **GLIBC_2.34** — Ubuntu 22.04, Debian 12, RHEL 9 and newer. The job asserts the
 whole `ldd` set against an allowlist and starts the binary before packaging it.
 
-**Not built**: purge, the conformance run in CI, analytics writers, Phases 3–6,
-and the rest of the discovery surface (blob fan-in, untagged set, tag history,
-pull counts — all listed under **Beyond the spec**).
+**Not built**: purge, the conformance run in CI, Phases 3–6, and the rest of
+the discovery surface (blob fan-in and the untagged set — both listed under
+**Beyond the spec**).
 
 ## Phases
 
@@ -376,10 +384,11 @@ The UI lives in `summ-server/ui/` and `summ-server/src/ui.rs`, not the
 nothing for a crate to own but four `include_str!`s; give it one when there is
 an asset pipeline to put in it.
 
-**Tag history has since landed** — `/api/v1/tag-history/<name>@<reference>` and
-the UI over it. Still to build here: blob fan-in ("what shares this layer"), the
-untagged / reclaimable set, and pull counts — the schema and the ops-layer
-queries exist for all of them.
+**Tag history and pull counts have since landed** —
+`/api/v1/tag-history/<name>@<reference>` and `/api/v1/pull-counts/<name>` with
+the UI over both. Still to build here: blob fan-in ("what shares this layer")
+and the untagged / reclaimable set — the schema and the ops-layer queries exist
+for both.
 
 ### Phase 3 — performance
 
@@ -506,8 +515,8 @@ its data model is still argued over, so committing to that envelope now means
 owning a guess. The rows are already in its vocabulary (`created` / `deleted`),
 so if it merges the work is a response adapter over the same scan.
 
-**Open: retention.** `A`, `H` and `J` are the only ranges bounded by time rather
-than by current state, and nothing trims them. A window is a `DeletePrefix` over
+**Open: retention**, shared with pull counts. `A`, `H` and `J` are the only
+ranges bounded by time rather than by current state, and nothing trims them. A window is a `DeletePrefix` over
 a bounded suffix of each range — the keys are ordered newest-first, so "older
 than X" is a contiguous tail — and it belongs to the purge sweep (package F),
 which already walks the store. #606 permits trimming history when the repo is
@@ -619,11 +628,19 @@ added outside the policy.
 | G | Scale benchmark — synthetic 10M-repo dataset, engine A/B | `benches/` | — |
 | H | Extension API — *first cut done*; blob fan-in, untagged set, history remain | `summ-server/` | E |
 | I | Built-in web UI — *first cut done*; assets embedded, same port | `summ-server/ui/` | H |
-| J | Analytics — pull-count queue, aggregation worker, retention | `summ-analytics/` | E |
 
 Done: **B** HTTP skeleton, **C** blob store, **D** upload sessions, **E** ops
-layer, **K** wiring, and the first cut of **H** and **I**. The Phase 1 exit
-criterion is met; package A is what stops it from silently regressing.
+layer, **J** pull counts, **K** wiring, and the first cut of **H** and **I**.
+The Phase 1 exit criterion is met; package A is what stops it from silently
+regressing.
+
+**J did not get its own crate, and the table above no longer says it should.**
+The aggregation is a `WriteBatch` builder, which is what `summ-registry`
+already is, and the worker is a tokio task, which belongs beside `backend.rs` —
+the one module allowed to name the lower crates. A crate for that would hold one
+task and force `summ-server`'s layering rule to grow a fourth name. The
+accumulator does sit in its own module (`summ-server/src/counters.rs`) above the
+seam, because what is counted is an HTTP fact.
 
 ## Engine choice — RocksDB (decided)
 
@@ -769,24 +786,104 @@ non-deterministic content in a batch — are in CLAUDE.md.
 Blobs need no WAL: content-addressed and immutable, so replication is plain
 copy, or shared object storage.
 
-## Analytics — pull counts
+## Pull counts
 
-**Tag history has landed and left this section** — see **Tag history** below.
-What remains here is pull counts (package J), still **not designed**. The `A`
-range has key builders, value types and a prefix group, so the schema will not
-move when the feature is scheduled; nothing writes to it.
+Served at `GET /api/v1/pull-counts/<name>` and
+`.../<name>@<reference>`, with two contribution grids on the repository, tag and
+manifest pages: thirty days, and the last twenty-four hours. On by default;
+`--no-pull-counts` (`SUMM_NO_PULL_COUNTS`) turns off the recording, not the
+endpoint. The feasibility working is in **`design/analytics.md`**; what follows
+is what was actually built and what a change must not undo.
 
-The feasibility argument — why a counter works with no `merge` and no
-read-modify-write, the key shapes, and what it costs the engine — is in
-**`design/analytics.md`**. Read it before starting package J. Three conclusions
-that constrain other work:
+**Nothing in `MetaEngine` changed.** No merge operator, no reverse scan, no new
+`MetaOp`. That was the test the design had to pass and it passed it.
 
-- **Pull counts are best-effort** (bounded in-process queue, dropped on
-  overflow, absolute values flushed periodically). The API must say so.
-- **Tag history is not**, and skips that pipeline entirely — its events are
-  written in the same `WriteBatch` as the tag mutation. That part is built.
-- **Nothing changes in `MetaEngine`.** No merge operator, no reverse scan, no new
-  `MetaOp`. That is the test the design had to pass.
+- **The pull path never touches the store.** A served `GET` locks a
+  `HashMap<(subject, day, hour), counts>` in `summ-server/src/counters.rs`, adds,
+  and returns. A background task drains it every five seconds and folds it into
+  the `A` range in one `WriteBatch` of plain `Put`s. **The map holds deltas since
+  the last flush, not running totals** — the design note proposed totals seeded
+  from the store and held forever, which is unbounded in the ten-million-repo
+  direction and needs an eviction policy to fix. Deltas bound the map by the
+  traffic in one interval instead, there is nothing to seed, and a restart costs
+  one interval rather than leaving stale totals behind.
+- **There is no queue and no channel**, which the design note also proposed. A
+  channel costs an allocation and a task wakeup per pull and drops events under
+  exactly the burst you most want counted; a map turns a burst on one manifest
+  into repeated increments of one entry. What is bounded instead is the number
+  of *distinct* buckets (`MAX_BUCKETS`, 50 000), so saturating costs the long
+  tail of a spike and never the volume of a hot subject.
+- **This is the one read-modify-write in summ, and it is where the rule is paid
+  for rather than a hole in it.** The fold happens in the flush, *before* the
+  batch is built, so what reaches the log is an absolute value with no
+  engine-minted content — replayable, exactly as the rule requires. What the
+  rule forbids is a read-modify-write on the request path, and there is none.
+- **Best-effort, and every response says so.** A crash loses up to one interval;
+  a saturated accumulator drops new subjects. `approximate: true` is a constant
+  field on the endpoint precisely so nothing has to remember to mention it.
+  There is deliberately no drain on shutdown — what would be lost is under one
+  interval of a signal already declared approximate, and the alternative is a
+  shutdown path that can block on the metadata store.
+- **A flush resolves the repository name and skips what it cannot find.** It
+  calls `lookup_repo`, never `intern_repo`: a pull can only have been served for
+  a repository that existed, so a miss means it was deleted in between, and
+  minting an id would resurrect a name in the catalog on the strength of a
+  counter. Counters left behind by a later delete are harmless — `A` is a clean
+  prefix under the repo and purge drops it with a `DeletePrefix`.
+
+**What counts, decided once so the numbers mean something.**
+
+- `GET /v2/<name>/manifests/<ref>` is the pull event, counted against the
+  manifest, the tag (when the client asked by tag) and the repository. **`HEAD`
+  is not**: containerd issues `HEAD` then `GET` on every cold pull, so counting
+  both doubles every number. A `304` is not either.
+- A multi-platform pull is two `GET`s, the index and the chosen child, and each
+  is counted against itself — so the index's grid is "how often was this image
+  pulled" and the children's are the platform split. That falls out of the rule
+  rather than needing a case.
+- Blob `GET`s add `blob_pulls` and `bytes_out` **on the repository scope only**.
+  Attributing a shared layer's bytes to one manifest would be a lie, and doing
+  it honestly needs `R`, which is a scan.
+- **`bytes_out` is metered, not promised.** The response body is wrapped and
+  reports on drop, so what is counted is what reached the socket. containerd
+  2.1+ asks for `bytes=N-`, reads 8 MiB and tears the connection down; counting
+  the requested window would over-report a 900 MB layer about a hundred times.
+
+**The value is per hour, and there is no stored day total.** `CounterBucket`
+holds three fixed 24-element arrays; the day figure is their sum. That is 24
+additions and it cannot disagree with the parts, where a cached total beside
+them would be a second source of truth for one number. The hours are what make
+the numbers honest outside UTC: **a day bucket is fixed at write time and must
+never be re-bucketed**, or the same wall changes shape depending on who is
+looking at it, but an hour names an *instant* and can be re-summed into any
+zone. The UI does exactly that — the daily grid is labelled UTC and stays UTC,
+the 24-hour strip is relabelled to the viewer's clock. The weekday is
+`(day + 4) % 7`, arithmetic on the key, because 1970-01-01 was a Thursday;
+nothing is stored for it.
+
+Adding the arrays was free because nothing had ever written an `A` key. After
+the first one it would have been a `DBVersion` migration on records postcard
+cannot decode — the same trap `skip_serializing_if` sprang.
+
+**The endpoint is a window, not a cursor.** `?days=` (default 30, clamped to
+400) sets the length and it always ends today, so the whole visualisation is one
+ordered scan of at most a few hundred keys. Every day in the window comes back
+whether or not it saw traffic, because the client is a grid and a gap in a grid
+is a missing cell rather than a zero one. Nothing 404s, for the reason tag
+history does not: counts outlive what they describe.
+
+**Not built, and not a package: no per-pull event log.** It is the only
+structure here that would grow with traffic rather than with content, and it
+buys only retroactive re-bucketing — which the hourly arrays now mostly give
+anyway, for a number already declared approximate.
+
+**Open: retention**, along with `H` and `J`. See **Tag history**.
+
+**Open: the aggregation worker is one process-local task**, so the reserved
+`<shard>` key component is `0` and the read path sums across shards. Two nodes
+each flushing absolute values into one bucket is last-write-wins and therefore
+silent undercounting; the component is there so that adding a second writer is
+a configuration change rather than a migration.
 
 ## Risks
 
@@ -837,10 +934,12 @@ that constrain other work:
    any further tuning.
 3. **Filesystem fan-out.** distribution's 2 hex chars gives 256 directories; at
    10⁸ blobs that is ~400K entries each. Use three levels. See Blob storage.
-4. **The analytics ranges are the first that grow with time rather than with
+4. **`A`, `H` and `J` are the only ranges that grow with time rather than with
    content**, and absolute-value counters are last-write-wins under two writers.
-   Neither bites on a single node, and both have cheap insurance available today
-   — a retention window and a reserved shard component. See **Analytics**.
+   Neither bites on a single node. The shard component is reserved and written
+   as `0`, with the read path summing across shards, so a second writer is a
+   configuration change; the retention window is still unwritten and belongs to
+   the purge sweep. See **Pull counts** and **Tag history**.
 5. **Offline purge is a scaling cliff.** Acceptable for v1 by decision. The
    upgrade path is upload-session pinning via `U` keys plus an mtime grace
    period — additive, not a redesign.
@@ -1078,7 +1177,7 @@ query exists for every row here either way.
 | Which tags point at this manifest | `G <repo> <digest>` | **built** |
 | Which manifests reference this layer | `R <digest>` | ops layer only |
 | Untagged / reclaimable manifests | `M` minus `G` | ops layer only |
-| Pull counts by day, for a wall | `A m <repo> <digest>` | no writer yet |
+| Pull counts by day and hour, for a wall | `A m <repo> <digest>` | **built** |
 | Tag history, newest first | `H <repo> <tag>` | **built** |
 | What was this manifest ever tagged | `J <repo> <digest>` | **built** |
 

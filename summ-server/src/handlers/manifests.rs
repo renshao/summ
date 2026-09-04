@@ -90,6 +90,22 @@ async fn get(ctx: &Ctx, name: &str, reference: &Reference) -> Handled {
         ));
     }
 
+    // Counted here and not in `head` below: containerd issues `HEAD` then `GET`
+    // on every cold pull, so counting both doubles every number. Counted after
+    // the `304` too - a conditional request that finds nothing changed did not
+    // pull the manifest. A multi-platform pull is two `GET`s, the index and the
+    // chosen child, and each is counted against itself, which is what makes the
+    // index's wall "how often was this image pulled" and the children's the
+    // platform split.
+    ctx.counters().record_manifest_pull(
+        name,
+        match reference {
+            Reference::Tag(tag) => Some(tag.as_str()),
+            Reference::Digest(_) => None,
+        },
+        &stat.digest,
+    );
+
     Ok(build(
         axum::http::Response::builder()
             .status(StatusCode::OK)

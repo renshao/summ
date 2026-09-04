@@ -17,6 +17,8 @@ pub mod referrers;
 pub mod tags;
 pub mod uploads;
 
+use std::sync::Arc;
+
 use axum::body::{Body, Bytes};
 use axum::extract::Request;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
@@ -25,6 +27,7 @@ use summ_core::Digest;
 
 use crate::app::{AppState, Endpoint};
 use crate::config::ServerConfig;
+use crate::counters::PullCounters;
 use crate::error::{ApiError, ErrorCode};
 use crate::query;
 use crate::seam::{OpsError, Registry};
@@ -69,6 +72,12 @@ impl Ctx {
 
     pub fn registry(&self) -> &dyn Registry {
         self.state.registry.as_ref()
+    }
+
+    /// Where a served pull is counted. Disabled unless `summ serve` started a
+    /// flush task behind it, in which case every recording call is a branch.
+    pub fn counters(&self) -> &Arc<PullCounters> {
+        &self.state.counters
     }
 
     pub fn header(&self, name: HeaderName) -> Option<&str> {
