@@ -9,3 +9,19 @@ Summ is currently a research and engineering project. I want to create an OCI/do
 - Created for AI Agent to operate - most of the time we let AI agents to push, pull, purge, and reason about images and artifacts stats, so Summ will be shipped with MCP and SKILLS for agents.
 - Extremely efficient - using bespoke data structure to store registry specific data entities instead of using a general purpose. database, when information can be encoded in less bytes, the system becomes much much faster.
 - Designed to take advantage of mordern computer hardware - Watch [Cliff Click's talk](https://www.youtube.com/watch?v=OFgxAFdxYAQ).
+
+## Download
+
+Prebuilt Linux x86_64 binaries are published on the
+[releases page](https://github.com/renshao/summ/releases). RocksDB, its C++
+runtime and libgcc are linked in statically, so the only shared library left is
+glibc — the build floor is 2.35 (Ubuntu 22.04, Debian 12, RHEL 9 and newer).
+
+```sh
+curl -fsSL https://github.com/renshao/summ/releases/latest/download/summ-x86_64-unknown-linux-gnu.tar.gz \
+  | tar -xz summ
+./summ serve
+```
+
+`dev` is a rolling prerelease built from `main` on demand — swap `latest/download`
+for `download/dev` to fetch it.

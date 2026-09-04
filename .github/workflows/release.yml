@@ -1,0 +1,108 @@
+name: Release
+
+# A tag makes a release; a manual run refreshes the rolling `dev` prerelease at
+# whatever ref was dispatched. The second trigger is the one summ-bench uses:
+# it measures the working tree, so it needs a binary for a commit that is not a
+# release, and compiling RocksDB on the benchmark VM costs more than the
+# benchmark does.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # librocksdb-sys already links RocksDB's C++ in statically, which leaves
+  # libstdc++ and libgcc as the only shared libraries that are not part of the
+  # OS's own floor — and libstdc++ is the one that actually breaks, because a
+  # binary built against a newer GLIBCXX cannot run on an older machine. Taking
+  # both in leaves glibc as the single compatibility axis.
+  #
+  # Deliberately *not* a fully static musl build: musl's allocator is markedly
+  # slower under the multi-threaded allocation churn RocksDB generates, and
+  # this binary exists to be benchmarked. A musl summ would measure musl.
+  RUSTFLAGS: -C link-arg=-static-libstdc++ -C link-arg=-static-libgcc -C strip=symbols
+
+jobs:
+  linux-amd64:
+    name: x86_64-unknown-linux-gnu
+    # 22.04 rather than latest: the binary links against the builder's glibc,
+    # and glibc is forward- but not backward-compatible. This sets the floor at
+    # 2.35 — Ubuntu 22.04, Debian 12, RHEL 9 — and the benchmark VMs run 24.04,
+    # comfortably inside it.
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same list as CI: librocksdb-sys compiles RocksDB from source and runs
+      # bindgen over its headers, so it needs a clang for libclang.
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang lld
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked --bin summ
+
+      # The two failure modes this build exists to avoid, asserted rather than
+      # assumed. A libstdc++ that creeps back in is a binary that dies with
+      # `GLIBCXX_… not found` on the first machine older than the runner.
+      - name: Check the binary's dynamic dependencies
+        run: |
+          ldd target/release/summ
+          if ldd target/release/summ | grep -q 'libstdc++'; then
+            echo "::error::libstdc++ is dynamically linked; -static-libstdc++ did not apply"
+            exit 1
+          fi
+          echo "glibc floor: $(objdump -T target/release/summ \
+            | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
+
+      # A binary that links is not a binary that runs. Start it, ask it the
+      # spec's own liveness question, stop it.
+      - name: Smoke test
+        run: |
+          ./target/release/summ --version
+          ./target/release/summ serve --listen 127.0.0.1:15000 \
+            --data-dir "$RUNNER_TEMP/smoke" &
+          pid=$!
+          trap 'kill $pid' EXIT
+          for _ in $(seq 30); do
+            curl -fsS http://127.0.0.1:15000/v2/ && break || sleep 1
+          done
+          curl -fsS http://127.0.0.1:15000/v2/
+
+      # A stable asset name, so a fetch can be a URL in a script rather than a
+      # release lookup: .../releases/latest/download/summ-x86_64-unknown-linux-gnu.tar.gz
+      - name: Package
+        run: |
+          mkdir -p dist stage
+          cp target/release/summ LICENSE NOTICE stage/
+          tar -C stage -czf dist/summ-x86_64-unknown-linux-gnu.tar.gz summ LICENSE NOTICE
+          (cd dist && sha256sum summ-x86_64-unknown-linux-gnu.tar.gz \
+            > summ-x86_64-unknown-linux-gnu.tar.gz.sha256)
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "$GITHUB_REF_NAME" --generate-notes
+          else
+            # One rolling prerelease, re-pointed at the dispatched commit. The
+            # tag is deleted with it, or `create` would attach to the old one.
+            gh release delete dev --yes --cleanup-tag || true
+            gh release create dev dist/* \
+              --prerelease --target "$GITHUB_SHA" \
+              --title "dev (${GITHUB_SHA:0:7})" \
+              --notes "Rolling build of \`$GITHUB_SHA\`. Not a release."
+          fi
