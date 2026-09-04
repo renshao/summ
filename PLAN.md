@@ -281,7 +281,7 @@ Three things not to rediscover:
 - **Read the result vocabulary, not the FAIL count.** `errRegUnsupported`
   downgrades FAIL to Skip, so a low FAIL count can hide an unimplemented API.
 
-Perf baseline with `../container-registry/bench` still to do.
+Perf baseline with `../summ-bench/bench` still to do.
 
 ### Phase 1 — skeleton — **done**
 
@@ -961,7 +961,7 @@ do not size the store.
 | `../distribution` | Reference impl. `registry/storage/paths.go` for the on-disk layout |
 | `../zot` | Closest prior art: `pkg/meta/boltdb` (embedded metadata store), `pkg/storage/{types,s3,local}` |
 | `../harbor` | Product-level features, not architecture |
-| `../container-registry` | **Your** bench harness. `notes/fs_limit.md` has the capacity analysis |
+| `../summ-bench` | **Your** bench harness. `notes/fs_limit.md` has the capacity analysis |
 | `../summdb` | The prototype this schema descends from |
 
 From `notes/fs_limit.md`: on a Standard_L8s_v3 the ceiling is network
