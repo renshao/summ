@@ -239,6 +239,24 @@ below: `--auth apikey` puts a read key and a write key in front of `/v2/`, the
 discovery API and the UI at once. Off by default, so the conformance runs above
 and every measurement in this document are unaffected.
 
+**There is a downloadable Linux x86_64 binary** (`.github/workflows/release.yml`).
+A tag publishes a release; a manual dispatch re-points a rolling `dev`
+prerelease at that commit, which is the trigger summ-bench wants — it measures
+the working tree, so the commit it needs a binary for is never a release, and
+compiling RocksDB on the benchmark VM costs more than the benchmark does.
+
+**It is glibc, not musl, and that is a measurement decision.** musl's allocator
+is markedly slower under the multi-threaded allocation churn RocksDB generates,
+so a static musl summ would be a benchmark of musl. The build instead links
+libstdc++ in — which `-static-libstdc++` cannot do, because librocksdb-sys emits
+an explicit `cargo:rustc-link-lib=dylib=stdc++` that the flag has no opinion
+about, so the fix is an `-L` directory holding `libstdc++.a` and no `.so`. What
+is left is `libc`, `libm` and `libgcc_s`, which are the OS's ABI rather than
+summ's dependencies; std links `gcc_s` itself unless the target is crt-static,
+and removing it would mean overriding the unwinder std chose. Measured floor:
+**GLIBC_2.34** — Ubuntu 22.04, Debian 12, RHEL 9 and newer. The job asserts the
+whole `ldd` set against an allowlist and starts the binary before packaging it.
+
 **Not built**: purge, the conformance run in CI, analytics writers, Phases 3–6,
 and the rest of the discovery surface (blob fan-in, untagged set, tag history,
 pull counts — all listed under **Beyond the spec**).
