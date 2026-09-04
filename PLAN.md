@@ -41,7 +41,7 @@ Conformance is the floor, not the ceiling.
 | Question | Decision | Consequence |
 |---|---|---|
 | Scale target | 10M repos; up to 10M manifests in a single repo | No API may materialise an unbounded set. Every list is cursor-paged. |
-| Auth | None / static token for v1 | Auth is middleware, deferred to Phase 6. Not on the critical path. |
+| Auth | **Two static API keys, off by default** | One middleware over every surface. Anonymous read-write stays the default, so nothing on the critical path changed. |
 | Topology | Single node, but keep HA viable | All mutations flow through a serialisable `WriteBatch`. No engine types leak past the trait. |
 | Workload | Full read-write, pull-optimised | Push must be correct and complete; perf work targets pull. |
 | Metadata engine | **RocksDB**, compiled from source and statically linked | Single binary, no RocksDB install. redb retained as a second implementation to keep the trait honest. |
@@ -119,7 +119,7 @@ Two traps worth stating explicitly:
 
 ## Status
 
-`cargo test` — **329 passing**. Every crate in CLAUDE.md's Layout is built, and
+`cargo test` — **363 passing**. Every crate in CLAUDE.md's Layout is built, and
 **the wiring has landed** (package K, `summ-server/src/backend.rs`): `summ
 serve` runs on `summ-registry` over `summ-meta` with `summ-storage` holding the
 bytes. `tests/wiring.rs` drives the same router as `tests/api.rs` against a real
@@ -207,6 +207,11 @@ both fixed:
   hold. One data row failing cascaded into six: *Non-distributable Layers* plus
   the *Manifest put/get/head by digest and by tag* rows and *Tag listing*, all of
   which use that data. See **Foreign layers**.
+
+**API-key authentication has landed** and is described under **Authentication**
+below: `--auth apikey` puts a read key and a write key in front of `/v2/`, the
+discovery API and the UI at once. Off by default, so the conformance runs above
+and every measurement in this document are unaffected.
 
 **Not built**: purge, the conformance run in CI, analytics writers, Phases 3–6,
 and the rest of the discovery surface (blob fan-in, untagged set, tag history,
@@ -327,9 +332,11 @@ actually does**.
 **4** offline purge exploiting `R` and `G` — and retaining every blob whose
 digest is a manifest digest, or it destroys Risk 0's mitigation on its first
 run. **5** storage driver abstraction +
-S3, chunked upload → multipart. **6** auth and full conformance — **referrers
-landed early**, because the `F` edges had been written since Phase 1 and what
-was left was a page and a switch.
+S3, chunked upload → multipart. **6** full conformance — of which **referrers**
+and now **auth** both landed early: the `F` edges had been written since Phase 1,
+so referrers was a page and a switch, and API keys turned out to be one
+middleware rather than an architecture. What is left of Phase 6 is anything
+beyond a shared secret — per-repository scopes, a token endpoint, users.
 
 ## The referrers API
 
@@ -374,6 +381,61 @@ Legacy cosign tags are the backward-compatibility case that *does* matter in the
 wild, and they are handled: `sha256-<hex>.sig|.sbom|.att` synthesises its `F`
 edge at tag time and retracts it when the tag moves (`summ-registry/src/cosign.rs`).
 That is a purge fix as much as a discovery one — see the module docs.
+
+## Authentication
+
+Two static API keys — a read key and a write key — off by default and turned on
+with `--auth apikey` (`SUMM_AUTH=apikey`). A supplied key comes from
+`--read-apikey` / `--write-apikey` or `SUMM_READ_APIKEY` / `SUMM_WRITE_APIKEY`;
+an absent one is generated and printed once in the startup banner. Five
+decisions here, and each of them is a thing a change could quietly undo:
+
+- **The challenge is `Basic`, not `Bearer`.** `Bearer` is what the hosted
+  registries advertise, and it means something specific to a client: the
+  challenge's `realm` is a *token server*, and docker and containerd will `GET`
+  it, exchange credentials for a scoped token, and only then retry. Advertising
+  `Bearer` without standing one up produces a client that fails in the token
+  exchange rather than one that authenticates. `Basic` is the challenge those
+  same clients answer with the credential they already hold, which is exactly
+  the model when the key *is* the credential — so `docker login`, `oras login`
+  and a browser opening the UI all work with no token endpoint existing.
+  `Bearer <key>` is *accepted* anyway, for `curl`, and never advertised.
+- **Everything is behind it — `/v2/`, `/api/v1/` and the UI — through one
+  middleware, and there is no exemption list.** An exemption is a hole that has
+  to be re-argued on every new route, and both candidates fail on inspection.
+  `GET /v2/` is the endpoint whose `401` is how a client *discovers* it needs
+  credentials, so exempting it breaks the flow it exists for; and serving the UI
+  shell anonymously only moves the prompt to the first `fetch`, where a native
+  browser dialog on an XHR is strictly worse.
+- **The write key reads as well.** A CI job that pushes also pulls, and making
+  it hold two secrets to do so is how one of them ends up unrotated. Write is
+  also tried *first*, so setting both keys to the same value is one key that can
+  do everything rather than one that has silently lost its write access.
+- **The read key on a write is `403 DENIED`, and carries no challenge.** The
+  credential is genuine, so re-challenging tells the client to retry with the
+  same key it just used. `401` with the challenge is for a missing, unparsable
+  or unrecognised credential — the three cases where trying again could work.
+- **A supplied key is never printed; a generated one is printed exactly once.**
+  The banner says which keys it had to invent, and stays silent about the rest —
+  whoever passed a key already has it, and echoing it only copies a live
+  credential into a scrollback, a log file and a CI transcript. `ApiKey`'s
+  `Debug` redacts, so a `{:?}` on `ServerConfig` cannot leak one either, and
+  comparison is constant-time so the timing cannot.
+
+Two smaller things that are load-bearing anyway. A key supplied *without*
+`--auth apikey` is a **startup error**, not a warning: the alternatives are to
+ignore it, which serves an open registry to someone who believes it is closed,
+or to infer the mode from the key's presence, which makes deleting an
+environment variable silently disable authentication. And the check runs as a
+layer *before* any body is read, so a denied blob `PUT` is rejected without
+draining the gigabytes behind it.
+
+Deliberately not built: per-repository scopes, more than one identity, a token
+endpoint, and key rotation without a restart. The keys are a shared secret in
+front of a whole registry, which is the right size for the thing this is — a
+binary someone runs to have a registry a minute later — and the wrong size for a
+multi-tenant one. `summ-server/tests/auth.rs` is what stops a new route being
+added outside the policy.
 
 ## Digest algorithms
 

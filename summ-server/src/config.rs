@@ -3,8 +3,9 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
+use crate::auth::{AuthPolicy, Generated};
 use crate::backend::Engine;
 
 /// Limits and switches the handlers consult. Separate from [`Cli`] so tests can
@@ -57,6 +58,12 @@ pub struct ServerConfig {
     /// the client both that the fallback is unnecessary and that it is
     /// required.
     pub referrers_enabled: bool,
+    /// Who may read and who may write.
+    ///
+    /// [`AuthPolicy::Anonymous`] by default, which is what makes `summ serve`
+    /// with no arguments a working registry in one command. Everything the
+    /// server exposes is behind this once it is not - see [`crate::auth`].
+    pub auth: AuthPolicy,
 }
 
 impl Default for ServerConfig {
@@ -69,8 +76,19 @@ impl Default for ServerConfig {
             max_tag_params: 32,
             chunk_min_length: None,
             referrers_enabled: true,
+            auth: AuthPolicy::Anonymous,
         }
     }
+}
+
+/// How the registry authenticates a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AuthMode {
+    /// Anyone may read and write. The default.
+    Anonymous,
+    /// A read key and a write key, sent as an HTTP Basic password.
+    #[value(name = "apikey", alias = "api-key")]
+    ApiKey,
 }
 
 #[derive(Debug, Parser)]
@@ -153,6 +171,30 @@ pub struct ServeArgs {
     /// its subject was processed by a registry that will not list it.
     #[arg(long, env = "SUMM_NO_REFERRERS")]
     pub no_referrers: bool,
+
+    /// Authentication mode.
+    ///
+    /// `anonymous`, the default, is an open read-write registry - which is the
+    /// right default for the thing this is: a single binary someone runs to
+    /// have a registry a minute later, usually on a laptop or inside a network
+    /// that is already the boundary. `apikey` turns on the two-key scheme in
+    /// [`crate::auth`] and applies it to everything the server serves.
+    #[arg(long, value_enum, default_value = "anonymous", env = "SUMM_AUTH")]
+    pub auth: AuthMode,
+
+    /// API key admitting `GET` and `HEAD` - pull, list, browse.
+    ///
+    /// Only meaningful with `--auth apikey`, where an absent key is generated
+    /// and printed once at startup. A key given here is never printed back.
+    #[arg(long, env = "SUMM_READ_APIKEY")]
+    pub read_apikey: Option<String>,
+
+    /// API key admitting everything, reads included - push, delete.
+    ///
+    /// One key that can do everything is what a CI job wants, and making the
+    /// write key also read is what stops that job needing both.
+    #[arg(long, env = "SUMM_WRITE_APIKEY")]
+    pub write_apikey: Option<String>,
 }
 
 impl ServeArgs {
@@ -169,13 +211,114 @@ impl ServeArgs {
         }
     }
 
-    pub fn server_config(&self) -> ServerConfig {
-        ServerConfig {
+    /// The HTTP layer's configuration, plus which API keys had to be invented.
+    ///
+    /// Fallible because the auth arguments can contradict each other, and the
+    /// contradiction has to be fatal. A key supplied without `--auth apikey` is
+    /// somebody who believes they have locked the registry; the alternatives to
+    /// failing are to ignore the key, which serves an open registry to someone
+    /// who thinks otherwise, or to infer the mode from the key's presence,
+    /// which makes deleting an environment variable silently disable
+    /// authentication. Neither is a failure an operator can see, so this one is
+    /// made loud and made at startup, before the listener binds.
+    pub fn server_config(&self) -> Result<(ServerConfig, Option<Generated>), String> {
+        let (auth, generated) = match self.auth {
+            AuthMode::Anonymous => {
+                if self.read_apikey.is_some() || self.write_apikey.is_some() {
+                    return Err("an API key was supplied but --auth is `anonymous`; pass \
+                         `--auth apikey` (SUMM_AUTH=apikey) to require it"
+                        .to_owned());
+                }
+                (AuthPolicy::Anonymous, None)
+            }
+            AuthMode::ApiKey => {
+                let (policy, generated) =
+                    AuthPolicy::new(self.read_apikey.clone(), self.write_apikey.clone())?;
+                (policy, Some(generated))
+            }
+        };
+        let config = ServerConfig {
             max_manifest_bytes: self.max_manifest_bytes,
             default_page_size: self.default_page_size,
             max_page_size: self.max_page_size,
             referrers_enabled: !self.no_referrers,
+            auth,
             ..ServerConfig::default()
+        };
+        Ok((config, generated))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse a `serve` argument list. The auth arguments are always passed
+    /// explicitly, so a `SUMM_*` variable in the environment running the tests
+    /// cannot change what is under test.
+    fn args(extra: &[&str]) -> Result<ServeArgs, clap::Error> {
+        let mut argv = vec!["serve"];
+        argv.extend_from_slice(extra);
+        ServeArgs::try_parse_from(argv)
+    }
+
+    #[test]
+    fn the_default_is_an_open_registry() {
+        assert!(!ServerConfig::default().auth.is_enabled());
+        let args = args(&["--auth", "anonymous"]).expect("parses");
+        let (config, generated) = args.server_config().expect("valid");
+        assert!(!config.auth.is_enabled());
+        assert!(generated.is_none(), "nothing to generate when auth is off");
+    }
+
+    #[test]
+    fn a_key_without_the_mode_is_a_startup_error() {
+        // The failure this prevents is silent: an operator who set
+        // SUMM_READ_APIKEY and believes the registry is closed.
+        let args = args(&["--auth", "anonymous", "--read-apikey", "k"]).expect("parses");
+        let message = args.server_config().expect_err("must not start");
+        assert!(message.contains("--auth apikey"), "{message}");
+    }
+
+    #[test]
+    fn apikey_mode_generates_what_was_not_supplied() {
+        let args = args(&["--auth", "apikey", "--write-apikey", "mine"]).expect("parses");
+        let (config, generated) = args.server_config().expect("valid");
+        assert!(config.auth.is_enabled());
+        let generated = generated.expect("reported");
+        assert!(generated.read, "the read key had to be invented");
+        assert!(!generated.write);
+
+        let args = args_both();
+        let (_, generated) = args.server_config().expect("valid");
+        let generated = generated.expect("reported");
+        assert!(!generated.read);
+        assert!(!generated.write, "nothing to print when both were supplied");
+    }
+
+    fn args_both() -> ServeArgs {
+        args(&[
+            "--auth",
+            "apikey",
+            "--read-apikey",
+            "r",
+            "--write-apikey",
+            "w",
+        ])
+        .expect("parses")
+    }
+
+    #[test]
+    fn an_empty_key_is_rejected_rather_than_matching_an_empty_credential() {
+        let args = args(&["--auth", "apikey", "--read-apikey", " "]).expect("parses");
+        assert!(args.server_config().is_err());
+    }
+
+    #[test]
+    fn the_mode_is_spelled_both_ways() {
+        for spelling in ["apikey", "api-key"] {
+            let args = args(&["--auth", spelling]).expect("parses");
+            assert_eq!(args.auth, AuthMode::ApiKey);
         }
     }
 }

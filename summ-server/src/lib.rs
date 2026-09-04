@@ -20,8 +20,14 @@
 //!   five times, ignoring `Retry-After`, so it amplifies load rather than
 //!   shedding it. Throttling, if it is ever needed, belongs at the connection
 //!   or accept level.
+//!
+//! The one thing that *is* a layer is [`auth`], and it is a layer because there
+//! is no route it does not apply to - the `/v2/` surface, the discovery API and
+//! the UI are one registry behind one credential. It is attached only when
+//! authentication is switched on, which by default it is not.
 
 pub mod app;
+pub mod auth;
 pub mod backend;
 pub mod config;
 pub mod error;
@@ -35,5 +41,6 @@ pub mod seam;
 pub mod ui;
 
 pub use app::{router, AppState};
+pub use auth::AuthPolicy;
 pub use config::ServerConfig;
 pub use error::{ApiError, ErrorCode};

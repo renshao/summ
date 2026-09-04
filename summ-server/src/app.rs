@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderName, HeaderValue};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
@@ -257,8 +258,17 @@ pub fn api_route(path: &str) -> Result<ApiEndpoint, RouteError> {
 /// body breaks it, and a layer scoped "not near `/blobs/`" is one refactor away
 /// from being wrong. There is no rate limiter either; see
 /// [`crate::error::ErrorCode::TooManyRequests`].
+///
+/// The one thing that *is* a layer rather than a handler is authentication, and
+/// it is a layer precisely because there is no route it does not apply to: the
+/// `/v2/` surface, the discovery API and the UI are one registry and one
+/// credential. Put it in the handlers instead and protecting the next endpoint
+/// becomes something a person has to remember. It sits inside [`TraceLayer`],
+/// so a rejected request is still traced, and outside the routes, so a `401`
+/// costs no routing and no state lookup.
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let auth = state.config.auth.is_enabled();
+    let router = Router::new()
         .route("/v2", any(dispatch))
         .route("/v2/", any(dispatch))
         .route("/v2/{*rest}", any(dispatch))
@@ -275,9 +285,37 @@ pub fn router(state: AppState) -> Router {
         .layer(SetResponseHeaderLayer::if_not_present(
             API_VERSION_HEADER,
             HeaderValue::from_static("registry/2.0"),
-        ))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        ));
+
+    // Attached only when it would do something. An always-present layer that
+    // matches `Anonymous` and calls `next` is a clone of the request extensions
+    // and a future per request bought for nothing, and the default deployment
+    // is the anonymous one.
+    let router = if auth {
+        router.layer(middleware::from_fn_with_state(state.clone(), authenticate))
+    } else {
+        router
+    };
+
+    router.layer(TraceLayer::new_for_http()).with_state(state)
+}
+
+/// Reject a request that has no credential for what it is about to do.
+///
+/// Note what is *not* here: nothing reads the body, and nothing routes. A
+/// rejected push is rejected before its first byte is read, which matters for
+/// the shape this registry is built around - a blob `PUT` is gigabytes, and a
+/// `401` that has to drain one is a denial-of-service surface rather than an
+/// answer. axum drops the body with the request, and hyper resets the stream.
+async fn authenticate(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    match state
+        .config
+        .auth
+        .authorize(request.method(), request.headers())
+    {
+        Ok(()) => next.run(request).await,
+        Err(err) => err.into_api_error().into_response(),
+    }
 }
 
 async fn dispatch(State(state): State<AppState>, request: Request) -> Response {

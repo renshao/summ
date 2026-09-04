@@ -9,6 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use clap::Parser;
+use summ_server::auth::{AuthPolicy, Generated};
 use summ_server::backend::Backend;
 use summ_server::config::{Cli, Command, ServeArgs};
 use summ_server::{router, AppState};
@@ -38,8 +39,25 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     // newer schema version, a directory we cannot write - must be a startup
     // failure with a message, never a server that accepts connections and
     // answers 500 to every one of them.
+    // Built before the store is opened: an auth argument that contradicts
+    // itself is a mistake about who may reach the registry, and it should cost
+    // a second, not a RocksDB open.
+    //
+    // Reported through clap rather than as a returned error, because that is
+    // what it is - a conflict between two arguments - and it is what makes it
+    // read like one. `Err` out of `main` would print the message quoted, via
+    // the `Debug` that `Termination` uses, under a bare `Error:`.
+    let (config, generated) = args.server_config().unwrap_or_else(|message| {
+        clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            format!("{message}\n"),
+        )
+        .exit()
+    });
+
     let backend = Backend::open(&args.data_dir, args.engine, args.registry_options())?;
-    let state = AppState::new(Arc::new(backend), args.server_config());
+    let auth = config.auth.clone();
+    let state = AppState::new(Arc::new(backend), config);
     let app = router(state);
 
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
@@ -63,11 +81,40 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.allow_missing_references {
         println!("  references    unvalidated (--allow-missing-references)");
     }
+    print_auth(&auth, generated);
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown())
         .await?;
     Ok(())
+}
+
+/// The auth line of the banner, and any key that had to be invented.
+///
+/// A *generated* key exists nowhere else, so this is its only chance to reach
+/// the operator and it is printed in full. A *supplied* key is not printed at
+/// all: whoever passed it already has it, and echoing it only copies a live
+/// credential into a scrollback, a log file and a CI transcript. So the banner
+/// says which keys it made up, and stays silent about the rest.
+fn print_auth(auth: &AuthPolicy, generated: Option<Generated>) {
+    let AuthPolicy::ApiKey { read, write } = auth else {
+        println!("  auth          anonymous read-write (--auth apikey to require a key)");
+        return;
+    };
+    let generated = generated.unwrap_or(Generated {
+        read: false,
+        write: false,
+    });
+    println!("  auth          API key, as an HTTP Basic password");
+    if generated.read {
+        println!("  read key      {}   (generated)", read.expose());
+    }
+    if generated.write {
+        println!("  write key     {}   (generated)", write.expose());
+    }
+    if generated.read || generated.write {
+        println!("  !! a generated key is printed once and is not stored anywhere.");
+    }
 }
 
 /// A bound address rewritten into one a browser can actually open.
