@@ -263,11 +263,34 @@ default; `--no-pull-counts` turns it off. See **Pull counts**.
 below. Off by default, so the conformance runs above and every measurement in
 this document are unaffected.
 
-**There is a downloadable Linux x86_64 binary** (`.github/workflows/release.yml`).
-A tag publishes a release; a manual dispatch re-points a rolling `dev`
-prerelease at that commit, which is the trigger summ-bench wants — it measures
-the working tree, so the commit it needs a binary for is never a release, and
-compiling RocksDB on the benchmark VM costs more than the benchmark does.
+**There are downloadable binaries for four targets** (`.github/workflows/release.yml`):
+Linux x86_64 and arm64, macOS on Apple silicon and Intel. A tag publishes a
+release; a manual dispatch re-points a rolling `dev` prerelease at that commit,
+which is the trigger summ-bench wants — it measures the working tree, so the
+commit it needs a binary for is never a release, and compiling RocksDB on the
+benchmark VM costs more than the benchmark does.
+
+**The asset names carry no version, and that is what makes the install line
+stable.** `releases/latest/download/<asset>` is a GitHub redirect that matches
+an asset by *exact* filename on whichever release is marked latest, so a
+version in the name would break every documented `curl` on each release. Two
+things protect it: `gh release create --latest` asserts the pointer rather than
+letting GitHub infer it by date, and the rolling `dev` build stays
+`--prerelease`, which is what keeps it out of `latest` rather than merely
+labelling it.
+
+**Every leg builds natively, and the label is checked rather than trusted.**
+There is no cross toolchain — each target has a runner of its own architecture
+— so `matrix.target` is a claim about the runner that only the runner can
+confirm. The build asserts `rustc -vV`'s host against it before compiling
+anything, because the failure it catches (a runner label changing architecture
+under us, as `macos-13` did when Intel moved to the `-intel` suffix) otherwise
+ships a correctly-named binary of the wrong architecture.
+
+**Publishing is its own job.** Four matrix legs each calling `gh release
+create` would race to create one release; instead each uploads an artifact and
+a single job downloads all four and makes the release once, which also means a
+failed target blocks the release rather than yielding a partial one.
 
 **It is glibc, not musl, and that is a measurement decision.** musl's allocator
 is markedly slower under the multi-threaded allocation churn RocksDB generates,
@@ -280,6 +303,17 @@ summ's dependencies; std links `gcc_s` itself unless the target is crt-static,
 and removing it would mean overriding the unwinder std chose. Measured floor:
 **GLIBC_2.34**; the README turns that into a distro list. The job asserts the
 whole `ldd` set against an allowlist and starts the binary before packaging it.
+
+**macOS has neither problem and a different one.** libc++ is part of the OS and
+lives in the dyld shared cache, so linking it dynamically is what every native
+binary does and there is no static-linking trick to play. The portability risk
+is a *path* rather than a symbol version — a dependency resolved out of
+Homebrew exists on the builder and on nobody else's Mac — so the check there
+rejects any dylib from outside `/usr/lib` and `/System/Library` instead of
+enumerating an allowlist, which lets an unforeseen system framework through by
+design. `MACOSX_DEPLOYMENT_TARGET` is pinned to 11.0 for both macOS targets
+rather than inherited from the runner's SDK, or the floor would move each time
+GitHub rolls the image.
 
 **Repository delete has landed** — `DELETE /api/v1/repositories/<name>`, with
 a confirm-by-typing-the-name control on the repository page. It is the first

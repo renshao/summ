@@ -19,22 +19,67 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Pinned rather than inherited from whatever SDK the runner happens to carry.
+  # RocksDB's C++ is compiled here, so an unset deployment target lets the
+  # builder's own macOS become the floor, and that floor then moves whenever
+  # GitHub rolls the image. 11.0 is what `aarch64-apple-darwin` requires in any
+  # case, so pinning both to it costs the Intel build nothing and gives the two
+  # binaries one documented minimum. Ignored on Linux.
+  MACOSX_DEPLOYMENT_TARGET: '11.0'
 
 jobs:
-  linux-amd64:
-    name: x86_64-unknown-linux-gnu
-    # 22.04 rather than latest: the binary links against the builder's glibc,
-    # and glibc is forward- but not backward-compatible. This sets the floor at
-    # 2.35 — Ubuntu 22.04, Debian 12, RHEL 9 — and the benchmark VMs run 24.04,
-    # comfortably inside it.
-    runs-on: ubuntu-22.04
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      # A broken target is worth seeing alongside the others in one run rather
+      # than cancelling them; `publish` needs all four, so a red leg already
+      # stops the release.
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04 rather than latest, on both architectures: the binary links
+          # against the builder's glibc, and glibc is forward- but not
+          # backward-compatible. This sets the floor at 2.35 — Ubuntu 22.04,
+          # Debian 12, RHEL 9 — and the benchmark VMs run 24.04, comfortably
+          # inside it.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          # macOS 13 was the last image where the bare `macos-<n>` label meant
+          # Intel; it is retired, and Intel is now the explicit `-intel`
+          # suffix. The host check below is what stops that going unnoticed if
+          # the label's meaning moves again.
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
 
     steps:
       - uses: actions/checkout@v4
 
+      # Every leg builds natively — no `--target`, no cross toolchain — so
+      # `matrix.target` is a *label* on the runner rather than something cargo
+      # enforces. Assert the two agree, before the twenty minutes of RocksDB
+      # rather than after: the failure it catches is a runner label quietly
+      # changing architecture, which would otherwise ship an arm64 binary named
+      # x86_64 and only be discovered by whoever downloaded it.
+      - name: Check the runner is the architecture it is labelled with
+        run: |
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          if [ "$host" != "${{ matrix.target }}" ]; then
+            echo "::error::runner ${{ matrix.runner }} is $host, not ${{ matrix.target }}"
+            exit 1
+          fi
+          echo "$host"
+
       # Same list as CI: librocksdb-sys compiles RocksDB from source and runs
-      # bindgen over its headers, so it needs a clang for libclang.
+      # bindgen over its headers, so it needs a clang for libclang. macOS gets
+      # both from the Xcode command line tools, which the image already has.
       - name: Install build dependencies
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y clang lld
 
       # librocksdb-sys already links RocksDB's own C++ in statically, but the
@@ -63,6 +108,7 @@ jobs:
       # generates, and this binary exists to be benchmarked. A musl summ would
       # measure musl.
       - name: Point the linker at a static libstdc++
+        if: runner.os == 'Linux'
         run: |
           archive=$(g++ -print-file-name=libstdc++.a)
           if [ ! -f "$archive" ]; then
@@ -72,6 +118,13 @@ jobs:
           mkdir -p "$RUNNER_TEMP/staticlibs"
           ln -sf "$archive" "$RUNNER_TEMP/staticlibs/libstdc++.a"
           echo "RUSTFLAGS=-L native=$RUNNER_TEMP/staticlibs -C strip=symbols" >> "$GITHUB_ENV"
+
+      # macOS needs none of the above: libc++ is part of the OS and lives in
+      # the dyld shared cache, so linking it dynamically is what every native
+      # binary does. Only the symbol strip carries over.
+      - name: Set link flags
+        if: runner.os == 'macOS'
+        run: echo "RUSTFLAGS=-C strip=symbols" >> "$GITHUB_ENV"
 
       # After RUSTFLAGS is set: the cache key covers it, so a change to the
       # link flags must invalidate the cache rather than reuse artefacts built
@@ -85,13 +138,15 @@ jobs:
       # assumed. A libstdc++ that creeps back in is a binary that dies with
       # `GLIBCXX_… not found` on the first machine older than the runner.
       - name: Check the binary's dynamic dependencies
+        if: runner.os == 'Linux'
         run: |
           ldd target/release/summ
           # An allowlist rather than a denylist: this fails on libstdc++
           # creeping back, and equally on a new dependency arriving with a
           # crate — an OpenSSL, say — which is the failure nobody would think
-          # to write a check for.
-          expected='^(linux-vdso\.so\.1|libgcc_s\.so\.1|libm\.so\.6|libc\.so\.6|ld-linux-x86-64\.so\.2)$'
+          # to write a check for. Both loaders are listed because one file
+          # serves both architectures.
+          expected='^(linux-vdso\.so\.1|libgcc_s\.so\.1|libm\.so\.6|libc\.so\.6|ld-linux-x86-64\.so\.2|ld-linux-aarch64\.so\.1)$'
           unexpected=$(ldd target/release/summ \
             | sed -E 's/^[[:space:]]*//; s/ .*//; s#.*/##' \
             | grep -vE "$expected" || true)
@@ -101,6 +156,27 @@ jobs:
           fi
           echo "glibc floor: $(objdump -T target/release/summ \
             | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
+
+      # The same check, against the failure macOS actually has. There is no
+      # glibc-style symbol versioning to police here — the risk is a *path*: a
+      # dependency picked up from Homebrew under /opt/homebrew or /usr/local
+      # exists on the runner and on nobody else's Mac. Everything under
+      # /usr/lib and /System/Library is in the dyld shared cache on every
+      # machine, so the rule is about where a library comes from rather than
+      # which one it is, and an unexpected framework is allowed through by
+      # design.
+      - name: Check the binary's dynamic dependencies
+        if: runner.os == 'macOS'
+        run: |
+          otool -L target/release/summ
+          unexpected=$(otool -L target/release/summ | tail -n +2 \
+            | sed -E 's/^[[:space:]]*//; s/ \(compatibility.*//' \
+            | grep -vE '^(/usr/lib/|/System/Library/)' || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::binary links libraries from outside the OS: $unexpected"
+            exit 1
+          fi
+          vtool -show-build target/release/summ | grep -E 'platform|minos' || true
 
       # A binary that links is not a binary that runs. Start it, ask it the
       # spec's own liveness question, stop it.
@@ -116,27 +192,69 @@ jobs:
           done
           curl -fsS http://127.0.0.1:15000/v2/
 
-      # A stable asset name, so a fetch can be a URL in a script rather than a
-      # release lookup: .../releases/latest/download/summ-x86_64-unknown-linux-gnu.tar.gz
+      # A stable asset name — no version in it — so a fetch can be a URL in a
+      # script rather than a release lookup:
+      # .../releases/latest/download/summ-<target>.tar.gz. Putting the version
+      # in the filename is what breaks that link on every release.
       - name: Package
+        env:
+          # bsdtar on macOS otherwise writes each file's extended attributes as
+          # a second AppleDouble `._summ` member, which a Linux extraction of a
+          # macOS asset would drop in the current directory.
+          COPYFILE_DISABLE: '1'
         run: |
           mkdir -p dist stage
           cp target/release/summ LICENSE NOTICE stage/
-          tar -C stage -czf dist/summ-x86_64-unknown-linux-gnu.tar.gz summ LICENSE NOTICE
-          (cd dist && sha256sum summ-x86_64-unknown-linux-gnu.tar.gz \
-            > summ-x86_64-unknown-linux-gnu.tar.gz.sha256)
+          tar -C stage -czf "dist/summ-${{ matrix.target }}.tar.gz" summ LICENSE NOTICE
+          # shasum rather than sha256sum: same output format, and it is the one
+          # of the two that exists on both runners.
+          (cd dist && shasum -a 256 "summ-${{ matrix.target }}.tar.gz" \
+            > "summ-${{ matrix.target }}.tar.gz.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: summ-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # One release, made once, after every target has built. Publishing from
+  # inside the matrix would have four jobs racing to create the same release.
+  publish:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: summ-*
+          merge-multiple: true
+
+      - name: List the assets
+        run: ls -l dist
 
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          # This job does not check the repository out, so gh has no git
+          # remote to infer from.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           if [ "$GITHUB_REF_TYPE" = tag ]; then
+            # --latest is asserted rather than left to GitHub, which otherwise
+            # picks by date: re-publishing an older tag to fix an asset would
+            # silently re-point every /releases/latest/download URL in the
+            # README at it.
             gh release create "$GITHUB_REF_NAME" dist/* \
-              --title "$GITHUB_REF_NAME" --generate-notes
+              --title "$GITHUB_REF_NAME" --generate-notes --latest
           else
             # One rolling prerelease, re-pointed at the dispatched commit. The
             # tag is deleted with it, or `create` would attach to the old one.
+            # --prerelease is load-bearing beyond labelling: it is what keeps
+            # this build out of /releases/latest.
             gh release delete dev --yes --cleanup-tag || true
             gh release create dev dist/* \
               --prerelease --target "$GITHUB_SHA" \

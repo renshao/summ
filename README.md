@@ -57,11 +57,17 @@ passing at the suite's `dev` profile, with nothing skipped.
 
 ## Download
 
-Prebuilt Linux x86_64 binaries are published on the
-[releases page](https://github.com/summcr/summ/releases). RocksDB and its C++
-runtime are linked in statically, so the only shared libraries left are the
-ones every glibc system already has — `libc`, `libm` and `libgcc_s`. The build
-floor is glibc 2.34: Ubuntu 22.04, Debian 12, RHEL 9 and newer.
+Prebuilt binaries for four targets are published on the
+[releases page](https://github.com/summcr/summ/releases). Asset names carry no
+version, and `releases/latest/download/` resolves to the newest release, so an
+install line never needs updating.
+
+| Platform | Asset |
+|---|---|
+| Linux x86_64 | `summ-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 | `summ-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS Apple silicon | `summ-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `summ-x86_64-apple-darwin.tar.gz` |
 
 ```sh
 curl -fsSL https://github.com/summcr/summ/releases/latest/download/summ-x86_64-unknown-linux-gnu.tar.gz \
@@ -69,8 +75,15 @@ curl -fsSL https://github.com/summcr/summ/releases/latest/download/summ-x86_64-u
 ./summ serve
 ```
 
-`dev` is a rolling prerelease built from `main` on demand — swap `latest/download`
-for `download/dev` to fetch it.
+On Linux, RocksDB and its C++ runtime are linked in statically, so the only
+shared libraries left are the ones every glibc system already has — `libc`,
+`libm` and `libgcc_s`. The build floor is glibc 2.34: Ubuntu 22.04, Debian 12,
+RHEL 9 and newer. The macOS builds link nothing beyond the OS's own libraries
+and run on macOS 11 and up.
+
+Every asset has a `.sha256` beside it. `dev` is a rolling prerelease built from
+`main` on demand — swap `latest/download` for `download/dev` to fetch it. Being
+a prerelease, it never becomes `latest`.
 
 ## Deployment
 
