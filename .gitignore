@@ -10,3 +10,8 @@ target/
 # drives an AI tool.
 CLAUDE.md
 .claude/
+
+# Deployment credentials. A systemd unit's EnvironmentFile is a natural home
+# for an API key and a checkout is a natural home for that file, so the two
+# meet here — and a stray `git add -A` must not commit a live key.
+.env
