@@ -652,7 +652,7 @@ and as a push client in tests. **Not a server dependency.**
 
 - No Rust crate implements the OCI **distribution-spec server** in a form worth
   depending on. The conformance suite itself is Go
-  (`../distribution-spec/conformance`) and will have to be driven as an external
+  (`../../distribution-spec/conformance`) and will have to be driven as an external
   binary from CI — angos's `conformance-gates` shows one way.
 - No Rust equivalent of `go-containerregistry`/`crane` with server-side utility.
 - No maintained Rust crate for repository-**name** validation against the spec

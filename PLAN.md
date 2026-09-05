@@ -1253,16 +1253,20 @@ Read a file when you need the working behind a decision, not before.
 Open, not research: **aggregate manifest count** (Risk 2) — the per-axis bounds
 do not size the store.
 
-## Reference material (sibling directories)
+## Reference material (paths relative to this repo)
+
+Two groups, and the depth tells them apart. Ours are siblings under
+`~/projects/summcr`, which holds every repo of the `summcr` GitHub org; the
+upstream checkouts read for prior art are a level further out.
 
 | Path | Use |
 |---|---|
-| `../distribution-spec` | Spec text + `conformance/` suite — the acceptance gate |
-| `../distribution` | Reference impl. `registry/storage/paths.go` for the on-disk layout |
-| `../zot` | Closest prior art: `pkg/meta/boltdb` (embedded metadata store), `pkg/storage/{types,s3,local}` |
-| `../harbor` | Product-level features, not architecture |
 | `../summ-bench` | **Your** bench harness. `notes/fs_limit.md` has the capacity analysis |
 | `../summdb` | The prototype this schema descends from |
+| `../../distribution-spec` | Spec text + `conformance/` suite — the acceptance gate |
+| `../../distribution` | Reference impl. `registry/storage/paths.go` for the on-disk layout |
+| `../../zot` | Closest prior art: `pkg/meta/boltdb` (embedded metadata store), `pkg/storage/{types,s3,local}` |
+| `../../harbor` | Product-level features, not architecture |
 
 From `notes/fs_limit.md`: on a Standard_L8s_v3 the ceiling is network
 (~1.56 GB/s) before NVMe (~3 GB/s). Large-image pulls are network-saturated, so

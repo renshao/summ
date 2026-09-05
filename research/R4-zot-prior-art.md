@@ -3,9 +3,9 @@
 **Question:** What has zot already solved that summ would otherwise rediscover
 the hard way?
 
-**Sources read:** `../zot` at `b689b06` (2026-09-02) — `pkg/meta/{types,common,parse,hooks,proto,boltdb,redis,dynamodb}`,
+**Sources read:** `../../zot` at `b689b06` (2026-09-02) — `pkg/meta/{types,common,parse,hooks,proto,boltdb,redis,dynamodb}`,
 `pkg/storage/{types,common,local,s3,imagestore,cache,gc,scrub}`, `pkg/retention`,
-`pkg/api/{routes,constants}`, `pkg/common/common.go`. Plus `../harbor`
+`pkg/api/{routes,constants}`, `pkg/common/common.go`. Plus `../../harbor`
 (`src/pkg/{artifact,blob,accessory}`, `src/jobservice/job/impl/gc`) as a second
 data point.
 

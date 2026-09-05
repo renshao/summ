@@ -10,9 +10,9 @@ against the reference implementation; baseline captured.
 
 | Thing | Version |
 |---|---|
-| `../distribution-spec` | `v1.1.1-57-g9727462` (main, ahead of the 1.1.1 tag) |
-| `../distribution-spec/conformance` | the **rewritten** suite: `main.go`/`run.go`/`api.go`, Go 1.24+ |
-| `../distribution` (reference impl) | `v3.1.1-63-g5b354e6f` |
+| `../../distribution-spec` | `v1.1.1-57-g9727462` (main, ahead of the 1.1.1 tag) |
+| `../../distribution-spec/conformance` | the **rewritten** suite: `main.go`/`run.go`/`api.go`, Go 1.24+ |
+| `../../distribution` (reference impl) | `v3.1.1-63-g5b354e6f` |
 | Toolchain used | Go 1.26.1 darwin/arm64 |
 
 Everything below is written to be implemented from directly. Where the spec says
