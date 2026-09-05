@@ -45,6 +45,7 @@ use summ_registry::{
     UploadKey,
 };
 use summ_storage::{BlobStore, DigestAlgorithm, UploadId};
+use tokio::sync::Notify;
 
 use crate::counters::{PullCounters, Recorded, Subject};
 use crate::range::ByteRange;
@@ -184,6 +185,10 @@ fn manifest_info(
 pub struct Backend {
     ops: Arc<Ops>,
     blobs: BlobStore,
+    /// Woken by a repository delete so the sweeper starts on it now rather
+    /// than at the next tick. The tick is the fallback that picks up work left
+    /// by a crash; this is what makes an ordinary delete feel immediate.
+    sweep: Arc<Notify>,
 }
 
 impl Backend {
@@ -226,6 +231,7 @@ impl Backend {
         Ok(Backend {
             ops: Arc::new(Ops::with_options(engine, options)),
             blobs,
+            sweep: Arc::new(Notify::new()),
         })
     }
 
@@ -429,6 +435,30 @@ impl Registry for Backend {
             more: page.next.is_some(),
             items: page.tags,
         })
+    }
+
+    /// Release the name synchronously, sweep the keys behind it.
+    ///
+    /// The batch this waits on is three ops regardless of how large the
+    /// repository is, so the request costs one write whether the repository
+    /// held one manifest or ten million. See
+    /// [`Ops::delete_repository`](summ_registry::Registry::delete_repository)
+    /// for why the id it leaves behind is safe to sweep while the registry
+    /// keeps serving, and [`Backend::spawn_repo_sweeper`] for what does it.
+    async fn delete_repository(&self, name: &str) -> OpsResult<()> {
+        let now = self.now();
+        let name = name.to_string();
+        self.write(move |ops| {
+            ops.delete_repository(&name, now)?;
+            Ok(())
+        })
+        .await?;
+        // After the commit, and it matters which way round: a sweeper woken
+        // before the `D` record lands would find no work and go back to
+        // sleep, leaving the sweep to wait for the next tick. `Notify` holds
+        // a permit if the task is mid-pass, so nothing is lost the other way.
+        self.sweep.notify_one();
+        Ok(())
     }
 
     // ---- manifests -------------------------------------------------------
@@ -1196,6 +1226,127 @@ async fn flush_pull_counts(ops: &Arc<Ops>, counters: &PullCounters) -> usize {
             tracing::warn!(error = %e, "pull-count flush task failed");
             0
         }
+    }
+}
+
+/// How often the sweeper looks for work it was not told about.
+///
+/// A delete notifies the task directly, so this interval is not what makes a
+/// delete progress - it is what picks up a sweep interrupted by a crash, and a
+/// registry that has just restarted is not in a hurry about a repository whose
+/// name is already gone.
+pub const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Manifests whose reference edges one sweep step retracts.
+///
+/// Bounds the batch and the memory a step holds, and nothing else: the cursor
+/// carries across steps, so the scan stays sequential over the repository's
+/// `M` range however many steps it takes.
+const SWEEP_STEP: usize = 500;
+
+/// Dead repositories one pass will pick up. More than one delete may be
+/// outstanding; the range is otherwise empty.
+const SWEEP_BATCH: usize = 32;
+
+impl Backend {
+    /// Start the repository sweeper: the half of a repository delete that
+    /// does not happen while a client waits.
+    ///
+    /// Detached and never joined, like the pull-count flush. There is nothing
+    /// to drain on shutdown either, and for a better reason: the `D` record
+    /// *is* the state, so a sweep interrupted anywhere - by a crash, a signal
+    /// or a rollback - is picked up by the next process to run this task. What
+    /// a shutdown loses is time, not work.
+    pub fn spawn_repo_sweeper(self: &Arc<Self>) -> Arc<Notify> {
+        let backend = Arc::clone(self);
+        let wake = Arc::clone(&self.sweep);
+        let handle = Arc::clone(&self.sweep);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                // Either signal starts a pass, and a pass drains everything it
+                // finds, so a notification arriving during one is not lost -
+                // at worst it costs an extra empty pass afterwards.
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = wake.notified() => {}
+                }
+                if let Err(e) = backend.sweep_dead_repos().await {
+                    // Logged and dropped. The `D` record survives, so the next
+                    // pass retries; a sweep that could take the server down
+                    // would be a worse trade than a repository whose keys are
+                    // reclaimed a minute late.
+                    tracing::warn!(error = %e, "repository sweep failed");
+                }
+            }
+        });
+        handle
+    }
+
+    /// Sweep every outstanding dead repository to completion.
+    ///
+    /// Public so a test can run one pass rather than wait for a tick.
+    pub async fn sweep_dead_repos(&self) -> Result<usize, String> {
+        let mut swept = 0usize;
+        loop {
+            let ops = Arc::clone(&self.ops);
+            let dead = blocking(move || ops.dead_repos(None, SWEEP_BATCH)).await?;
+            if dead.is_empty() {
+                return Ok(swept);
+            }
+            for repo in dead {
+                self.sweep_one(repo.id, &repo.name).await?;
+                swept += 1;
+            }
+        }
+    }
+
+    /// One repository: retract its `R` edges, then drop everything under its
+    /// id.
+    ///
+    /// The two are in this order and must stay in it. `R <digest> <repo>
+    /// <manifest>` is keyed by the blob, so a repository's edges are only
+    /// reachable through the `M` records naming those blobs; dropping `M`
+    /// first strands every one of them, and a stranded edge is a blob purge
+    /// will decline to reclaim for ever because `exists_prefix` on it keeps
+    /// answering yes.
+    ///
+    /// The cursor lives across steps rather than the scan restarting each
+    /// time, which is what keeps a ten-million-manifest sweep linear: the
+    /// deletes leave tombstones, and re-seeking to the start of the range
+    /// would read every one of them again on every step.
+    async fn sweep_one(&self, id: summ_core::RepoId, name: &str) -> Result<usize, String> {
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut manifests = 0usize;
+        loop {
+            let ops = Arc::clone(&self.ops);
+            let at = cursor.clone();
+            let step = blocking(move || ops.sweep_repo_refs(id, at.as_deref(), SWEEP_STEP)).await?;
+            manifests += step.manifests;
+            match step.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        let ops = Arc::clone(&self.ops);
+        blocking(move || ops.finish_repo_sweep(id)).await?;
+        tracing::info!(repo = name, id, manifests, "repository swept");
+        Ok(manifests)
+    }
+}
+
+/// Run one blocking ops call and flatten both failure modes into a message.
+async fn blocking<T, F>(f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> summ_registry::Result<T> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(e) => Err(e.to_string()),
     }
 }
 

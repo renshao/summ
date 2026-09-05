@@ -479,24 +479,152 @@ async fn one_manifest_resolves_by_tag_and_by_digest() {
 // ---- shape and method ----------------------------------------------------
 
 #[tokio::test]
-async fn the_api_is_read_only_and_answers_head() {
+async fn the_api_mutates_through_exactly_one_route() {
     let h = Harness::new();
     seed_image(&h, "demo/app", "v1", "one");
 
-    for method in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+    for method in [Method::POST, Method::PUT, Method::PATCH] {
         let (status, ..) = h.send(method.clone(), "/api/v1/repositories").await;
         assert_eq!(
             status,
             StatusCode::METHOD_NOT_ALLOWED,
             "{method} must not mutate through the discovery API: every write \
-             has a spec-defined meaning on `/v2/`, and a second way to do it \
-             would be a second set of rules to keep in agreement"
+             with a spec-defined meaning belongs on `/v2/`, and a second way \
+             to do it would be a second set of rules to keep in agreement"
         );
+    }
+
+    // `DELETE` of a single repository is the exception, and only there: the
+    // spec has no repository delete for it to duplicate.
+    for uri in [
+        "/api/v1/repositories",
+        "/api/v1/tags/demo/app",
+        "/api/v1/manifests/demo/app",
+    ] {
+        let (status, ..) = h.send(Method::DELETE, uri).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "DELETE {uri}");
     }
 
     let (status, _, body) = h.send(Method::HEAD, "/api/v1/repositories").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.is_empty(), "a HEAD carries no body");
+}
+
+// ---- deleting a repository -----------------------------------------------
+
+#[tokio::test]
+async fn deleting_a_repository_removes_it_from_every_listing() {
+    let h = Harness::new();
+    seed_index(&h, "demo/app", "latest");
+    seed_image(&h, "demo/keep", "v1", "keep");
+
+    let (status, _, body) = h
+        .send(Method::DELETE, "/api/v1/repositories/demo/app")
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "`202`: the name is released, and the keys under it may still be going"
+    );
+    assert!(body.is_empty());
+
+    // Gone the instant the call returns, which is the half of the operation a
+    // client can observe.
+    let listing = h.get("/api/v1/repositories").await;
+    let names: Vec<&str> = listing["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["demo/keep"], "the other repository is untouched");
+
+    for uri in [
+        "/api/v1/repositories/demo/app",
+        "/api/v1/tags/demo/app",
+        "/api/v1/manifests/demo/app",
+    ] {
+        assert_eq!(h.status(uri).await, StatusCode::NOT_FOUND, "{uri}");
+    }
+    // And through `/v2/`, which is the same store seen from the spec side.
+    assert_eq!(
+        h.status("/v2/demo/app/tags/list").await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(h.status("/v2/demo/keep/tags/list").await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn deleting_a_repository_that_does_not_exist_is_a_404() {
+    let h = Harness::new();
+    seed_image(&h, "demo/app", "v1", "one");
+
+    let (status, _, body) = h
+        .send(Method::DELETE, "/api/v1/repositories/demo/nope")
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let error: Value = serde_json::from_slice(&body).expect("a spec error body");
+    assert_eq!(error["errors"][0]["code"], "NAME_UNKNOWN");
+
+    // A second delete of the same name, for the same reason: the name is gone
+    // after the first, whatever is still being swept underneath it.
+    assert_eq!(
+        h.send(Method::DELETE, "/api/v1/repositories/demo/app")
+            .await
+            .0,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        h.send(Method::DELETE, "/api/v1/repositories/demo/app")
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// The route table is flat precisely so a name containing `/` cannot be
+/// mistaken for a collection under another name. A delete is the operation
+/// where getting that wrong is unrecoverable.
+#[tokio::test]
+async fn deleting_a_repository_whose_name_looks_like_a_collection() {
+    let h = Harness::new();
+    seed_image(&h, "foo", "v1", "one");
+    seed_image(&h, "foo/tags", "v1", "two");
+
+    assert_eq!(
+        h.send(Method::DELETE, "/api/v1/repositories/foo/tags")
+            .await
+            .0,
+        StatusCode::ACCEPTED
+    );
+
+    let listing = h.get("/api/v1/repositories").await;
+    let names: Vec<&str> = listing["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["foo"], "`foo` kept its tags");
+    assert_eq!(h.get("/api/v1/tags/foo").await["tags"][0]["name"], "v1");
+}
+
+#[tokio::test]
+async fn a_deleted_repository_can_be_pushed_again_immediately() {
+    let h = Harness::new();
+    seed_image(&h, "demo/app", "v1", "one");
+    h.send(Method::DELETE, "/api/v1/repositories/demo/app")
+        .await;
+
+    seed_image(&h, "demo/app", "v2", "two");
+    let tags = h.get("/api/v1/tags/demo/app").await;
+    let names: Vec<&str> = tags["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["v2"], "nothing of the old repository came back");
 }
 
 #[tokio::test]

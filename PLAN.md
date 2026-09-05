@@ -89,6 +89,7 @@ Digests encode as one algorithm byte followed by raw hash bytes.
 | `H <repo> <tag> 0 <!ms> <digest>` | `TagEvent` | Tag history, newest first. **Served** |
 | `J <repo> <digest> <!ms> <tag>` | `TagEvent` | Same, addressed by digest. **Served** |
 | `A <scope> <…> <day> <shard>` | `CounterBucket` | Pull counters, per day and per hour. **Served** |
+| `D <id>` | `DeadRepo` | A repository whose name is released and whose keys are not yet. The sweeper's worklist |
 
 `H` and `J` are complete — written on every tag mutation since Phase 1, and now
 read by `/api/v1/tag-history/` and the UI. See **Tag history** below. `A` is
@@ -129,7 +130,7 @@ Two traps worth stating explicitly:
 
 ## Status
 
-`cargo test` — **428 passing**. Every crate in CLAUDE.md's Layout is built, and
+`cargo test` — **457 passing**. Every crate in CLAUDE.md's Layout is built, and
 **the wiring has landed** (package K, `summ-server/src/backend.rs`): `summ
 serve` runs on `summ-registry` over `summ-meta` with `summ-storage` holding the
 bytes. `tests/wiring.rs` drives the same router as `tests/api.rs` against a real
@@ -280,6 +281,13 @@ and removing it would mean overriding the unwinder std chose. Measured floor:
 **GLIBC_2.34**; the README turns that into a distro list. The job asserts the
 whole `ldd` set against an allowlist and starts the binary before packaging it.
 
+**Repository delete has landed** — `DELETE /api/v1/repositories/<name>`, with
+a confirm-by-typing-the-name control on the repository page. It is the first
+mutating route on `/api/v1/` and the first write the UI makes. The operation
+splits in two because the work does: releasing the name is one O(1) batch that
+the client waits for, and everything keyed by the repo id is swept by a
+background task behind it. See **Repository delete** below.
+
 **Not built**: purge, the conformance run in CI, Phases 3–6, and the rest of
 the discovery surface (blob fan-in and the untagged set — both listed under
 **Beyond the spec**).
@@ -378,11 +386,12 @@ The UI lives in `summ-server/ui/` and `summ-server/src/ui.rs`, not the
 nothing for a crate to own but four `include_str!`s; give it one when there is
 an asset pipeline to put in it.
 
-**Tag history and pull counts have since landed** —
-`/api/v1/tag-history/<name>@<reference>` and `/api/v1/pull-counts/<name>` with
-the UI over both. Still to build here: blob fan-in ("what shares this layer")
-and the untagged / reclaimable set — the schema and the ops-layer queries exist
-for both.
+**Tag history, pull counts and repository delete have since landed** —
+`/api/v1/tag-history/<name>@<reference>`, `/api/v1/pull-counts/<name>` and
+`DELETE /api/v1/repositories/<name>`, with the UI over all three. The delete is
+the one route here that mutates anything; see **Repository delete**. Still to
+build: blob fan-in ("what shares this layer") and the untagged / reclaimable
+set — the schema and the ops-layer queries exist for both.
 
 ### Phase 3 — performance
 
@@ -404,7 +413,9 @@ actually does**.
 
 **4** offline purge exploiting `R` and `G` — and retaining every blob whose
 digest is a manifest digest, or it destroys Risk 0's mitigation on its first
-run. **5** storage driver abstraction +
+run. Note it inherits the repository sweep's ordering rule from the other end:
+an `R` edge stranded by a sweep that dropped `M` first is a blob purge can
+never reclaim, because the edge is exactly what it asks about. **5** storage driver abstraction +
 S3, chunked upload → multipart. **6** full conformance — of which **referrers**
 and now **auth** both landed early: the `F` edges had been written since Phase 1,
 so referrers was a page and a switch, and API keys turned out to be one
@@ -515,6 +526,82 @@ a bounded suffix of each range — the keys are ordered newest-first, so "older
 than X" is a contiguous tail — and it belongs to the purge sweep (package F),
 which already walks the store. #606 permits trimming history when the repo is
 deleted; a time window is our own policy and needs a flag.
+
+## Repository delete
+
+`DELETE /api/v1/repositories/<name>` — `202`, and a confirm-by-typing-the-name
+control at the foot of the repository page. The spec has no repository delete,
+so this is ours, and it is the first route on `/api/v1/` that mutates anything.
+
+**The operation is in two halves because the work is.** Releasing the *name* is
+three ops — drop `n <name>`, drop `i <id>`, write `D <id>` — and it is what the
+client waits for, at O(1) whether the repository held one manifest or ten
+million. Everything keyed by the id is swept afterwards by a background task.
+The split is not a convenience: the scale target is 10M manifests in one
+repository, so the second half cannot be one `WriteBatch` and cannot be a
+request.
+
+Five things decided here, each of which a change could quietly undo:
+
+- **A repo id is never reused, and that is the whole safety argument.** Ids come
+  off the monotonic counter at `i <u32::MAX>`, so a name pushed back the instant
+  after a delete gets a fresh one. Every straggler under the dead id is
+  therefore unreachable garbage rather than another repository's data — which is
+  what lets the sweep run with no lock, no fencing, and no coordination with
+  concurrent pushes. An upload in flight to the deleted repository is not
+  blocked for the same reason: `UploadSession` carries the id in its *value*, so
+  it commits into the dead id and leaves an orphan `P` that the sweep drops or
+  purge does.
+
+- **The interner cache has to be evicted, and the store cannot do it.** The
+  `n`/`i` deletes are in the batch; the LRU in front of them is not, and a
+  cached entry resolves the name to an id that is being swept.
+  `RepoInterner::forget` runs *after* the apply — before it, eviction only
+  forces the next lookup to read the mapping back. A push racing the delete
+  interns a new id in between and this then evicts that fresh entry instead,
+  which is harmless: it is a cache, and the next lookup re-reads the mapping
+  nothing touched.
+
+- **`R` edges are retracted before `M` is dropped.** This is the ordering rule
+  and the reason the sweep exists at all. Ten of the twelve repo-scoped ranges
+  are `<type> <repo> …` and die to one `DeletePrefix` each; `R <digest> <repo>
+  <manifest>` is keyed by the *blob*, so a repository's edges are scattered
+  across the whole `R` range and the only way to find them is through the `M`
+  records that name the blobs. Drop `M` first and every one of those edges is
+  stranded — and a stranded edge is a blob purge will decline to reclaim for
+  ever, because `exists_prefix` on it keeps answering yes. The failure is
+  silent and would surface years later as disk that will not come back, so it
+  has its own test rather than a comment.
+
+- **The sweep is a sequence of batches and `D` is its state.** The edge set is
+  unbounded, so the whole thing cannot be atomic; each step is, and re-running
+  one is a no-op, so a sweep interrupted anywhere — crash, signal, rollback —
+  is finished by the next process to run the task. The task is therefore
+  spawned unconditionally, because the `D` range may hold work this process
+  never served. Within one run the cursor lives across steps rather than each
+  step re-seeking to the start of `M`: the deletes leave tombstones, and
+  re-reading them every step is what would turn a linear sweep quadratic.
+
+- **`L` and the blob bytes stay.** A layer is shared registry-wide, so whether
+  this repository was its last user is purge's question and not this one's. A
+  client that deletes a repository to free disk gets the space when purge runs.
+  The archive copy of each manifest stays too, for the reason under Risk 0.
+
+**No `--allow-repo-delete` flag, deliberately.** Deleting a repository is a
+write; `--auth` is the axis that decides who may write, and `Access::of`
+already calls `DELETE` one, so the route is inside the policy by construction
+rather than by being remembered. A second axis for one route would be the
+mechanism-inside-a-scope mistake `--auth`'s own naming exists to avoid. The
+friction is in the UI instead, where it costs nothing to change: the button
+opens a form that stays inert until the repository name has been typed back,
+compared exactly, because a name is the one thing somebody deleting the wrong
+repository would have got wrong.
+
+**Not built: undo, and a delete that reports progress.** Nothing reads `D`
+except the sweeper — an operator wanting to know whether a sweep is outstanding
+has to look in the store. Worth an endpoint if a registry ever holds enough
+outstanding sweeps for the question to arise; at one entry per unfinished
+delete it has not.
 
 ## Authentication
 
@@ -657,7 +744,7 @@ added outside the policy.
 | A | **Conformance harness** — the suite passes by hand; this is putting it in CI so it is a gate | `conformance/` | — |
 | F | Purge | `summ-purge/` | E |
 | G | Scale benchmark — synthetic 10M-repo dataset, engine A/B | `benches/` | — |
-| H | Extension API — *first cut done*; blob fan-in, untagged set, history remain | `summ-server/` | E |
+| H | Extension API — *first cut done*; blob fan-in and the untagged set remain | `summ-server/` | E |
 | I | Built-in web UI — *first cut done*; assets embedded, same port | `summ-server/ui/` | H |
 
 Done: **B** HTTP skeleton, **C** blob store, **D** upload sessions, **E** ops
@@ -1210,6 +1297,7 @@ query exists for every row here either way.
 | Untagged / reclaimable manifests | `M` minus `G` | ops layer only |
 | Pull counts by day and hour, for a wall | `A m <repo> <digest>` | **built** |
 | Tag history, newest first | `H <repo> <tag>` | **built** |
+| Delete a repository | tombstone + sweep | **built** |
 | What was this manifest ever tagged | `J <repo> <digest>` | **built** |
 
 summdb prototyped several of these (`/v1/repos/:repo/stats`,

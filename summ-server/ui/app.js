@@ -109,20 +109,39 @@ async function api(path, params) {
     if (v !== null && v !== undefined && v !== '') url.searchParams.set(k, v);
   }
   const response = await fetch(url, { headers: { accept: 'application/json' } });
-  if (!response.ok) {
-    // The server answers in the spec's error envelope on every path, including
-    // this one, so there is exactly one shape to unpack.
-    let detail = `HTTP ${response.status}`;
-    try {
-      const body = await response.json();
-      const first = body.errors && body.errors[0];
-      if (first) detail = first.message || first.code || detail;
-    } catch { /* a non-JSON error body is still an error */ }
-    const error = new Error(detail);
-    error.status = response.status;
-    throw error;
-  }
+  if (!response.ok) throw await failed(response);
   return response.json();
+}
+
+/**
+ * The one request this UI makes that changes anything.
+ *
+ * `202` carries no body - the repository is out of every listing by the time
+ * this resolves, and whether its keys have finished going is not something a
+ * client can observe - so there is nothing to parse and nothing to return.
+ */
+async function apiDelete(path) {
+  const response = await fetch(new URL(path, location.origin), {
+    method: 'DELETE',
+    headers: { accept: 'application/json' },
+  });
+  if (!response.ok) throw await failed(response);
+}
+
+/**
+ * Unpack a failure. The server answers in the spec's error envelope on every
+ * path, including these, so there is exactly one shape to read.
+ */
+async function failed(response) {
+  let detail = `HTTP ${response.status}`;
+  try {
+    const body = await response.json();
+    const first = body.errors && body.errors[0];
+    if (first) detail = first.message || first.code || detail;
+  } catch { /* a non-JSON error body is still an error */ }
+  const error = new Error(detail);
+  error.status = response.status;
+  return error;
 }
 
 /**
@@ -336,7 +355,109 @@ async function repositoryPage(name, query) {
     pullCountsSection(name, null),
     tabs,
     body,
+    deleteSection(name),
   );
+}
+
+/**
+ * The only destructive control in the UI, and the only write it makes.
+ *
+ * Deliberately awkward: the button opens a form that stays inert until the
+ * repository name has been typed back. A registry name is the one thing a
+ * person deleting the wrong repository would have got wrong, and re-typing it
+ * is the check that a modal asking "are you sure?" is not - it is answered
+ * yes by reflex.
+ *
+ * There is no gating flag behind this on the server. Deleting a repository is
+ * a write, `--auth` is the axis that decides who may write, and a second axis
+ * for one route would be a second policy to keep in agreement with the first.
+ * So on an open registry this button works for whoever can reach the port,
+ * exactly as `docker push` and `DELETE /v2/.../manifests/` already do.
+ */
+function deleteSection(name) {
+  const section = el('section', { class: 'danger' });
+
+  const collapsed = () => {
+    section.replaceChildren(
+      el('div', { class: 'danger-head' }, [
+        el('div', {}, [
+          el('h2', { class: 'section', text: 'Delete this repository' }),
+          el('p', {
+            class: 'danger-note',
+            text: 'Removes every tag, manifest, referrer edge and pull count. '
+              + 'Layer bytes are shared between repositories, so they are '
+              + 'reclaimed by a purge rather than by this.',
+          }),
+        ]),
+        el('button', { class: 'danger-button', type: 'button', onclick: expand }, ['Delete…']),
+      ]),
+    );
+  };
+
+  const expand = () => {
+    const input = el('input', {
+      type: 'text',
+      class: 'danger-input',
+      autocomplete: 'off',
+      autocapitalize: 'off',
+      spellcheck: 'false',
+      'aria-label': 'Type the repository name to confirm',
+      placeholder: name,
+    });
+    const confirm = el('button', { class: 'danger-button', type: 'button' }, ['Delete repository']);
+    const status = el('span', { class: 'danger-status' });
+    confirm.disabled = true;
+
+    // Compared exactly. A name is case-sensitive in the registry, so a
+    // confirmation that was not would be confirming a different name.
+    input.addEventListener('input', () => {
+      confirm.disabled = input.value !== name;
+    });
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && !confirm.disabled) run();
+      if (event.key === 'Escape') collapsed();
+    });
+
+    const run = async () => {
+      confirm.disabled = true;
+      input.disabled = true;
+      status.textContent = 'Deleting…';
+      try {
+        await apiDelete(apiRepo(name));
+      } catch (error) {
+        input.disabled = false;
+        confirm.disabled = false;
+        status.textContent = error.message;
+        status.classList.add('failed');
+        return;
+      }
+      // Back to the catalogue, which is the only page that still means
+      // anything: this one is now a 404.
+      go('/');
+    };
+    confirm.addEventListener('click', run);
+
+    section.replaceChildren(
+      el('div', { class: 'danger-open' }, [
+        el('h2', { class: 'section', text: 'Delete this repository' }),
+        el('p', { class: 'danger-note' }, [
+          'This cannot be undone. Type ',
+          el('code', { text: name }),
+          ' to confirm.',
+        ]),
+        el('div', { class: 'danger-form' }, [
+          input,
+          confirm,
+          el('button', { class: 'ghost-button', type: 'button', onclick: collapsed }, ['Cancel']),
+        ]),
+        status,
+      ]),
+    );
+    input.focus();
+  };
+
+  collapsed();
+  return section;
 }
 
 function tabLink(label, count, selected, href) {

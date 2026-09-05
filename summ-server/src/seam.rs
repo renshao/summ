@@ -447,6 +447,26 @@ pub trait Registry: Send + Sync + 'static {
     /// `Err(OpsError::RepoUnknown)` when the repository does not exist.
     async fn tags(&self, name: &str, last: Option<&str>, limit: usize) -> OpsResult<Page<String>>;
 
+    /// Delete a whole repository: every tag, manifest, edge and counter it
+    /// owns.
+    ///
+    /// The one mutation in this group, and the only operation on this trait
+    /// with no `/v2/` spelling - the spec has no repository-delete, so this is
+    /// ours, and it is reached through `/api/v1/`.
+    ///
+    /// **It returns once the name is released, not once the keys are gone.**
+    /// The repository leaves every listing immediately, which is what a caller
+    /// can observe and what a `202` promises; the rest is unbounded work - ten
+    /// million manifests in one repository is the scale target - and happens
+    /// behind it. An implementation may of course finish synchronously, and
+    /// `memory` does.
+    ///
+    /// Blob bytes are never removed here. A layer is shared registry-wide, so
+    /// whether this repository was its last user is purge's question.
+    ///
+    /// `Err(OpsError::RepoUnknown)` when the repository does not exist.
+    async fn delete_repository(&self, name: &str) -> OpsResult<()>;
+
     // ---- manifests -------------------------------------------------------
 
     /// Metadata only. `HEAD` is a first-class path, never a `GET` with the body

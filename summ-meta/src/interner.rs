@@ -114,6 +114,22 @@ impl RepoInterner {
         Ok(id)
     }
 
+    /// Drop a mapping from the cache, for a name that no longer has one.
+    ///
+    /// The store is not touched: the `n`/`i` deletes belong in the caller's
+    /// batch, with the rest of the tombstone, so that the mapping and the
+    /// record of the work it left behind land atomically. What this fixes is
+    /// the cache in front of that batch - without it a re-push of the same
+    /// name resolves the *old* id out of the LRU and writes into a keyspace
+    /// that is being swept, which the store itself cannot detect.
+    ///
+    /// Both directions go, and by both keys: an id whose name was reused
+    /// would otherwise resolve back to a name that is now somebody else's.
+    pub fn forget(&self, name: &str, id: RepoId) {
+        self.by_name.lock().pop(name);
+        self.by_id.lock().pop(&id);
+    }
+
     fn remember(&self, name: &str, id: RepoId) {
         self.by_name.lock().put(name.to_string(), id);
         self.by_id.lock().put(id, name.to_string());

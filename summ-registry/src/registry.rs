@@ -167,6 +167,12 @@ impl Registry {
         Ok(self.interner.intern(&*self.engine, name)?)
     }
 
+    /// Drop a name/id mapping from the interner cache. See
+    /// [`Registry::delete_repository`], which is the only caller.
+    pub(crate) fn forget_repo(&self, name: &str, id: RepoId) {
+        self.interner.forget(name, id);
+    }
+
     pub(crate) fn repo_name(&self, id: RepoId) -> Result<String> {
         self.interner
             .resolve(&*self.engine, id)?

@@ -159,6 +159,25 @@ pub struct UploadSession {
     pub hasher_state: Option<Vec<u8>>,
 }
 
+/// `D <id>` - a repository whose name is gone and whose keys are not yet.
+///
+/// Written in the same batch that removes the `n`/`i` mapping, and deleted by
+/// the batch that finishes the sweep. Its presence is the fact; the fields are
+/// for the operator reading a stuck sweep out of the store, not for the
+/// sweeper, which needs only the id in the key.
+///
+/// The name is denormalised because `i <id>` is gone by the time anything reads
+/// this - the same reason [`TagEvent`] carries a descriptor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeadRepo {
+    /// The name this id was interned under. Another repository may hold the
+    /// name again by the time the sweep runs, under a different id; that is
+    /// exactly why the sweep works off the id.
+    pub name: String,
+    /// Unix seconds the tombstone was written.
+    pub dropped_at: u64,
+}
+
 /// Whether a tag event created or removed the tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TagEventKind {

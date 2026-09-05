@@ -34,6 +34,7 @@ pub const PREFIX_UPLOAD: u8 = b'U';
 pub const PREFIX_TAG_HISTORY: u8 = b'H';
 pub const PREFIX_MANIFEST_TAG_HISTORY: u8 = b'J';
 pub const PREFIX_COUNTER: u8 = b'A';
+pub const PREFIX_DEAD_REPO: u8 = b'D';
 pub const PREFIX_REPO_BY_NAME: u8 = b'n';
 pub const PREFIX_REPO_BY_ID: u8 = b'i';
 pub const PREFIX_DB_VERSION: u8 = b'v';
@@ -88,6 +89,12 @@ pub fn manifests_in_repo(repo: RepoId) -> Vec<u8> {
     start_repo(PREFIX_MANIFEST, repo, 0)
 }
 
+/// Scan prefix over every stored manifest body in a repo. Only a whole-repo
+/// drop wants this - a body is otherwise read by digest, never swept.
+pub fn manifest_bodies_in_repo(repo: RepoId) -> Vec<u8> {
+    start_repo(PREFIX_MANIFEST_BODY, repo, 0)
+}
+
 // --- tags --------------------------------------------------------------
 
 /// `T <repo> <tag>` -> digest. Ordered by tag name, which is the order
@@ -116,6 +123,13 @@ pub fn tags_of_manifest(repo: RepoId, digest: &Digest) -> Vec<u8> {
     let mut k = start_repo(PREFIX_MANIFEST_TAG, repo, digest.encoded_len());
     digest.encode_into(&mut k);
     k
+}
+
+/// Scan prefix over every manifest-to-tag edge in a repo. Unlike
+/// [`tags_of_manifest`] this is not a query anything answers from: it exists so
+/// a repo drop can take the range in one op.
+pub fn manifest_tags_in_repo(repo: RepoId) -> Vec<u8> {
+    start_repo(PREFIX_MANIFEST_TAG, repo, 0)
 }
 
 /// Extract the tag suffix from a `G` key.
@@ -205,6 +219,11 @@ pub fn parents_of(repo: RepoId, child: &Digest) -> Vec<u8> {
     k
 }
 
+/// Scan prefix over every child-to-parent edge in a repo, for a repo drop.
+pub fn children_in_repo(repo: RepoId) -> Vec<u8> {
+    start_repo(PREFIX_CHILD_PARENT, repo, 0)
+}
+
 /// `F <repo> <subject> <referrer>` -> (). Backs the OCI 1.1 referrers API.
 pub fn referrer(repo: RepoId, subject: &Digest, referrer: &Digest) -> Vec<u8> {
     let mut k = start_repo(
@@ -221,6 +240,11 @@ pub fn referrers_of(repo: RepoId, subject: &Digest) -> Vec<u8> {
     let mut k = start_repo(PREFIX_REFERRER, repo, subject.encoded_len());
     subject.encode_into(&mut k);
     k
+}
+
+/// Scan prefix over every referrer edge in a repo, for a repo drop.
+pub fn referrers_in_repo(repo: RepoId) -> Vec<u8> {
+    start_repo(PREFIX_REFERRER, repo, 0)
 }
 
 // --- uploads -----------------------------------------------------------
@@ -281,6 +305,13 @@ pub fn tag_history_of(repo: RepoId, tag: &str) -> Vec<u8> {
     k
 }
 
+/// Scan prefix over every tag's history in a repo, for a repo drop. Not a
+/// query: a repo-wide fold across every tag's events is exactly the unbounded
+/// read this API does not offer.
+pub fn tag_history_in_repo(repo: RepoId) -> Vec<u8> {
+    start_repo(PREFIX_TAG_HISTORY, repo, 0)
+}
+
 /// Seek key for "events strictly before this instant", given the descending
 /// order. Pass as `start_after`.
 ///
@@ -333,6 +364,11 @@ pub fn manifest_tag_history_of(repo: RepoId, digest: &Digest) -> Vec<u8> {
     let mut k = start_repo(PREFIX_MANIFEST_TAG_HISTORY, repo, digest.encoded_len());
     digest.encode_into(&mut k);
     k
+}
+
+/// The `J` counterpart of [`tag_history_in_repo`].
+pub fn manifest_tag_history_in_repo(repo: RepoId) -> Vec<u8> {
+    start_repo(PREFIX_MANIFEST_TAG_HISTORY, repo, 0)
 }
 
 /// The `J` counterpart of [`tag_history_before`], with the same
@@ -464,6 +500,37 @@ pub fn counter_suffix(key: &[u8], scan_prefix: &[u8]) -> Option<(u16, u16)> {
         u16::from_be_bytes([rest[0], rest[1]]),
         u16::from_be_bytes([rest[2], rest[3]]),
     ))
+}
+
+// --- dead repos --------------------------------------------------------
+
+/// `D <id>` -> `DeadRepo`. The sweeper's worklist.
+///
+/// A repository is deleted in two steps because the work splits in two. The
+/// name mapping (`n`/`i`) goes in one O(1) batch, which is what a client waits
+/// for; everything keyed by the id is swept afterwards. This record is what
+/// joins them, and it is a record rather than a rediscoverable fact because the
+/// alternative - looking for ids that have no `i` entry - is a scan of the
+/// whole store.
+///
+/// Deliberately keyed by id and not by name: the name is free the instant the
+/// tombstone lands, and a second delete of a recreated repository must not
+/// overwrite the first one's outstanding work.
+pub fn dead_repo(id: RepoId) -> Vec<u8> {
+    let mut k = start(PREFIX_DEAD_REPO, REPO_LEN);
+    k.extend_from_slice(&id.to_be_bytes());
+    k
+}
+
+pub fn dead_repos() -> Vec<u8> {
+    vec![PREFIX_DEAD_REPO]
+}
+
+pub fn parse_dead_repo_id(key: &[u8]) -> Option<RepoId> {
+    if key.first() != Some(&PREFIX_DEAD_REPO) {
+        return None;
+    }
+    Some(RepoId::from_be_bytes(key.get(1..)?.try_into().ok()?))
 }
 
 // --- repo interner -----------------------------------------------------

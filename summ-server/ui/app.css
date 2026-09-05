@@ -39,6 +39,15 @@
   --wall-2:        #7bc2cf;
   --wall-3:        #3d9cae;
   --wall-4:        #0b7285;
+  /* Destructive. Distinct from `--deleted`, which is a *tag event* and must
+     read as ordinary: this one is a control that removes a repository, so it
+     is allowed to be loud. */
+  --danger:        #b42318;
+  --danger-hover:  #912018;
+  --danger-soft:   #fdf0ee;
+  /* What sits *on* the danger fill, for the same reason `--on-accent` exists:
+     the dark theme's red is light enough that white on it does not carry. */
+  --on-danger:     #ffffff;
   --shadow:        0 1px 2px rgba(31, 35, 40, .06);
   --radius:        8px;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
@@ -69,6 +78,10 @@
     --created-soft:  #12261a;
     --deleted:       #ec8e5c;
     --deleted-soft:  #2a1a13;
+    --danger:        #e5534b;
+    --danger-hover:  #f07a72;
+    --danger-soft:   #2a1512;
+    --on-danger:     #0d1117;
     --shadow:        0 1px 2px rgba(0, 0, 0, .3);
   }
 }
@@ -610,4 +623,118 @@ h2.section {
 
 @media (max-width: 480px) {
   .wall.days  { grid-template-columns: repeat(15, minmax(0, 15px)); }
+}
+
+/* ---- delete a repository ---------------------------------------------- */
+
+/* The only destructive control there is, so it is set apart rather than being
+   one more button in a row: a rule above it, muted until it is opened, and no
+   accent colour anywhere near it. */
+.danger {
+  margin-top: 40px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.danger-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.danger h2.section { margin-top: 0; }
+
+.danger-note {
+  margin: 4px 0 0;
+  max-width: 62ch;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.danger-note code {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-subtle);
+  color: var(--text);
+}
+
+.danger-head .danger-button { margin-left: auto; flex: none; }
+
+.danger-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+.danger-input {
+  flex: 1 1 240px;
+  min-width: 0;
+  max-width: 380px;
+  padding: 7px 11px;
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  outline: none;
+}
+.danger-input:focus {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 3px var(--danger-soft);
+}
+.danger-input::placeholder { color: var(--text-faint); }
+
+.danger-button,
+.ghost-button {
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  padding: 7px 14px;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+
+.danger-button {
+  color: var(--on-danger);
+  background: var(--danger);
+  border: 1px solid var(--danger);
+}
+.danger-button:hover:not(:disabled) {
+  background: var(--danger-hover);
+  border-color: var(--danger-hover);
+}
+/* Disabled until the name has been typed back, which is most of the time this
+   button is on screen - so it has to look inert rather than merely dimmed. */
+.danger-button:disabled {
+  cursor: not-allowed;
+  color: var(--text-faint);
+  background: var(--bg-subtle);
+  border-color: var(--border);
+}
+
+.ghost-button {
+  color: var(--text-muted);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+}
+.ghost-button:hover { color: var(--text); background: var(--bg-hover); }
+
+.danger-status {
+  display: block;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.danger-status.failed { color: var(--danger); }
+
+@media (max-width: 480px) {
+  .danger-head { flex-direction: column; gap: 12px; }
+  .danger-head .danger-button { margin-left: 0; }
 }

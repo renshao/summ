@@ -40,7 +40,7 @@ use axum::body::Body;
 use axum::http::{header, Method, StatusCode};
 use serde::Serialize;
 
-use super::{build, method_not_allowed, ops_error, Ctx, Handled};
+use super::{build, empty_with_length, method_not_allowed, ops_error, Ctx, Handled};
 use crate::error::{ApiError, ErrorCode};
 use crate::reference::{parse_digest, valid_tag, Reference};
 use crate::seam::{
@@ -70,7 +70,8 @@ pub const MAX_PULL_COUNT_DAYS: u16 = 400;
 pub enum ApiEndpoint {
     /// `GET /api/v1/repositories`
     Repositories,
-    /// `GET /api/v1/repositories/<name>`
+    /// `GET /api/v1/repositories/<name>`, and `DELETE` of the same - the one
+    /// mutating route on this API.
     Repository { name: String },
     /// `GET /api/v1/tags/<name>`
     Tags { name: String },
@@ -340,11 +341,22 @@ struct PullCountsBody {
 // ---- dispatch ------------------------------------------------------------
 
 pub async fn handle(ctx: &Ctx, endpoint: ApiEndpoint) -> Handled {
-    // Read-only, deliberately. Everything that changes the registry is a `/v2/`
-    // operation with a spec-defined meaning, and a second way to do it would be
-    // a second set of rules to keep in agreement with the first.
+    // Read-only but for one route. Everything with a spec-defined meaning is a
+    // `/v2/` operation and stays there, because a second way to do it would be
+    // a second set of rules to keep in agreement with the first. Deleting a
+    // repository has no spec spelling at all - `/v2/` cannot express it - so it
+    // lives here, on the resource it deletes.
+    if ctx.method == Method::DELETE {
+        return match endpoint {
+            ApiEndpoint::Repository { name } => delete_repository(ctx, &name).await,
+            _ => Err(method_not_allowed("GET, HEAD")),
+        };
+    }
     if ctx.method != Method::GET && ctx.method != Method::HEAD {
-        return Err(method_not_allowed("GET, HEAD"));
+        return Err(method_not_allowed(match endpoint {
+            ApiEndpoint::Repository { .. } => "GET, HEAD, DELETE",
+            _ => "GET, HEAD",
+        }));
     }
 
     match endpoint {
@@ -395,6 +407,26 @@ async fn repository(ctx: &Ctx, name: &str) -> Handled {
         .await
         .map_err(ops_error)?;
     json(ctx, &RepositoryBody::from(detail))
+}
+
+/// `DELETE /api/v1/repositories/<name>`.
+///
+/// `202 Accepted`, and it means what it says here rather than what it means on
+/// a manifest delete: the repository is gone from every listing by the time
+/// this returns, but the keys underneath it may still be being swept. There is
+/// nothing a client can observe that distinguishes the two, which is the
+/// point: a `GET` of the repository, its tags or its manifests answers `404`
+/// immediately.
+///
+/// Blob bytes are not reclaimed. Layers are shared registry-wide and whether
+/// this repository was the last user of one is purge's question; a client that
+/// deletes a repository to free disk gets the space when purge runs.
+async fn delete_repository(ctx: &Ctx, name: &str) -> Handled {
+    ctx.registry()
+        .delete_repository(name)
+        .await
+        .map_err(ops_error)?;
+    Ok(empty_with_length(StatusCode::ACCEPTED, 0, Vec::new()))
 }
 
 async fn tags(ctx: &Ctx, name: &str) -> Handled {

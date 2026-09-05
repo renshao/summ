@@ -447,6 +447,203 @@ async fn an_index_reports_the_platforms_of_its_children() {
     );
 }
 
+// ------------------------------------------------------- repository delete --
+
+/// The whole operation over the real store: the name goes while the client
+/// waits, the keys go behind it.
+#[tokio::test]
+async fn deleting_a_repository_releases_the_name_then_sweeps_the_keys() {
+    let dir = TempDir::new().expect("tempdir");
+    let h = Harness::rocks(dir.path());
+    push_image(&h, "demo/app", "v1").await;
+    push_image(&h, "demo/keep", "v1").await;
+
+    let reply = h
+        .request(
+            Method::DELETE,
+            "/api/v1/repositories/demo/app",
+            Vec::new(),
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::ACCEPTED);
+
+    // Everything a client can see is already true, with nothing swept yet.
+    assert_eq!(
+        h.get("/v2/demo/app/manifests/v1").await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        h.get(&format!("/v2/demo/app/blobs/{}", sha256_hex(LAYER)))
+            .await
+            .status,
+        StatusCode::NOT_FOUND,
+        "a blob is only servable under a repository that exists"
+    );
+    let catalog = h.get("/v2/_catalog").await.json();
+    assert_eq!(catalog["repositories"], serde_json::json!(["demo/keep"]));
+
+    // The sweep is the rest of it, and it reports one repository once.
+    assert_eq!(h.backend.sweep_dead_repos().await.unwrap(), 1);
+    assert_eq!(
+        h.backend.sweep_dead_repos().await.unwrap(),
+        0,
+        "a finished sweep leaves no work behind"
+    );
+
+    // The neighbour that shares both blobs is untouched throughout.
+    assert_eq!(
+        h.get("/v2/demo/keep/manifests/v1").await.status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        h.get(&format!("/v2/demo/keep/blobs/{}", sha256_hex(LAYER)))
+            .await
+            .status,
+        StatusCode::OK,
+        "the shared layer lost one repository's `R` edges, not the blob"
+    );
+}
+
+/// The `D` record is the sweep's state, so an interrupted sweep is finished by
+/// whichever process runs next - which is what lets the delete return before
+/// the work does.
+#[tokio::test]
+async fn an_unfinished_sweep_is_picked_up_by_the_next_process() {
+    let dir = TempDir::new().expect("tempdir");
+    {
+        let h = Harness::rocks(dir.path());
+        push_image(&h, "demo/app", "v1").await;
+        let reply = h
+            .request(
+                Method::DELETE,
+                "/api/v1/repositories/demo/app",
+                Vec::new(),
+                Body::empty(),
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::ACCEPTED);
+        // And the process ends here, before the sweeper has run at all.
+    }
+
+    let h = Harness::rocks(dir.path());
+    assert_eq!(
+        h.backend.sweep_dead_repos().await.unwrap(),
+        1,
+        "the outstanding sweep survived the restart"
+    );
+    assert!(h.get("/v2/_catalog").await.json()["repositories"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+/// A name is free the instant the tombstone lands, including while the old
+/// id's keys are still on their way out.
+#[tokio::test]
+async fn a_deleted_name_can_be_pushed_again_before_the_sweep_runs() {
+    let dir = TempDir::new().expect("tempdir");
+    let h = Harness::rocks(dir.path());
+    push_image(&h, "demo/app", "v1").await;
+    h.request(
+        Method::DELETE,
+        "/api/v1/repositories/demo/app",
+        Vec::new(),
+        Body::empty(),
+    )
+    .await;
+
+    // Pushed back with the sweep still outstanding: a new id, so nothing the
+    // sweep does can reach it.
+    push_image(&h, "demo/app", "v2").await;
+    assert_eq!(h.backend.sweep_dead_repos().await.unwrap(), 1);
+
+    let tags = h.get("/v2/demo/app/tags/list").await.json();
+    assert_eq!(tags["tags"], serde_json::json!(["v2"]), "only the new push");
+    assert_eq!(
+        h.get("/v2/demo/app/manifests/v2").await.status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        h.get(&format!("/v2/demo/app/blobs/{}", sha256_hex(LAYER)))
+            .await
+            .status,
+        StatusCode::OK,
+        "the re-pushed repository kept its own blob membership"
+    );
+
+    // And it survives the restart, which is where a stale interner entry or a
+    // reused id would show up.
+    drop(h);
+    let h = Harness::rocks(dir.path());
+    assert_eq!(
+        h.get("/v2/demo/app/manifests/v2").await.status,
+        StatusCode::OK
+    );
+}
+
+/// Both engines, because a repo drop is nine `DeletePrefix` ops and the two
+/// engines implement that op completely differently - a RocksDB range
+/// tombstone against a redb `retain_in`.
+#[tokio::test]
+async fn a_repository_drop_works_on_the_second_engine_too() {
+    for engine in [Engine::Rocks, Engine::Redb] {
+        let dir = TempDir::new().expect("tempdir");
+        let h = Harness::open(dir.path(), engine, RegistryOptions::default());
+        push_image(&h, "demo/app", "v1").await;
+        push_image(&h, "demo/keep", "v1").await;
+
+        h.request(
+            Method::DELETE,
+            "/api/v1/repositories/demo/app",
+            Vec::new(),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(h.backend.sweep_dead_repos().await.unwrap(), 1, "{engine:?}");
+
+        let catalog = h.get("/v2/_catalog").await.json();
+        assert_eq!(
+            catalog["repositories"],
+            serde_json::json!(["demo/keep"]),
+            "{engine:?}"
+        );
+        assert_eq!(
+            h.get("/v2/demo/keep/manifests/v1").await.status,
+            StatusCode::OK,
+            "{engine:?}"
+        );
+    }
+}
+
+/// Counters are a repo-scoped range like any other, and the only one written
+/// by something other than a push.
+#[tokio::test]
+async fn a_repository_drop_takes_its_pull_counts_with_it() {
+    let dir = TempDir::new().expect("tempdir");
+    let h = Harness::rocks(dir.path());
+    push_image(&h, "demo/app", "v1").await;
+    h.get("/v2/demo/app/manifests/v1").await;
+    h.flush().await;
+
+    let counts = h.get("/api/v1/pull-counts/demo/app").await.json();
+    assert_eq!(counts["totals"]["manifest_pulls"], 1, "a pull was recorded");
+
+    h.request(
+        Method::DELETE,
+        "/api/v1/repositories/demo/app",
+        Vec::new(),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(h.backend.sweep_dead_repos().await.unwrap(), 1);
+
+    // Nothing 404s here - counts outlive what they describe - so the assertion
+    // is that the window came back empty rather than that it came back at all.
+    let counts = h.get("/api/v1/pull-counts/demo/app").await.json();
+    assert_eq!(counts["totals"]["manifest_pulls"], 0, "the `A` range went");
+}
+
 // ------------------------------------------------------------ persistence --
 
 #[tokio::test]

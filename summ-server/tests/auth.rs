@@ -41,6 +41,7 @@ const READABLE: &[&str] = &[
     "/api/v1/tag-history/lib/nginx@v1",
     "/api/v1/pull-counts/lib/nginx",
     "/api/v1/pull-counts/lib/nginx@v1",
+    "/api/v1/repositories/lib/nginx",
     "/app.css",
     "/app.js",
     "/logo.svg",
@@ -401,6 +402,76 @@ async fn the_read_key_is_denied_a_write_and_the_write_does_not_happen() {
             .await;
         assert_eq!(reply.status, StatusCode::FORBIDDEN, "{method}");
     }
+}
+
+/// The discovery API's one mutating route is a write like any other, and it is
+/// the first route on this API that had to be: nothing but the method decides,
+/// so a route added here is inside the policy by construction and this test is
+/// what says so out loud.
+#[tokio::test]
+async fn deleting_a_repository_is_a_write_on_every_surface() {
+    const URI: &str = "/api/v1/repositories/lib/nginx";
+
+    // `--auth all`: no credential is challenged, the read key is denied
+    // without a challenge, the write key does it.
+    let h = Harness::guarded();
+    h.seed();
+    let reply = h.send(Method::DELETE, URI, None, Body::empty()).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    assert!(reply.header(header::WWW_AUTHENTICATE).is_some());
+
+    let reply = h
+        .send(
+            Method::DELETE,
+            URI,
+            Some(&basic("anyone", READ_KEY)),
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert!(
+        reply.header(header::WWW_AUTHENTICATE).is_none(),
+        "a genuine but insufficient credential is not re-challenged"
+    );
+    assert!(
+        h.get(
+            "/api/v1/repositories/lib/nginx",
+            Some(&basic("anyone", READ_KEY))
+        )
+        .await
+        .status
+        .is_success(),
+        "the refusal is a refusal, not a slow delete"
+    );
+
+    let reply = h
+        .send(
+            Method::DELETE,
+            URI,
+            Some(&basic("anyone", WRITE_KEY)),
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::ACCEPTED);
+
+    // `--auth write`: anonymous reads, but this is not a read.
+    let h = Harness::public();
+    h.seed();
+    let reply = h.send(Method::DELETE, URI, None, Body::empty()).await;
+    assert_eq!(
+        reply.status,
+        StatusCode::UNAUTHORIZED,
+        "the mode that gates pushes gates this too - it is not a read"
+    );
+    let reply = h
+        .send(
+            Method::DELETE,
+            URI,
+            Some(&basic("anyone", WRITE_KEY)),
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::ACCEPTED);
 }
 
 #[tokio::test]

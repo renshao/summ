@@ -113,4 +113,8 @@ fn every_stored_record_roundtrips() {
     // to decode back to a bucket rather than to nothing.
     check!(CounterBucket::default());
     check!(ManifestRef { repo: 4, digest: d });
+    check!(DeadRepo {
+        name: "library/alpine".into(),
+        dropped_at: 1_700_000_000,
+    });
 }

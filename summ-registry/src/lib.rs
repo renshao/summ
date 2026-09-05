@@ -52,7 +52,7 @@ pub use registry::{
 };
 
 pub use counters::{CountDay, CountDelta, CountSubject};
-pub use delete::{BlobRefDeleted, ManifestDeleted};
+pub use delete::{BlobRefDeleted, DeadRepoEntry, ManifestDeleted, RepoTombstoned, SweepStep};
 pub use discovery::{
     BlobReference, BlobReferenceList, DigestList, ManifestCountPage, ManifestList, RepoList,
     RepoUsagePage, TagCountPage,

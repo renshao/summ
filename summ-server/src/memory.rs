@@ -428,6 +428,19 @@ impl Registry for MemoryRegistry {
         ))
     }
 
+    /// Synchronous here, and legitimately so: the whole repository is one
+    /// `BTreeMap` entry, so there is no unbounded half to defer. The seam
+    /// promises the name is released, not that the keys are gone, and removing
+    /// the entry satisfies both readings at once.
+    async fn delete_repository(&self, name: &str) -> OpsResult<()> {
+        let mut state = self.lock();
+        state
+            .repos
+            .remove(name)
+            .map(|_| ())
+            .ok_or(OpsError::RepoUnknown)
+    }
+
     async fn stat_manifest(&self, name: &str, reference: &Reference) -> OpsResult<ManifestStat> {
         let state = self.lock();
         let repo = state.repo(name)?;
