@@ -1,40 +1,32 @@
 # summ — build plan
 
-An OCI Distribution Spec compliant container registry in Rust. One binary, no
-dependencies, a built-in web UI, and a metadata store that makes discovery a
-first-class operation rather than an afterthought.
-
-This document is the entry point for a fresh session and is loaded into every
-one of them, so it holds only what a session needs *before* starting work:
-decisions, schema, status, invariants, and what is open. Working that has served
-its purpose lives in `research/` and `design/`, linked from here.
+`README.md` says what summ is and why anyone would want it. This document is
+the entry point for a fresh session and is loaded into every one of them, so it
+holds only what a session needs *before* starting work: decisions, schema,
+status, invariants, and what is open. Working that has served its purpose lives
+in `research/` and `design/`, linked from here.
 
 ## Why this exists
 
-Four goals that are one engineering problem. `README.md` has the pitch.
+The goals are in the README; what they bind the code to is here.
 
-1. **Extremely fast.** R2 measured the byte path at 2–5 % of an 8-vCPU box at
-   line rate, where a perfect implementation saves ~1 % — throughput is not
-   where the race is won. R5 found four of the five serial steps in a cold
-   containerd pull are metadata lookups, and their latencies add. **Metadata
-   latency is the product.**
-2. **First-class discovery.** The spec is a transfer protocol and cannot tell
-   you what is in your registry; `_catalog` is not even in it. Every registry
-   bolts discovery on over a store designed for transfer, and it is slow.
-   **Catalog and list operations degrading at high repo counts, plus ECR/ACR
-   rate limiting, is the concrete failure that started this project.** summ
-   inverts the order: the store is designed for discovery, transfer served from
-   it.
-3. **Simple to run.** One binary, no database, no sidecar. Every feature needing
-   an external service must justify itself against that; the answer is usually
-   to build it in.
-4. **A built-in web UI**, same port, embedded assets. It is the honesty check on
-   goal 2 — if it browses a ten-million-repo catalog responsively, the API is
-   genuinely cursor-paged.
-
-Consequences: the extension API is core product surface and carries its own
-tests, because nothing external validates it. Everything is cursor-paged.
-Conformance is the floor, not the ceiling.
+- **Metadata latency is the product.** R2 measured the byte path at 2–5 % of an
+  8-vCPU box at line rate, where a perfect implementation saves ~1 %, so
+  throughput is not where the race is won; R5 found four of the five serial
+  steps in a cold containerd pull are metadata lookups, and their latencies add.
+- **Catalog and list operations degrading at high repo counts, plus ECR/ACR
+  rate limiting, is the concrete failure that started this project.** The spec
+  is a transfer protocol and cannot tell you what is in your registry, so every
+  registry bolts discovery on over a store designed for transfer and it is slow.
+  summ inverts the order: the store is designed for discovery, transfer served
+  from it.
+- **A feature needing an external service must justify itself against the
+  single binary**, and the answer is usually to build it in.
+- **The UI is the honesty check on discovery.** If it browses a
+  ten-million-repo catalog responsively, the API is genuinely cursor-paged.
+- **The extension API is core product surface and carries its own tests**,
+  because nothing external validates it. Everything is cursor-paged, and
+  conformance is the floor, not the ceiling.
 
 ## Decisions locked
 
@@ -196,11 +188,10 @@ blob range cases, both `Content-Range` grammars.
 
 **The discovery API and the web UI have landed** (packages H and I, first cut).
 `/api/v1/` serves four cursor-paged read-only endpoints and `/` serves a
-built-in UI over them — repository list with per-repo tag and manifest counts,
-name-prefix search, a repository page with tags and manifests, and a manifest
-page. Assets are `include_str!`d, so `cargo build` is the whole pipeline and the
-page loads nothing from the network. Verified by hand against a real corpus:
-`oras cp` of alpine, busybox, nginx, postgres and redis, browsed end to end.
+built-in UI over them. Assets are `include_str!`d, so `cargo build` is the whole
+pipeline and the page loads nothing from the network. Verified by hand against a
+real corpus: `oras cp` of alpine, busybox, nginx, postgres and redis, browsed
+end to end.
 
 **The referrers API is on** (end-12a/12b), which is the one part of Phase 6
 that landed early. The `F` edges have been written since Phase 1, so the work
@@ -267,10 +258,9 @@ absolute values. The `CounterBucket` value gained a per-hour breakdown on the
 way in, which cost nothing because nothing had ever written an `A` key. On by
 default; `--no-pull-counts` turns it off. See **Pull counts**.
 
-**API-key authentication has landed** and is described under **Authentication**
-below: `--auth all` puts a read key and a write key in front of `/v2/`, the
-discovery API and the UI at once. Off by default, so the conformance runs above
-and every measurement in this document are unaffected.
+**API-key authentication has landed**, described under **Authentication**
+below. Off by default, so the conformance runs above and every measurement in
+this document are unaffected.
 
 **There is a downloadable Linux x86_64 binary** (`.github/workflows/release.yml`).
 A tag publishes a release; a manual dispatch re-points a rolling `dev`
@@ -287,7 +277,7 @@ about, so the fix is an `-L` directory holding `libstdc++.a` and no `.so`. What
 is left is `libc`, `libm` and `libgcc_s`, which are the OS's ABI rather than
 summ's dependencies; std links `gcc_s` itself unless the target is crt-static,
 and removing it would mean overriding the unwinder std chose. Measured floor:
-**GLIBC_2.34** — Ubuntu 22.04, Debian 12, RHEL 9 and newer. The job asserts the
+**GLIBC_2.34**; the README turns that into a distro list. The job asserts the
 whole `ldd` set against an allowlist and starts the binary before packaging it.
 
 **Not built**: purge, the conformance run in CI, Phases 3–6, and the rest of
