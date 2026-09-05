@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="Summ">
-  <title>Summ</title>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="summ">
+  <title>summ</title>
   <!--
     The mark: a sigma, for summation, drawn as a stack of strokes - which is
     also what a registry holds. One path on a 32-unit grid, mitred joins, no

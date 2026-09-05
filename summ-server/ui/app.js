@@ -713,14 +713,14 @@ function pullCountsSection(name, reference) {
 function route() {
   const path = decodeURI(location.pathname);
   const query = new URLSearchParams(location.search);
-  document.title = 'Summ';
+  document.title = 'summ';
 
   if (path === '/' || path === '') return repositoriesPage(query);
 
   if (path.startsWith('/r/')) {
     const name = path.slice(3).replace(/\/+$/, '');
     if (!name) return repositoriesPage(query);
-    document.title = `${name} · Summ`;
+    document.title = `${name} · summ`;
     const manifest = query.get('manifest');
     const history = query.get('history');
     if (history) return tagHistoryPage(name, history);
