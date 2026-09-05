@@ -1,6 +1,6 @@
 # summ Container Registry
 
-[![CI](https://github.com/renshao/summ/actions/workflows/ci.yml/badge.svg)](https://github.com/renshao/summ/actions/workflows/ci.yml)
+[![CI](https://github.com/summcr/summ/actions/workflows/ci.yml/badge.svg)](https://github.com/summcr/summ/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 **summ** is a simple yet powerful container registry with batteries included. It
@@ -58,13 +58,13 @@ passing at the suite's `dev` profile, with nothing skipped.
 ## Download
 
 Prebuilt Linux x86_64 binaries are published on the
-[releases page](https://github.com/renshao/summ/releases). RocksDB and its C++
+[releases page](https://github.com/summcr/summ/releases). RocksDB and its C++
 runtime are linked in statically, so the only shared libraries left are the
 ones every glibc system already has — `libc`, `libm` and `libgcc_s`. The build
 floor is glibc 2.34: Ubuntu 22.04, Debian 12, RHEL 9 and newer.
 
 ```sh
-curl -fsSL https://github.com/renshao/summ/releases/latest/download/summ-x86_64-unknown-linux-gnu.tar.gz \
+curl -fsSL https://github.com/summcr/summ/releases/latest/download/summ-x86_64-unknown-linux-gnu.tar.gz \
   | tar -xz summ
 ./summ serve
 ```
