@@ -62,7 +62,7 @@ Options:
   --source MODE        auto | docker | remote (default: auto)
   --data-dir DIR       registry data directory (default: under $TMPDIR)
   --layout-dir DIR     OCI layout cache for the docker path
-  --auth               run with --auth apikey and use the keys for every request
+  --auth               run with --auth all and use the keys for every request
   --no-build           use target/release/summ as it stands
   --no-verify          do not sha256 pulled blobs (measures raw throughput)
   --reuse-data         keep an existing data dir and skip the push phase
@@ -187,7 +187,7 @@ info "target     $REGISTRY/$DEST_REPO:$DEST_TAG"
 info "engine     $ENGINE   threads $THREADS   rounds $ROUNDS"
 info "data dir   $DATA_DIR"
 info "verify     $([[ $DO_VERIFY -eq 1 ]] && echo 'sha256 every blob' || echo 'off')"
-info "auth       $([[ $AUTH -eq 1 ]] && echo 'apikey' || echo 'anonymous')"
+info "auth       $([[ $AUTH -eq 1 ]] && echo 'all' || echo 'none')"
 
 # ------------------------------------------------------------------- build ---
 
@@ -210,7 +210,7 @@ mkdir -p "$DATA_DIR"
 
 SERVE_ARGS=(serve --listen "$REGISTRY" --data-dir "$DATA_DIR" --engine "$ENGINE")
 if [[ $AUTH -eq 1 ]]; then
-    SERVE_ARGS+=(--auth apikey --read-apikey "$READ_KEY" --write-apikey "$WRITE_KEY")
+    SERVE_ARGS+=(--auth all --read-apikey "$READ_KEY" --write-apikey "$WRITE_KEY")
 fi
 "$BIN" "${SERVE_ARGS[@]}" >"$LOG" 2>&1 &
 SERVER_PID=$!

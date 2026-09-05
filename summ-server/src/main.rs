@@ -104,20 +104,32 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// credential into a scrollback, a log file and a CI transcript. So the banner
 /// says which keys it made up, and stays silent about the rest.
 fn print_auth(auth: &AuthPolicy, generated: Option<Generated>) {
-    let AuthPolicy::ApiKey { read, write } = auth else {
-        println!("  auth          anonymous read-write (--auth apikey to require a key)");
-        return;
-    };
     let generated = generated.unwrap_or(Generated {
         read: false,
         write: false,
     });
-    println!("  auth          API key, as an HTTP Basic password");
-    if generated.read {
-        println!("  read key      {}   (generated)", read.expose());
-    }
-    if generated.write {
-        println!("  write key     {}   (generated)", write.expose());
+    match auth {
+        AuthPolicy::None => {
+            println!("  auth          none - anonymous read-write (--auth write to gate push)");
+        }
+        AuthPolicy::Write { write } => {
+            // Say what is open as well as what is shut: an operator reading
+            // this line is entitled to learn from it that the catalog and the
+            // UI are now world-readable.
+            println!("  auth          write - anonymous pull, API key to push");
+            if generated.write {
+                println!("  write key     {}   (generated)", write.expose());
+            }
+        }
+        AuthPolicy::All { read, write } => {
+            println!("  auth          all - API key, as an HTTP Basic password");
+            if generated.read {
+                println!("  read key      {}   (generated)", read.expose());
+            }
+            if generated.write {
+                println!("  write key     {}   (generated)", write.expose());
+            }
+        }
     }
     if generated.read || generated.write {
         println!("  !! a generated key is printed once and is not stored anywhere.");

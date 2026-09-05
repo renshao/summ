@@ -73,11 +73,10 @@ pub struct ServerConfig {
     /// the client both that the fallback is unnecessary and that it is
     /// required.
     pub referrers_enabled: bool,
-    /// Who may read and who may write.
+    /// Which requests require an API key.
     ///
-    /// [`AuthPolicy::Anonymous`] by default, which is what makes `summ serve`
-    /// with no arguments a working registry in one command. Everything the
-    /// server exposes is behind this once it is not - see [`crate::auth`].
+    /// [`AuthPolicy::None`] by default, which is what makes `summ serve` with
+    /// no arguments a working registry in one command - see [`crate::auth`].
     pub auth: AuthPolicy,
 }
 
@@ -91,19 +90,25 @@ impl Default for ServerConfig {
             max_tag_params: 32,
             chunk_min_length: None,
             referrers_enabled: true,
-            auth: AuthPolicy::Anonymous,
+            auth: AuthPolicy::None,
         }
     }
 }
 
-/// How the registry authenticates a request.
+/// Which requests require an API key.
+///
+/// One axis, three points, from open to closed. Naming them for *what needs a
+/// key* rather than for how the key travels leaves room for a second
+/// mechanism to be a separate choice, instead of a fourth value here that
+/// silently also decides the scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum AuthMode {
-    /// Anyone may read and write. The default.
-    Anonymous,
-    /// A read key and a write key, sent as an HTTP Basic password.
-    #[value(name = "apikey", alias = "api-key")]
-    ApiKey,
+    /// None of them. Anyone may read and write. The default.
+    None,
+    /// The ones that write: anonymous pull, keyed push.
+    Write,
+    /// All of them, with a read key and a write key.
+    All,
 }
 
 #[derive(Debug, Parser)]
@@ -214,25 +219,32 @@ pub struct ServeArgs {
     #[arg(long, env = "SUMM_NO_PULL_COUNTS")]
     pub no_pull_counts: bool,
 
-    /// Authentication mode.
+    /// Which requests require an API key: `none`, `write` or `all`.
     ///
-    /// `anonymous`, the default, is an open read-write registry - which is the
+    /// `none`, the default, is an open read-write registry - which is the
     /// right default for the thing this is: a single binary someone runs to
     /// have a registry a minute later, usually on a laptop or inside a network
-    /// that is already the boundary. `apikey` turns on the two-key scheme in
-    /// [`crate::auth`] and applies it to everything the server serves.
-    #[arg(long, value_enum, default_value = "anonymous", env = "SUMM_AUTH")]
+    /// that is already the boundary. `write` requires the write key for push
+    /// and delete and serves every read anonymously, which is a public
+    /// registry - and means the catalog and the UI are readable by anyone who
+    /// can reach the port. `all` requires a key for everything the server
+    /// serves, the UI included. See [`crate::auth`].
+    #[arg(long, value_enum, default_value = "none", env = "SUMM_AUTH")]
     pub auth: AuthMode,
 
     /// API key admitting `GET` and `HEAD` - pull, list, browse.
     ///
-    /// Only meaningful with `--auth apikey`, where an absent key is generated
-    /// and printed once at startup. A key given here is never printed back.
+    /// Only meaningful with `--auth all`, where an absent key is generated and
+    /// printed once at startup; supplying it in any other mode is a startup
+    /// error rather than a key that quietly does nothing. A key given here is
+    /// never printed back.
     #[arg(long, env = "SUMM_READ_APIKEY")]
     pub read_apikey: Option<String>,
 
     /// API key admitting everything, reads included - push, delete.
     ///
+    /// The key `--auth write` requires and the stronger of the two `--auth
+    /// all` requires; absent, it is generated and printed once at startup.
     /// One key that can do everything is what a CI job wants, and making the
     /// write key also read is what stops that job needing both.
     #[arg(long, env = "SUMM_WRITE_APIKEY")]
@@ -256,26 +268,39 @@ impl ServeArgs {
     /// The HTTP layer's configuration, plus which API keys had to be invented.
     ///
     /// Fallible because the auth arguments can contradict each other, and the
-    /// contradiction has to be fatal. A key supplied without `--auth apikey` is
-    /// somebody who believes they have locked the registry; the alternatives to
-    /// failing are to ignore the key, which serves an open registry to someone
-    /// who thinks otherwise, or to infer the mode from the key's presence,
-    /// which makes deleting an environment variable silently disable
-    /// authentication. Neither is a failure an operator can see, so this one is
-    /// made loud and made at startup, before the listener binds.
+    /// contradiction has to be fatal. A key supplied to a mode that does not
+    /// require it is somebody who believes they have locked something; the
+    /// alternatives to failing are to ignore the key, which serves a more open
+    /// registry than its operator thinks, or to infer the mode from the key's
+    /// presence, which makes deleting an environment variable silently
+    /// downgrade authentication. Neither is a failure an operator can see, so
+    /// this one is made loud and made at startup, before the listener binds.
     pub fn server_config(&self) -> Result<(ServerConfig, Option<Generated>), String> {
         let (auth, generated) = match self.auth {
-            AuthMode::Anonymous => {
+            AuthMode::None => {
                 if self.read_apikey.is_some() || self.write_apikey.is_some() {
-                    return Err("an API key was supplied but --auth is `anonymous`; pass \
-                         `--auth apikey` (SUMM_AUTH=apikey) to require it"
+                    return Err("an API key was supplied but --auth is `none`; pass \
+                         `--auth write` (SUMM_AUTH=write) for anonymous pull and keyed \
+                         push, or `--auth all` to require a key for reads as well"
                         .to_owned());
                 }
-                (AuthPolicy::Anonymous, None)
+                (AuthPolicy::None, None)
             }
-            AuthMode::ApiKey => {
-                let (policy, generated) =
-                    AuthPolicy::new(self.read_apikey.clone(), self.write_apikey.clone())?;
+            AuthMode::Write => {
+                if self.read_apikey.is_some() {
+                    return Err("a read API key was supplied but --auth is `write`, which \
+                         serves every read anonymously; pass `--auth all` (SUMM_AUTH=all) \
+                         to require a key for reads too"
+                        .to_owned());
+                }
+                let (policy, generated) = AuthPolicy::for_writes(self.write_apikey.clone())?;
+                (policy, Some(generated))
+            }
+            AuthMode::All => {
+                let (policy, generated) = AuthPolicy::for_everything(
+                    self.read_apikey.clone(),
+                    self.write_apikey.clone(),
+                )?;
                 (policy, Some(generated))
             }
         };
@@ -311,7 +336,7 @@ mod tests {
     #[test]
     fn the_default_is_an_open_registry() {
         assert!(!ServerConfig::default().auth.is_enabled());
-        let args = args(&["--auth", "anonymous"]).expect("parses");
+        let args = args(&["--auth", "none"]).expect("parses");
         let (config, generated) = args.server_config().expect("valid");
         assert!(!config.auth.is_enabled());
         assert!(generated.is_none(), "nothing to generate when auth is off");
@@ -321,14 +346,37 @@ mod tests {
     fn a_key_without_the_mode_is_a_startup_error() {
         // The failure this prevents is silent: an operator who set
         // SUMM_READ_APIKEY and believes the registry is closed.
-        let args = args(&["--auth", "anonymous", "--read-apikey", "k"]).expect("parses");
+        let args = args(&["--auth", "none", "--read-apikey", "k"]).expect("parses");
         let message = args.server_config().expect_err("must not start");
-        assert!(message.contains("--auth apikey"), "{message}");
+        assert!(message.contains("--auth write"), "{message}");
+        assert!(message.contains("--auth all"), "{message}");
+    }
+
+    #[test]
+    fn write_mode_takes_one_key_and_refuses_the_other() {
+        let supplied = args(&["--auth", "write", "--write-apikey", "mine"]).expect("parses");
+        let (config, generated) = supplied.server_config().expect("valid");
+        assert!(config.auth.is_enabled());
+        let generated = generated.expect("reported");
+        assert!(!generated.write, "the key was supplied");
+        assert!(!generated.read, "this mode has no read key to invent");
+
+        let bare = args(&["--auth", "write"]).expect("parses");
+        let (_, generated) = bare.server_config().expect("valid");
+        assert!(
+            generated.expect("reported").write,
+            "an absent write key is generated, or the mode locks the operator out"
+        );
+
+        // A read key here is an operator who believes reads are guarded.
+        let contradictory = args(&["--auth", "write", "--read-apikey", "k"]).expect("parses");
+        let message = contradictory.server_config().expect_err("must not start");
+        assert!(message.contains("--auth all"), "{message}");
     }
 
     #[test]
     fn apikey_mode_generates_what_was_not_supplied() {
-        let args = args(&["--auth", "apikey", "--write-apikey", "mine"]).expect("parses");
+        let args = args(&["--auth", "all", "--write-apikey", "mine"]).expect("parses");
         let (config, generated) = args.server_config().expect("valid");
         assert!(config.auth.is_enabled());
         let generated = generated.expect("reported");
@@ -343,21 +391,15 @@ mod tests {
     }
 
     fn args_both() -> ServeArgs {
-        args(&[
-            "--auth",
-            "apikey",
-            "--read-apikey",
-            "r",
-            "--write-apikey",
-            "w",
-        ])
-        .expect("parses")
+        args(&["--auth", "all", "--read-apikey", "r", "--write-apikey", "w"]).expect("parses")
     }
 
     #[test]
     fn an_empty_key_is_rejected_rather_than_matching_an_empty_credential() {
-        let args = args(&["--auth", "apikey", "--read-apikey", " "]).expect("parses");
-        assert!(args.server_config().is_err());
+        let empty_read = args(&["--auth", "all", "--read-apikey", " "]).expect("parses");
+        assert!(empty_read.server_config().is_err());
+        let empty_write = args(&["--auth", "write", "--write-apikey", " "]).expect("parses");
+        assert!(empty_write.server_config().is_err());
     }
 
     #[test]
@@ -387,10 +429,20 @@ mod tests {
     }
 
     #[test]
-    fn the_mode_is_spelled_both_ways() {
-        for spelling in ["apikey", "api-key"] {
+    fn the_modes_are_spelled_as_one_ladder() {
+        // The flag answers one question - which requests need a key - and the
+        // three values are its only answers, from open to closed.
+        for (spelling, mode) in [
+            ("none", AuthMode::None),
+            ("write", AuthMode::Write),
+            ("all", AuthMode::All),
+        ] {
             let args = args(&["--auth", spelling]).expect("parses");
-            assert_eq!(args.auth, AuthMode::ApiKey);
+            assert_eq!(args.auth, mode);
         }
+        assert!(
+            args(&["--auth", "apikey"]).is_err(),
+            "the old vocabulary must fail loudly rather than mean something new"
+        );
     }
 }

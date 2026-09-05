@@ -56,16 +56,24 @@ struct Harness {
 }
 
 impl Harness {
-    /// A registry requiring the two keys above.
+    /// `--auth all`: a registry requiring the two keys above.
     fn guarded() -> Self {
-        Self::with_auth(AuthPolicy::ApiKey {
+        Self::with_auth(AuthPolicy::All {
             read: ApiKey::new(READ_KEY),
             write: ApiKey::new(WRITE_KEY),
         })
     }
 
+    /// `--auth write`: anonymous pull, the write key to push.
+    fn public() -> Self {
+        Self::with_auth(AuthPolicy::Write {
+            write: ApiKey::new(WRITE_KEY),
+        })
+    }
+
+    /// `--auth none`.
     fn anonymous() -> Self {
-        Self::with_auth(AuthPolicy::Anonymous)
+        Self::with_auth(AuthPolicy::None)
     }
 
     fn with_auth(auth: AuthPolicy) -> Self {
@@ -220,6 +228,92 @@ async fn anonymous_is_the_default_and_asks_for_nothing() {
         );
     }
     assert_eq!(h.push(None).await.status, StatusCode::CREATED);
+}
+
+// ----------------------------------------------------------- write mode --
+
+#[tokio::test]
+async fn write_mode_serves_every_read_surface_anonymously() {
+    // The point of the mode, and the assertion that has to name the whole
+    // list: a mode that gated one of these by accident would be a public
+    // registry nobody can pull from.
+    let h = Harness::public();
+    h.seed();
+    for uri in READABLE {
+        let reply = h.get(uri, None).await;
+        assert!(reply.status.is_success(), "GET {uri} -> {}", reply.status);
+        assert_eq!(
+            reply.header(header::WWW_AUTHENTICATE),
+            None,
+            "a read that needed no credential must not advertise a challenge on {uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn write_mode_challenges_a_push_and_admits_the_write_key() {
+    let h = Harness::public();
+
+    let reply = h.push(None).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(reply.error_code(), ErrorCode::Unauthorized.as_str());
+    let challenge = reply.header(header::WWW_AUTHENTICATE).unwrap_or_default();
+    assert!(
+        challenge.starts_with("Basic ") && challenge.contains(r#"realm="summ""#),
+        "an anonymous push must be the `401` that sends a client to `docker \
+         login`, not a bare refusal: got {challenge:?}"
+    );
+
+    assert_eq!(
+        h.push(Some(&basic("anyone", WRITE_KEY))).await.status,
+        StatusCode::CREATED
+    );
+
+    // Every other mutating method is behind the same key.
+    for method in [Method::POST, Method::PATCH, Method::DELETE] {
+        let reply = h
+            .send(
+                method.clone(),
+                "/v2/lib/nginx/blobs/uploads/",
+                None,
+                Body::empty(),
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{method}");
+    }
+}
+
+#[tokio::test]
+async fn write_mode_checks_a_credential_it_did_not_require() {
+    // A wrong credential is wrong wherever it is sent. It is not what makes
+    // `login` validate - a client pings `/v2/` bare, is answered `200`, and
+    // never offers a key here at all - but a registry that returns `200` to
+    // `Authorization: Bearer wrong` leaves a misconfigured client no way to
+    // discover it before the push.
+    let h = Harness::public();
+    h.seed();
+    for credential in [
+        basic("anyone", "not-the-key"),
+        format!("Bearer {WRITE_KEY}-almost"),
+        "Basic !!!not-base64".to_owned(),
+    ] {
+        let reply = h.get("/v2/", Some(&credential)).await;
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{credential:?}");
+        assert!(reply.header(header::WWW_AUTHENTICATE).is_some());
+    }
+    // And the right one is admitted to a read it did not need.
+    let reply = h.get("/v2/", Some(&basic("anyone", WRITE_KEY))).await;
+    assert_eq!(reply.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn write_mode_has_no_read_key_so_the_read_key_is_just_wrong() {
+    // A 401, not the 403 that `--auth all` gives a genuine-but-insufficient
+    // credential: under this mode the read key is not a credential at all.
+    let h = Harness::public();
+    let reply = h.push(Some(&format!("Bearer {READ_KEY}"))).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(reply.error_code(), ErrorCode::Unauthorized.as_str());
 }
 
 // ------------------------------------------------------- the challenge --
@@ -394,7 +488,7 @@ async fn a_401_body_names_no_key() {
     let rendered = format!(
         "{:?}",
         ServerConfig {
-            auth: AuthPolicy::ApiKey {
+            auth: AuthPolicy::All {
                 read: ApiKey::new(READ_KEY),
                 write: ApiKey::new(WRITE_KEY),
             },

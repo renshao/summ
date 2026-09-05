@@ -41,7 +41,7 @@ Conformance is the floor, not the ceiling.
 | Question | Decision | Consequence |
 |---|---|---|
 | Scale target | 10M repos; up to 10M manifests in a single repo | No API may materialise an unbounded set. Every list is cursor-paged. |
-| Auth | **Two static API keys, off by default** | One middleware over every surface. Anonymous read-write stays the default, so nothing on the critical path changed. |
+| Auth | **Two static API keys, on one axis: `--auth none\|write\|all`** | One middleware over every surface. Anonymous read-write stays the default, so nothing on the critical path changed. |
 | Topology | Single node, but keep HA viable | All mutations flow through a serialisable `WriteBatch`. No engine types leak past the trait. |
 | Workload | Full read-write, pull-optimised | Push must be correct and complete; perf work targets pull. |
 | Metadata engine | **RocksDB**, compiled from source and statically linked | Single binary, no RocksDB install. redb retained as a second implementation to keep the trait honest. |
@@ -268,7 +268,7 @@ way in, which cost nothing because nothing had ever written an `A` key. On by
 default; `--no-pull-counts` turns it off. See **Pull counts**.
 
 **API-key authentication has landed** and is described under **Authentication**
-below: `--auth apikey` puts a read key and a write key in front of `/v2/`, the
+below: `--auth all` puts a read key and a write key in front of `/v2/`, the
 discovery API and the UI at once. Off by default, so the conformance runs above
 and every measurement in this document are unaffected.
 
@@ -524,11 +524,25 @@ deleted; a time window is our own policy and needs a flag.
 
 ## Authentication
 
-Two static API keys — a read key and a write key — off by default and turned on
-with `--auth apikey` (`SUMM_AUTH=apikey`). A supplied key comes from
-`--read-apikey` / `--write-apikey` or `SUMM_READ_APIKEY` / `SUMM_WRITE_APIKEY`;
-an absent one is generated and printed once in the startup banner. Five
-decisions here, and each of them is a thing a change could quietly undo:
+Two static API keys — a read key and a write key — behind one flag with three
+values. `--auth` (`SUMM_AUTH`) answers exactly one question, *which requests
+require a key*, and its values are the three answers:
+
+| `--auth` | reads | writes |
+|---|---|---|
+| `none` (default) | open | open |
+| `write` | open | write key |
+| `all` | read key | write key |
+
+Naming them for what needs a key rather than for how the key travels is the
+point: `apikey` would have been a *mechanism* sitting in a *scope* enum, so a
+second mechanism later — htpasswd, OIDC — would have had to become a fourth
+value that also silently redecided the scope. It stays a separate choice.
+
+A supplied key comes from `--read-apikey` / `--write-apikey` or
+`SUMM_READ_APIKEY` / `SUMM_WRITE_APIKEY`; an absent one is generated and
+printed once in the startup banner. Six decisions here, and each of them is a
+thing a change could quietly undo:
 
 - **The challenge is `Basic`, not `Bearer`.** `Bearer` is what the hosted
   registries advertise, and it means something specific to a client: the
@@ -540,13 +554,35 @@ decisions here, and each of them is a thing a change could quietly undo:
   the model when the key *is* the credential — so `docker login`, `oras login`
   and a browser opening the UI all work with no token endpoint existing.
   `Bearer <key>` is *accepted* anyway, for `curl`, and never advertised.
-- **Everything is behind it — `/v2/`, `/api/v1/` and the UI — through one
-  middleware, and there is no exemption list.** An exemption is a hole that has
-  to be re-argued on every new route, and both candidates fail on inspection.
-  `GET /v2/` is the endpoint whose `401` is how a client *discovers* it needs
-  credentials, so exempting it breaks the flow it exists for; and serving the UI
-  shell anonymously only moves the prompt to the first `fetch`, where a native
-  browser dialog on an XHR is strictly worse.
+- **Under `all`, everything is behind it — `/v2/`, `/api/v1/` and the UI —
+  through one middleware, and there is no exemption list.** An exemption is a
+  hole that has to be re-argued on every new route, and both candidates fail on
+  inspection. `GET /v2/` is the endpoint whose `401` is how a client
+  *discovers* it needs credentials, so exempting it breaks the flow it exists
+  for; and serving the UI shell anonymously only moves the prompt to the first
+  `fetch`, where a native browser dialog on an XHR is strictly worse.
+- **`write` splits by method and by nothing else.** The rule is `Access::of` —
+  `GET`, `HEAD` and `OPTIONS` read, everything else writes, an unknown method
+  writes — applied to every route alike, so the middle mode is a statement
+  about what a request *does* rather than the route list an exemption would
+  have been. Its consequence is the mode rather than a hole in it, and the
+  banner says so: `_catalog`, every tag list, every manifest and the whole UI
+  are readable by anyone who can reach the port.
+- **A credential that is presented is checked in every mode, including on a
+  read that required none.** Ignoring one wherever it was not needed is a
+  registry that answers `200` to `Authorization: Bearer wrong`, which leaves a
+  misconfigured client nothing to discover before its first push. Under `write`
+  there is no read key, so a wrong credential there is a `401 UNAUTHORIZED`
+  rather than the `403` that `all` gives a genuine-but-insufficient one.
+
+  What it does not buy, because the assumption is natural and wrong: under
+  `write` it does **not** make `docker login` or `oras login` validate a key.
+  Both ping `GET /v2/` without a credential and send one only when answered
+  `401`; here they are answered `200`, so nothing is sent and nothing is
+  rejected — `login` succeeds on any key and the push is the first check.
+  Verified against `oras` 1.3: login with a deliberately wrong key reports
+  `Login Succeeded` under `--auth write` and `unauthorized: invalid API key`
+  under `--auth all`.
 - **The write key reads as well.** A CI job that pushes also pulls, and making
   it hold two secrets to do so is how one of them ends up unrotated. Write is
   also tried *first*, so setting both keys to the same value is one key that can
@@ -562,13 +598,14 @@ decisions here, and each of them is a thing a change could quietly undo:
   `Debug` redacts, so a `{:?}` on `ServerConfig` cannot leak one either, and
   comparison is constant-time so the timing cannot.
 
-Two smaller things that are load-bearing anyway. A key supplied *without*
-`--auth apikey` is a **startup error**, not a warning: the alternatives are to
-ignore it, which serves an open registry to someone who believes it is closed,
-or to infer the mode from the key's presence, which makes deleting an
-environment variable silently disable authentication. And the check runs as a
-layer *before* any body is read, so a denied blob `PUT` is rejected without
-draining the gigabytes behind it.
+Two smaller things that are load-bearing anyway. A key supplied to a mode that
+does not require it — either key under `--auth none`, `--read-apikey` under
+`--auth write` — is a **startup error**, not a warning: the alternatives are to
+ignore it, which serves a more open registry than its operator believes, or to
+infer the mode from the key's presence, which makes deleting an environment
+variable silently downgrade authentication. And the check runs as a layer
+*before* any body is read, so a denied blob `PUT` is rejected without draining
+the gigabytes behind it.
 
 Deliberately not built: per-repository scopes, more than one identity, a token
 endpoint, and key rotation without a restart. The keys are a shared secret in
