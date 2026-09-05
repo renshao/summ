@@ -361,10 +361,14 @@ that are now contract:
   would be the read-modify-write on the push path the schema exists to avoid —
   so a count folds pages to a ceiling (`seam::COUNT_CEILING`, 10,000) and
   carries `complete`. A UI renders `complete: false` as `10,000+`.
-- **Search is a name prefix, not a substring.** `n <name>` is the name appended
-  to one type byte, so a name prefix *is* a key prefix: `?q=` narrows the scan
-  to one seek and a walk of the matching run. A substring search would be a pass
-  over the catalogue and is deliberately not offered.
+- **Search is a substring, and pays for it in a bounded walk.** A prefix would
+  *be* a key prefix — `n <name>` is the name appended to one type byte — and
+  would cost one seek. `?q=` matches anywhere in the name instead, which the key
+  order cannot bracket, so it filters a walk of `n`. The walk is the cheap kind
+  (keys only, empty values, no decodes) and it is bounded per request by
+  `RegistryOptions::search_ceiling` (50,000 names); the cursor carries it across
+  requests, so a page may come back short, or empty, with `next` still set. Only
+  a `None` cursor ends a listing.
 - **These reads go through `spawn_blocking`.** They are the exception to the
   inline-read bet below: a page of summaries folds a bounded count per row, so
   it is milliseconds of CPU rather than the microseconds a point lookup costs.
@@ -1197,7 +1201,7 @@ query exists for every row here either way.
 | Query | Backed by | Status |
 |---|---|---|
 | List repositories | `n` (name-ordered) | **built** |
-| Search repositories by name prefix | `n <prefix>` | **built** |
+| Search repositories by name substring | `n` (filtered walk) | **built** |
 | List tags in a repo | `T <repo>` | **built** |
 | List manifests in a repo, with counts | `M <repo>` | **built** |
 | Repo size and manifest count | `P <repo>` | **built** |

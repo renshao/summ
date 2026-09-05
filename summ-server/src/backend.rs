@@ -51,8 +51,8 @@ use crate::range::ByteRange;
 use crate::reference::Reference;
 use crate::seam::{
     BlobRead, Descriptor, HistoryCursor, ManifestInfo, ManifestPut, ManifestStat, OpsError,
-    OpsResult, Page, PullCountDay, PullCountScope, Referrers, Registry, RepoDetail, RepoSummary,
-    TagEventInfo, TagInfo, Tally, UploadBody, COUNT_CEILING, TAGS_PER_MANIFEST,
+    OpsResult, Page, PullCountDay, PullCountScope, Referrers, Registry, RepoDetail, RepoPage,
+    RepoSummary, TagEventInfo, TagInfo, Tally, UploadBody, COUNT_CEILING, TAGS_PER_MANIFEST,
 };
 
 /// Which metadata engine `serve` opens.
@@ -923,14 +923,16 @@ impl Registry for Backend {
 
     async fn repository_summaries(
         &self,
-        prefix: &str,
+        query: &str,
         last: Option<&str>,
         limit: usize,
-    ) -> OpsResult<Page<RepoSummary>> {
-        let prefix = prefix.to_string();
+    ) -> OpsResult<RepoPage> {
+        let query = query.to_string();
         let last = last.map(str::to_string);
         self.scan(move |ops| {
-            let page = ops.search_repos(&prefix, last.as_deref(), limit)?;
+            let page = ops.search_repos_containing(&query, last.as_deref(), limit)?;
+            // Counting happens after the filter, so the rows that cost two
+            // stepped sub-scans each are the ones actually being served.
             let mut items = Vec::with_capacity(page.repos.len());
             for name in page.repos {
                 items.push(RepoSummary {
@@ -939,9 +941,9 @@ impl Registry for Backend {
                     name,
                 });
             }
-            Ok(Page {
+            Ok(RepoPage {
                 items,
-                more: page.next.is_some(),
+                next: page.next,
             })
         })
         .await

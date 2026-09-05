@@ -324,10 +324,17 @@ async fn the_discovery_api_reads_what_the_push_path_wrote() {
     assert_eq!(repos["repositories"][0]["tags"]["count"], 1);
     assert_eq!(repos["repositories"][0]["manifests"]["count"], 1);
 
-    // A prefix search is a narrowed key scan, all the way down to RocksDB.
+    // A substring search is a filtered walk of `n`, all the way down to RocksDB.
     let found = h.get("/api/v1/repositories?q=demo").await.json();
     assert_eq!(found["repositories"].as_array().unwrap().len(), 1);
     assert_eq!(found["repositories"][0]["name"], "demo/app");
+
+    // And it matches past the first character, which is the whole difference
+    // from the prefix scan this replaced.
+    let inner = h.get("/api/v1/repositories?q=/app").await.json();
+    assert_eq!(inner["repositories"].as_array().unwrap().len(), 1);
+    assert_eq!(inner["repositories"][0]["name"], "demo/app");
+    assert!(inner["next"].is_null());
 
     let detail = h.get("/api/v1/repositories/demo/app").await.json();
     assert_eq!(detail["blobs"]["count"], 2);

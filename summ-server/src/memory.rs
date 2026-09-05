@@ -35,8 +35,8 @@ use crate::range::ByteRange;
 use crate::reference::Reference;
 use crate::seam::{
     BlobRead, Descriptor, HistoryCursor, ManifestInfo, ManifestPut, ManifestStat, OpsError,
-    OpsResult, Page, PullCountDay, PullCountScope, Referrers, Registry, RepoDetail, RepoSummary,
-    TagEventInfo, TagInfo, Tally, UploadBody, TAGS_PER_MANIFEST,
+    OpsResult, Page, PullCountDay, PullCountScope, Referrers, Registry, RepoDetail, RepoPage,
+    RepoSummary, TagEventInfo, TagInfo, Tally, UploadBody, TAGS_PER_MANIFEST,
 };
 
 #[derive(Debug, Clone)]
@@ -839,20 +839,23 @@ impl Registry for MemoryRegistry {
 
     async fn repository_summaries(
         &self,
-        prefix: &str,
+        query: &str,
         last: Option<&str>,
         limit: usize,
-    ) -> OpsResult<Page<RepoSummary>> {
+    ) -> OpsResult<RepoPage> {
         let state = self.lock();
         let names = paginate(
             state
                 .repos
                 .keys()
-                .filter(|name| name.starts_with(prefix))
+                .filter(|name| name.contains(query))
                 .cloned(),
             last.map(str::to_owned).as_ref(),
             limit,
         );
+        // No ceiling to stop early against a `BTreeMap`, so the walk always
+        // reaches a match or the end: the cursor is the last row served.
+        let next = names.more.then(|| names.items.last().cloned()).flatten();
         // Counts are exact here because the whole registry fits in a map. The
         // ceiling the real backend stops at is a property of scanning ten
         // million keys, not of the contract.
@@ -868,10 +871,7 @@ impl Registry for MemoryRegistry {
                 }
             })
             .collect();
-        Ok(Page {
-            items,
-            more: names.more,
-        })
+        Ok(RepoPage { items, next })
     }
 
     async fn repository_detail(&self, name: &str) -> OpsResult<RepoDetail> {

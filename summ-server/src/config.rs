@@ -262,6 +262,11 @@ impl ServeArgs {
         summ_registry::RegistryOptions {
             validate_references: !self.allow_missing_references,
             max_manifest_bytes: self.max_manifest_bytes,
+            // The search ceiling is deliberately not a flag. It bounds how far
+            // one request walks, not what a search can find, so tuning it trades
+            // round trips against per-request latency - a property of the scan
+            // rather than a decision a deployment has to make.
+            ..Default::default()
         }
     }
 

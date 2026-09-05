@@ -362,28 +362,28 @@ pub async fn handle(ctx: &Ctx, endpoint: ApiEndpoint) -> Handled {
 
 async fn repositories(ctx: &Ctx) -> Handled {
     let (limit, last) = page_params(ctx)?;
-    // `?q=` is a name *prefix*, not a substring: it narrows the key scan, so it
-    // costs a seek rather than a pass over the catalogue. That is the whole
-    // reason search can exist at ten million repositories at all, and it is
-    // worth the UI having to say "starts with" rather than "contains".
-    let prefix = ctx.param("q").unwrap_or_default();
+    // `?q=` matches anywhere in the name. A prefix would ride the key order and
+    // cost a seek; a substring cannot, so this walks the name range instead -
+    // cheap keys, no value decodes, and a bound on how far one request goes.
+    // The bound is why the cursor comes from the scan rather than from the last
+    // row here: a page may skip rows, or stop on a name it never served.
+    // Lowercased because a repository name cannot hold an uppercase byte - see
+    // `reference::valid_name` - so an uppercase needle is not a search that
+    // finds nothing, it is a search that *cannot* find anything. Folding it
+    // here rather than in the ops layer keeps the match itself literal: this is
+    // a fact about what a person typed, not about how names are stored.
+    let query = ctx.param("q").unwrap_or_default().to_ascii_lowercase();
     let page = ctx
         .registry()
-        .repository_summaries(prefix, last.as_deref(), limit)
+        .repository_summaries(&query, last.as_deref(), limit)
         .await
         .map_err(ops_error)?;
 
-    // The cursor is the last row's own key, so it is only meaningful if there
-    // is a row *and* something after it.
-    let next = page
-        .more
-        .then(|| page.items.last().map(|row| row.name.clone()))
-        .flatten();
     json(
         ctx,
         &RepositoriesBody {
             repositories: page.items.into_iter().map(RepoRow::from).collect(),
-            next,
+            next: page.next,
         },
     )
 }

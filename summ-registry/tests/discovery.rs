@@ -4,7 +4,7 @@ mod common;
 
 use common::*;
 use summ_core::Digest;
-use summ_registry::{BlobReference, Reference, Registry};
+use summ_registry::{BlobReference, Reference, Registry, RegistryOptions};
 
 fn image(reg: &Registry, repo: &str, seed: &str, tag: Option<&str>) -> Digest {
     let config = upload(reg, repo, &format!("config-{seed}"));
@@ -121,6 +121,104 @@ fn repositories_page_in_name_order() {
     assert_eq!(second.next, None);
 
     assert_eq!(reg.list_repos(None, 10).unwrap().repos.len(), 4);
+}
+
+#[test]
+fn a_substring_search_matches_anywhere_and_pages_over_the_names_it_skips() {
+    let (_dir, reg) = fixture();
+    for repo in [
+        "zeta/app",
+        "alpine/base",
+        "nginx/web",
+        "beta/app",
+        "team/nginx",
+    ] {
+        let _ = upload(&reg, repo, "config");
+    }
+
+    let all = reg.search_repos_containing("nginx", None, 10).unwrap();
+    assert_eq!(
+        all.repos,
+        ["nginx/web", "team/nginx"],
+        "a prefix search would find only the first"
+    );
+    assert_eq!(
+        all.next, None,
+        "the walk reached the end of the range, so there is nothing to resume"
+    );
+
+    // The cursor has to carry across the names in between: `nginx/web` and
+    // `team/nginx` are not adjacent in `n`, so resuming from the last row
+    // served is the only way the second page starts in the right place.
+    let first = reg.search_repos_containing("nginx", None, 1).unwrap();
+    assert_eq!(first.repos, ["nginx/web"]);
+    assert_eq!(first.next.as_deref(), Some("nginx/web"));
+
+    let second = reg
+        .search_repos_containing("nginx", first.next.as_deref(), 1)
+        .unwrap();
+    assert_eq!(second.repos, ["team/nginx"]);
+    assert_eq!(
+        second.next, None,
+        "a page that exhausts the matches must not hand out a cursor that \
+         would cost the client an empty request to discover"
+    );
+
+    // A miss is proved by the walk, not guessed from an empty page.
+    let miss = reg.search_repos_containing("zzz", None, 10).unwrap();
+    assert!(miss.repos.is_empty());
+    assert_eq!(miss.next, None);
+
+    // The empty needle is the whole range, and takes the seek path.
+    assert_eq!(
+        reg.search_repos_containing("", None, 10).unwrap().repos,
+        reg.list_repos(None, 10).unwrap().repos
+    );
+}
+
+#[test]
+fn a_search_that_hits_its_ceiling_yields_a_short_page_and_resumes() {
+    // One name key examined per call, so every repository in the way costs a
+    // round trip. The real ceiling is 50,000; this is the same code path with
+    // the arithmetic small enough to assert on.
+    let (_dir, reg) = fixture_with(RegistryOptions {
+        search_ceiling: 1,
+        ..RegistryOptions::default()
+    });
+    for repo in ["a-skip", "b-skip", "c-match", "d-skip", "e-match"] {
+        let _ = upload(&reg, repo, "config");
+    }
+
+    // The first call examines `a-skip`, matches nothing, and stops - but it
+    // has not reached the end of the range, so it must not claim it has.
+    let first = reg.search_repos_containing("match", None, 10).unwrap();
+    assert!(
+        first.repos.is_empty(),
+        "the ceiling stopped the walk before any match"
+    );
+    assert_eq!(
+        first.next.as_deref(),
+        Some("a-skip"),
+        "the cursor is the last name *examined*, which is not a name it served \
+         and not a name that matched"
+    );
+
+    // Paging to exhaustion still finds everything: the bound costs requests,
+    // never results.
+    let mut seen = Vec::new();
+    let mut cursor = first.next;
+    for _ in 0..10 {
+        let page = reg
+            .search_repos_containing("match", cursor.as_deref(), 10)
+            .unwrap();
+        seen.extend(page.repos);
+        cursor = page.next;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(cursor, None, "the walk must terminate");
+    assert_eq!(seen, ["c-match", "e-match"]);
 }
 
 #[test]

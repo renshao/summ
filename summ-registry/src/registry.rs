@@ -49,6 +49,17 @@ pub struct RegistryOptions {
     /// manifest is a descriptor list, and one larger than this is an attack or
     /// a bug.
     pub max_manifest_bytes: usize,
+
+    /// How many repository names one substring search may examine before it
+    /// yields a short page and a cursor.
+    ///
+    /// A substring is not bracketed by the key order, so proving a miss means
+    /// walking the name range; this bounds how much of that walk lands in a
+    /// single request. It is a *per-call* bound and never a limit on what a
+    /// search can find - the cursor resumes the walk - so lowering it costs
+    /// round trips rather than results. See
+    /// [`Registry::search_repos_containing`].
+    pub search_ceiling: usize,
 }
 
 impl Default for RegistryOptions {
@@ -56,6 +67,9 @@ impl Default for RegistryOptions {
         Self {
             validate_references: true,
             max_manifest_bytes: 4 * 1024 * 1024,
+            // 50,000 name keys is a few milliseconds of sequential block reads
+            // and is far past any catalogue that fits on one screen of paging.
+            search_ceiling: 50_000,
         }
     }
 }

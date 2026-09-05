@@ -52,6 +52,22 @@ impl<T> Page<T> {
     }
 }
 
+/// One page of repository summaries.
+///
+/// Carries its own cursor rather than a `more` flag, which is what separates it
+/// from [`Page`]. Everywhere else the cursor is recoverable from the last row
+/// served, so saying "there is more" is enough; a substring search skips rows
+/// and can stop on a name it did not serve, so where the scan got to is no
+/// longer something the caller can read off the results.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoPage {
+    pub items: Vec<RepoSummary>,
+    /// Pass back as `start_after`. `None` means the scan proved itself
+    /// exhausted; an empty page with `Some` cursor means it hit its bound
+    /// before finding anything, and paging should continue.
+    pub next: Option<String>,
+}
+
 /// Everything a `HEAD` on a manifest needs, which is also everything a `GET`
 /// needs besides the bytes.
 ///
@@ -555,20 +571,21 @@ pub trait Registry: Send + Sync + 'static {
 
     /// Repository names with their tag and manifest counts, in name order.
     ///
-    /// `prefix` narrows the scan to names beginning with it, and `""` is the
-    /// whole registry. It is a *scan* prefix, not a filter: `n <name>` is the
-    /// name appended to one type byte, so this costs one seek and a walk of the
-    /// matching run.
+    /// `query` keeps names containing it, and `""` is the whole registry. A
+    /// substring cannot be bracketed by the key order, so this is a walk of the
+    /// name range and not a seek into it - bounded per call, with the cursor
+    /// carrying the walk across requests. An empty page with a cursor is
+    /// therefore normal, and only a `None` cursor ends the listing.
     ///
-    /// Counting is bounded per repository - see [`COUNT_CEILING`] - so the cost
-    /// of a page is bounded by `limit * CEILING` key reads and not by the size
-    /// of the registry.
+    /// Counting is bounded per repository - see [`COUNT_CEILING`] - and applies
+    /// to matched rows only, so the counting cost of a page is bounded by
+    /// `limit * CEILING` key reads and not by the size of the registry.
     async fn repository_summaries(
         &self,
-        prefix: &str,
+        query: &str,
         last: Option<&str>,
         limit: usize,
-    ) -> OpsResult<Page<RepoSummary>>;
+    ) -> OpsResult<RepoPage>;
 
     /// Counts and size for one repository.
     async fn repository_detail(&self, name: &str) -> OpsResult<RepoDetail>;

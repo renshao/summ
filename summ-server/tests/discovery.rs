@@ -195,7 +195,7 @@ async fn the_cursor_appears_only_when_a_further_page_exists() {
 }
 
 #[tokio::test]
-async fn search_is_a_name_prefix_not_a_substring() {
+async fn search_matches_anywhere_in_the_name() {
     let h = Harness::new();
     for name in ["nginx", "nginx-ingress", "nginx/base", "nginy", "my-nginx"] {
         seed_image(&h, name, "latest", name);
@@ -210,13 +210,58 @@ async fn search_is_a_name_prefix_not_a_substring() {
         .collect();
     assert_eq!(
         names,
-        ["nginx", "nginx-ingress", "nginx/base"],
-        "a prefix narrows the key scan; `my-nginx` would require a pass over \
-         the whole catalogue and is deliberately not matched"
+        ["my-nginx", "nginx", "nginx-ingress", "nginx/base"],
+        "a substring matches wherever it falls - `my-nginx` included - and the \
+         results stay in name order, not in match position or relevance"
     );
 
     let none = h.get("/api/v1/repositories?q=zzz").await;
     assert!(none["repositories"].as_array().unwrap().is_empty());
+    assert!(
+        none["next"].is_null(),
+        "a search that walked the range to prove a miss must say so, or the \
+         client pages forever"
+    );
+
+    // A name cannot contain an uppercase byte, so matching one literally would
+    // guarantee an empty result rather than report an honest one.
+    let shouted = h.get("/api/v1/repositories?q=NGINX").await;
+    assert_eq!(
+        shouted["repositories"].as_array().unwrap().len(),
+        4,
+        "an uppercase query is folded, not answered with nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_filtered_page_carries_a_cursor_past_the_names_it_skipped() {
+    let h = Harness::new();
+    // Interleaved so every page of matches has non-matching names inside it:
+    // a cursor taken from the last row served is still correct here, but only
+    // because the scan stopped *on* a match.
+    for i in 0..6 {
+        seed_image(&h, &format!("keep{i}"), "latest", "x");
+        seed_image(&h, &format!("skip{i}"), "latest", "x");
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut url = "/api/v1/repositories?q=keep&n=2".to_string();
+    for _ in 0..10 {
+        let body = h.get(&url).await;
+        for row in body["repositories"].as_array().unwrap() {
+            seen.push(row["name"].as_str().unwrap().to_owned());
+        }
+        let Some(next) = body["next"].as_str() else {
+            break;
+        };
+        url = format!("/api/v1/repositories?q=keep&n=2&last={next}");
+    }
+
+    assert_eq!(
+        seen,
+        ["keep0", "keep1", "keep2", "keep3", "keep4", "keep5"],
+        "paging a filtered scan must yield every match exactly once"
+    );
 }
 
 #[tokio::test]

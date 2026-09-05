@@ -29,7 +29,7 @@ answers, because "gone" is exactly the question you are asking.
 
 **A built-in web UI.** Same binary, same port, assets compiled in — no build
 step, no framework, no CDN, so it works air-gapped. Browse repositories with
-per-repo tag and manifest counts, search by name prefix, drill into a manifest,
+per-repo tag and manifest counts, search names by substring, drill into a manifest,
 and see the pull-count grids and tag timelines beside the thing they describe.
 
 **Metadata lookups are the product.** Four of the five serial steps in a cold

@@ -182,6 +182,11 @@ function failure(error) {
  * disappears when the server stops handing back a cursor. Deliberately a
  * button and not an infinite scroll: the page count is the visible cost of a
  * scan, and hiding it would hide the thing this UI exists to keep honest.
+ *
+ * A page may be short, or empty, and still carry a cursor - a filtered scan
+ * that hits its bound before it fills a page says exactly that. So the cursor,
+ * never the row count, decides when the listing is over: an empty list is only
+ * "nothing found" once the server has stopped offering somewhere to resume.
  */
 function pagedList(load, rowFor, emptyNode) {
   const list = el('div', { class: 'list' });
@@ -202,14 +207,16 @@ function pagedList(load, rowFor, emptyNode) {
       cursor = next;
       done = !next;
       if (done) button.remove();
-      if (!list.children.length) container.replaceChildren(emptyNode);
+      if (done && !list.children.length) container.replaceChildren(emptyNode);
     } catch (error) {
       container.replaceChildren(failure(error));
       done = true;
     } finally {
       busy = false;
       button.disabled = false;
-      button.textContent = 'Load more';
+      // Nothing found *yet* is a different offer from another page of rows,
+      // and the button is where the difference has to show.
+      button.textContent = list.children.length ? 'Load more' : 'Keep searching';
     }
   }
 
@@ -226,15 +233,17 @@ function repositoriesPage(query) {
 
   const input = el('input', {
     type: 'search',
-    placeholder: 'Filter by name prefix…',
+    placeholder: 'Search names…',
     value: q,
-    'aria-label': 'Filter repositories by name prefix',
+    'aria-label': 'Search repositories by name',
     spellcheck: 'false',
     autocapitalize: 'off',
   });
 
-  // A prefix, not a substring: it narrows the key scan rather than filtering
-  // its output, which is what lets search stay one seek at ten million repos.
+  // Matched anywhere in the name, so this filters a walk of the name range
+  // rather than narrowing a seek into it. The server bounds how far one
+  // request walks and hands back a cursor; the Load more button is where that
+  // cost stays visible.
   let timer;
   input.addEventListener('input', () => {
     clearTimeout(timer);
@@ -249,13 +258,13 @@ function repositoriesPage(query) {
     (cursor) => api('/api/v1/repositories', { q, last: cursor, n: PAGE })
       .then((body) => ({ items: body.repositories, next: body.next })),
     repositoryRow,
-    q ? empty('No repository starts with that.', q) : empty('This registry is empty.', 'docker push <host>/<name>:<tag>'),
+    q ? empty('No repository name contains that.', q) : empty('This registry is empty.', 'docker push <host>/<name>:<tag>'),
   );
 
   render(
     el('h1', { text: 'Repositories' }),
     el('p', { class: 'subtitle' }, q
-      ? ['Names starting with ', el('span', { class: 'mono', text: q }), ', in name order.']
+      ? ['Names containing ', el('span', { class: 'mono', text: q }), ', in name order.']
       : ['Every repository in this registry, in name order.']),
     el('div', { class: 'toolbar' }, [el('div', { class: 'search' }, [input])]),
     list,

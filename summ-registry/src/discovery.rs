@@ -19,6 +19,12 @@ use crate::error::{RegistryError, Result};
 use crate::registry::Registry;
 use crate::suffix;
 
+/// How many name keys a substring search reads per underlying scan.
+///
+/// The walk is one seek and a sequential read either way; this only decides how
+/// often it returns to ask for more, and a batch of names is a few kilobytes.
+const SEARCH_STEP: usize = 512;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepoList {
     pub repos: Vec<String>,
@@ -118,6 +124,85 @@ impl Registry {
             ),
             None => None,
         };
+        Ok(RepoList { repos, next })
+    }
+
+    /// Repositories whose name *contains* `needle`, in name order.
+    ///
+    /// Unlike [`Registry::search_repos`] this cannot ride the key order: a
+    /// substring may start anywhere in the name, so no key prefix brackets the
+    /// matches and every name in the range has to be looked at. It is still the
+    /// cheap kind of scan - an `n <name>` key is one type byte plus the name and
+    /// its value is empty, so `scan_keys` reads keys and decodes nothing - but
+    /// it is a walk of the catalogue rather than a seek into it, and that is the
+    /// whole difference between this and the prefix search.
+    ///
+    /// Two bounds keep a call finite. Matches are gathered one past `limit`, so
+    /// `next` is `None` only once the scan has *proved* nothing follows, never
+    /// because a page came back full. And the walk gives up after
+    /// [`RegistryOptions::search_ceiling`] keys, returning a short page whose
+    /// cursor points at where it stopped - the same bargain
+    /// [`Registry::untagged_manifests`] makes, and the reason a caller pages
+    /// until `next` is `None` rather than until a page arrives empty.
+    ///
+    /// [`RegistryOptions::search_ceiling`]: crate::RegistryOptions::search_ceiling
+    pub fn search_repos_containing(
+        &self,
+        needle: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<RepoList> {
+        // The empty needle matches every name, and *that* the key order can
+        // bracket: it is the whole range, so hand it back to the seek path.
+        if needle.is_empty() {
+            return self.search_repos("", start_after, limit);
+        }
+
+        let ceiling = self.options().search_ceiling;
+        let prefix = keys::repos_by_name();
+        let mut cursor = start_after.map(keys::repo_by_name);
+        let mut repos: Vec<String> = Vec::new();
+        let mut examined = 0usize;
+
+        let next = 'walk: loop {
+            // Never read past the budget. Asking for a whole step and stopping
+            // afterwards would make the ceiling a multiple of the step rather
+            // than the count it claims to be.
+            let step = SEARCH_STEP.min(ceiling.saturating_sub(examined));
+            let page = self.engine().scan_keys(&prefix, cursor.as_deref(), step)?;
+
+            for key in &page.keys {
+                let name = keys::parse_repo_name(key)
+                    .ok_or_else(|| RegistryError::corrupt("repo name key"))?;
+                examined += 1;
+                if !name.contains(needle) {
+                    continue;
+                }
+                if repos.len() == limit {
+                    // The match one past the page. It is not served; it exists
+                    // only to prove there is a further page, which is the sole
+                    // reason this page carries a cursor at all.
+                    break 'walk repos.last().cloned();
+                }
+                repos.push(name.to_string());
+            }
+
+            match page.next {
+                // The range ended. "Nothing further matches" is now proved.
+                None => break None,
+                // The ceiling stopped the walk mid-range: a short page, and a
+                // cursor at the last name examined rather than the last matched.
+                Some(key) if examined >= ceiling => {
+                    break Some(
+                        keys::parse_repo_name(&key)
+                            .ok_or_else(|| RegistryError::corrupt("repo cursor"))?
+                            .to_string(),
+                    );
+                }
+                next => cursor = next,
+            }
+        };
+
         Ok(RepoList { repos, next })
     }
 
